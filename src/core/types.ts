@@ -1,0 +1,105 @@
+export const USER_ID = "user";
+export const SYSTEM_ID = "system";
+export const DEFAULT_PROVIDER_ID = "default";
+
+export type MemberRole = "main" | "sub";
+export type MemberStatus = "idle" | "running" | "cancelled" | "error";
+export type ContextMode = "fork" | "isolated";
+export type ControlScope = "children" | "none";
+export type SenderKind = "user" | "member" | "system";
+export type MessageKind = "chat" | "announce" | "system";
+export type TaskStatus = "todo" | "doing" | "blocked" | "done" | "failed";
+
+export interface Limits {
+  maxConcurrent: number;
+  maxChildrenPerAgent: number;
+  maxSpawnDepth: number;
+  maxStepsPerRun: number;
+  maxRoomWindowChars: number;
+  maxTurnsPerUserMessage: number;
+  runTimeoutMs: number;
+}
+
+export const DEFAULT_LIMITS: Limits = {
+  maxConcurrent: 8,
+  maxChildrenPerAgent: 5,
+  maxSpawnDepth: 5,
+  maxStepsPerRun: 12,
+  maxRoomWindowChars: 12000,
+  maxTurnsPerUserMessage: 12,
+  runTimeoutMs: 120000,
+};
+
+export interface Member {
+  id: string;
+  roomId: string;
+  name: string;
+  role: MemberRole;
+  status: MemberStatus;
+  depth: number;
+  spawnedBy: string | null;
+  controlScope: ControlScope;
+  contextMode: ContextMode;
+  systemPrompt: string;
+  providerId: string;
+  createdAt: number;
+  lastActiveAt: number;
+}
+
+export interface RoomMessage {
+  id: string;
+  roomId: string;
+  seq: number;
+  ts: number;
+  senderId: string;
+  senderName: string;
+  senderKind: SenderKind;
+  kind: MessageKind;
+  text: string;
+  mentions: string[];
+  mentionsRaw: string[];
+  taskId?: string;
+  runId?: string;
+  replyTo?: string;
+  chainRootId?: string;
+  depthTurn?: number;
+}
+
+export interface ArtifactRef {
+  name: string;
+  path?: string;
+  summary?: string;
+  addedAt: number;
+  addedBy: string;
+}
+
+export interface TaskCard {
+  id: string;
+  roomId: string;
+  title: string;
+  detail: string;
+  ownerId: string | null;
+  status: TaskStatus;
+  deps: string[];
+  artifacts: ArtifactRef[];
+  messageIds: string[];
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type AgentEvent =
+  | { type: "run-start"; runId: string; memberId: string }
+  | { type: "delta"; runId: string; memberId: string; text: string }
+  | { type: "tool"; runId: string; memberId: string; name: string; args: Record<string, unknown> }
+  | { type: "tool-result"; runId: string; memberId: string; name: string; content: string }
+  | { type: "run-final"; runId: string; memberId: string; text: string }
+  | { type: "run-error"; runId: string; memberId: string; error: string }
+  | { type: "run-aborted"; runId: string; memberId: string };
+
+export type RoomEvent =
+  | { type: "message"; message: RoomMessage }
+  | { type: "member"; member: Member }
+  | { type: "task"; task: TaskCard }
+  | { type: "run"; event: AgentEvent }
+  | { type: "notice"; text: string };

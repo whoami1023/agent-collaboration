@@ -1,0 +1,32 @@
+{
+  "name": "agent-collaboration",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Group-chat multi-agent collaboration: a main agent spawns members and dispatches work by @mention.",
+  "scripts": {
+    "dev": "tsx watch src/server/index.ts",
+    "start": "tsx src/server/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "typecheck:web": "tsc -p web/tsconfig.json --noEmit",
+    "web:dev": "vite --config web/vite.config.ts",
+    "web:build": "vite build --config web/vite.config.ts"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8"
+  }
+}
