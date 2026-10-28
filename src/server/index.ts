@@ -1,88 +1,30 @@
 import { join } from "node:path";
 import { createApp } from "./app";
-import { RoomBus } from "../room/bus";
-import { Workboard } from "../workboard/board";
-import { Orchestrator, ensureMainMember } from "../agent/orchestrator";
-import { loadSettings, maskSettings, saveSettings, type Settings } from "../core/settings";
-import { readJson, writeJsonAtomic } from "../store/persist";
-import type { Member, RoomMessage, TaskCard } from "../core/types";
+import { AuthService } from "../auth/auth-service";
+import { WorkspaceRegistry } from "../workspace/workspace";
 
 const root = process.cwd();
 const dataDir = join(root, "data");
-const settingsFile = join(dataDir, "settings.json");
-const stateFile = join(dataDir, "state.json");
-
-interface PersistedState {
-  members: Member[];
-  messages: RoomMessage[];
-  seq: number;
-  tasks: TaskCard[];
-}
 
 async function main(): Promise<void> {
-  const loadedSettings = await loadSettings(settingsFile);
-  const state = await readJson<PersistedState | null>(stateFile, null);
+  const auth = new AuthService(join(dataDir, "auth.json"));
+  await auth.init();
 
-  const bus = new RoomBus("room_main", "协同作战室");
-  const board = new Workboard("room_main");
-
-  if (state) {
-    bus.hydrate({ seq: state.seq, messages: state.messages });
-    for (const member of state.members) {
-      bus.addMember({ ...member, status: member.status === "running" ? "idle" : member.status });
-    }
-    board.hydrate(state.tasks);
-  }
-  ensureMainMember(bus);
-
-  let currentSettings: Settings = loadedSettings;
-  const orchestrator = new Orchestrator({
-    bus,
-    board,
-    getSettings: () => currentSettings,
-  });
-
-  let saveTimer: NodeJS.Timeout | null = null;
-  const persist = async (): Promise<void> => {
-    const snapshot = bus.snapshot();
-    await writeJsonAtomic(stateFile, {
-      members: bus.listMembers(),
-      messages: snapshot.messages,
-      seq: snapshot.seq,
-      tasks: board.snapshot(),
-    });
-  };
-  const scheduleSave = (): void => {
-    if (saveTimer) return;
-    saveTimer = setTimeout(() => {
-      saveTimer = null;
-      void persist().catch((err) => console.error("持久化失败", err));
-    }, 300);
-  };
-  bus.subscribe((event) => {
-    if (event.type === "message" || event.type === "member") scheduleSave();
-  });
-  board.subscribe(() => scheduleSave());
-
+  const workspaces = new WorkspaceRegistry(join(dataDir, "workspaces"));
   const app = createApp({
-    bus,
-    board,
-    orchestrator,
-    getSettings: () => currentSettings,
-    setSettings: async (next) => {
-      currentSettings = next;
-      await saveSettings(settingsFile, next);
-    },
+    auth,
+    workspaces,
     webDist: join(root, "web", "dist"),
   });
 
   const port = Number(process.env["PORT"] ?? 8788);
   const server = app.listen(port, "127.0.0.1", () => {
-    const active = maskSettings(currentSettings).providers.find(
-      (provider) => provider.id === currentSettings.activeProviderId,
-    );
     console.log(`agent-collaboration 已启动：http://127.0.0.1:${port}`);
-    console.log(`当前 provider：${currentSettings.activeProviderId}（${active?.kind ?? "未知"}）`);
+    console.log(
+      auth.needsSetup()
+        ? "尚未创建管理员账号，请在登录页完成初始化。"
+        : `已有 ${auth.listUsers().length} 个账号，登录后进入各自的作战室。`,
+    );
   });
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
@@ -92,6 +34,18 @@ async function main(): Promise<void> {
     }
     process.exit(1);
   });
+
+  let closing = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (closing) return;
+    closing = true;
+    console.log(`收到 ${signal}，正在保存并退出…`);
+    server.close();
+    await workspaces.closeAll().catch((err) => console.error("关闭工作区失败", err));
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 main().catch((err) => {

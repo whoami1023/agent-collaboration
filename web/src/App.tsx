@@ -1,12 +1,21 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { Member, RoomEvent, RoomMessage, TaskCard } from "../../src/core/types";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent } from "react";
+import type { Member, PublicUser, RoomEvent, RoomMessage, TaskCard } from "../../src/core/types";
 import {
+  ApiError,
   cancelMember,
   createTask,
+  createUser,
+  fetchBootstrap,
+  fetchMe,
   fetchState,
+  listUsers,
+  loginUser,
+  logoutUser,
   patchTask,
   saveSettings,
   sendMessage,
+  setupAdmin,
   subscribeEvents,
   type MaskedSettings,
   type StateSnapshot,
@@ -16,6 +25,14 @@ interface RunState {
   memberId: string;
   text: string;
   tools: string[];
+}
+
+function messageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function isUnauthorized(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 401;
 }
 
 function upsert<T extends { id: string }>(items: T[], next: T): T[] {
@@ -32,13 +49,206 @@ function clock(ts: number): string {
 }
 
 export default function App() {
+  const [phase, setPhase] = useState<"loading" | "ready">("loading");
+  const [user, setUser] = useState<PublicUser | null>(null);
+  const [needsSetup, setNeedsSetup] = useState(false);
+  const [bootError, setBootError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const me = await fetchMe();
+        if (alive) setUser(me);
+      } catch (err) {
+        if (isUnauthorized(err)) {
+          try {
+            const bootstrap = await fetchBootstrap();
+            if (alive) setNeedsSetup(bootstrap.needsSetup);
+          } catch (bootErr) {
+            if (alive) setBootError(messageOf(bootErr));
+          }
+        } else if (alive) {
+          setBootError(messageOf(err));
+        }
+      } finally {
+        if (alive) setPhase("ready");
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const handleSessionLost = useCallback(() => {
+    setUser(null);
+    void fetchBootstrap()
+      .then((bootstrap) => setNeedsSetup(bootstrap.needsSetup))
+      .catch(() => setNeedsSetup(false));
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await logoutUser();
+    } catch {
+      // the server may already have revoked the session
+    }
+    handleSessionLost();
+  }, [handleSessionLost]);
+
+  if (phase === "loading") {
+    return <div className="loading">正在连接协同作战室…</div>;
+  }
+
+  if (bootError && !user) {
+    return (
+      <div className="auth-screen">
+        <div className="auth-card">
+          <div className="auth-brand">
+            <span className="room-name">协同作战室</span>
+          </div>
+          <p className="auth-error">{bootError}</p>
+          <button className="primary auth-submit" onClick={() => window.location.reload()}>
+            重新连接
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <LoginPage needsSetup={needsSetup} onAuthed={setUser} />;
+  }
+
+  return (
+    <RoomView
+      key={user.id}
+      user={user}
+      onLogout={() => void handleLogout()}
+      onSessionLost={handleSessionLost}
+    />
+  );
+}
+
+function LoginPage({
+  needsSetup,
+  onAuthed,
+}: {
+  needsSetup: boolean;
+  onAuthed: (user: PublicUser) => void;
+}) {
+  const [username, setUsername] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (busy) return;
+    setError(null);
+    if (needsSetup && password !== confirm) {
+      setError("两次输入的密码不一致");
+      return;
+    }
+    setBusy(true);
+    try {
+      const nextUser = needsSetup
+        ? await setupAdmin({ username, displayName, password })
+        : await loginUser({ username, password });
+      onAuthed(nextUser);
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="auth-screen">
+      <form className="auth-card" onSubmit={(event) => void handleSubmit(event)}>
+        <div className="auth-brand">
+          <span className="room-name">协同作战室</span>
+          <span className="badge">{needsSetup ? "首次初始化" : "多用户"}</span>
+        </div>
+        <p className="auth-sub">
+          {needsSetup
+            ? "创建管理员账号。登录后你会进入自己的独立房间，并绑定该房间的主智能体。"
+            : "登录后进入你自己的房间，你就是这间房的主智能体。账号由管理员创建。"}
+        </p>
+        <label className="auth-field">
+          用户名
+          <input
+            autoFocus
+            autoComplete="username"
+            spellCheck={false}
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+          />
+        </label>
+        {needsSetup && (
+          <label className="auth-field">
+            显示名称（可选）
+            <input
+              value={displayName}
+              placeholder="例如：老板"
+              onChange={(event) => setDisplayName(event.target.value)}
+            />
+          </label>
+        )}
+        <label className="auth-field">
+          密码
+          <input
+            type="password"
+            autoComplete={needsSetup ? "new-password" : "current-password"}
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+          />
+        </label>
+        {needsSetup && (
+          <label className="auth-field">
+            确认密码
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={confirm}
+              onChange={(event) => setConfirm(event.target.value)}
+            />
+          </label>
+        )}
+        {error && <div className="auth-error">{error}</div>}
+        <button className="primary auth-submit" type="submit" disabled={busy}>
+          {busy ? "请稍候…" : needsSetup ? "创建管理员并进入" : "登录"}
+        </button>
+        <p className="auth-hint">
+          {needsSetup
+            ? "用户名 3-24 位字母、数字、下划线或连字符；密码至少 8 位。"
+            : "忘记密码请联系管理员；退出后需要重新登录。"}
+        </p>
+      </form>
+    </div>
+  );
+}
+
+function RoomView({
+  user,
+  onLogout,
+  onSessionLost,
+}: {
+  user: PublicUser;
+  onLogout: () => void;
+  onSessionLost: () => void;
+}) {
   const [state, setState] = useState<StateSnapshot | null>(null);
   const [runs, setRuns] = useState<Record<string, RunState>>({});
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [usersOpen, setUsersOpen] = useState(false);
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const checkingSession = useRef(false);
 
   useEffect(() => {
     let alive = true;
@@ -46,7 +256,26 @@ export default function App() {
       .then((snapshot) => {
         if (alive) setState(snapshot);
       })
-      .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
+      .catch((err: unknown) => {
+        if (!alive) return;
+        if (isUnauthorized(err)) {
+          onSessionLost();
+          return;
+        }
+        setError(messageOf(err));
+      });
+
+    const checkSession = () => {
+      if (checkingSession.current) return;
+      checkingSession.current = true;
+      void fetchMe()
+        .catch((err: unknown) => {
+          if (isUnauthorized(err)) onSessionLost();
+        })
+        .finally(() => {
+          checkingSession.current = false;
+        });
+    };
 
     const unsubscribe = subscribeEvents((event: RoomEvent) => {
       setState((current) => applyEvent(current, event));
@@ -70,12 +299,12 @@ export default function App() {
         }
         return current;
       });
-    });
+    }, checkSession);
     return () => {
       alive = false;
       unsubscribe();
     };
-  }, []);
+  }, [onSessionLost]);
 
   const messages = state?.messages ?? [];
   const members = state?.members ?? [];
@@ -99,7 +328,7 @@ export default function App() {
     try {
       await sendMessage(text);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(messageOf(err));
     }
   }
 
@@ -107,7 +336,7 @@ export default function App() {
     try {
       await cancelMember(memberId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(messageOf(err));
     }
   }
 
@@ -118,7 +347,7 @@ export default function App() {
     try {
       await createTask(title);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(messageOf(err));
     }
   }
 
@@ -127,12 +356,12 @@ export default function App() {
     try {
       await patchTask(task.id, { status: next });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(messageOf(err));
     }
   }
 
   if (!state) {
-    return <div className="loading">正在连接协同作战室…</div>;
+    return <div className="loading">正在进入 @{user.displayName} 的作战室…</div>;
   }
 
   const activeProvider = state.settings.providers.find(
@@ -147,9 +376,23 @@ export default function App() {
           <span className="badge">{activeProvider ? `${activeProvider.id} · ${activeProvider.model}` : "未配置模型"}</span>
           <span className="badge subtle">{members.length} 名成员</span>
         </div>
-        <button className="ghost" onClick={() => setSettingsOpen((open) => !open)}>
-          模型设置
-        </button>
+        <div className="top-actions">
+          <span className={`user-chip ${user.role}`} title={`绑定主智能体 ${user.mainAgentId}`}>
+            {user.displayName}
+            <span className="user-handle">@{user.username}</span>
+          </span>
+          {user.role === "admin" && (
+            <button className="ghost" onClick={() => setUsersOpen(true)}>
+              用户管理
+            </button>
+          )}
+          <button className="ghost" onClick={() => setSettingsOpen((open) => !open)}>
+            模型设置
+          </button>
+          <button className="ghost" onClick={onLogout}>
+            退出
+          </button>
+        </div>
       </header>
 
       {error && (
@@ -158,7 +401,15 @@ export default function App() {
         </div>
       )}
 
-      {settingsOpen && <SettingsPanel settings={state.settings} onClose={() => setSettingsOpen(false)} onSaved={(next) => setState((current) => (current ? { ...current, settings: next } : current))} />}
+      {settingsOpen && (
+        <SettingsPanel
+          settings={state.settings}
+          onClose={() => setSettingsOpen(false)}
+          onSaved={(next) => setState((current) => (current ? { ...current, settings: next } : current))}
+        />
+      )}
+
+      {usersOpen && user.role === "admin" && <AdminPanel onClose={() => setUsersOpen(false)} />}
 
       <main className="layout">
         <aside className="panel members">
@@ -214,7 +465,7 @@ export default function App() {
           <div className="composer">
             <textarea
               value={draft}
-              placeholder="发消息给作战室…… 用 @成员名 指派任务"
+              placeholder={`以 ${user.displayName} 的身份发消息…… 用 @成员名 指派任务`}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
@@ -301,6 +552,120 @@ function MessageBubble({ message, nameById }: { message: RoomMessage; nameById: 
   );
 }
 
+function AdminPanel({ onClose }: { onClose: () => void }) {
+  const [users, setUsers] = useState<PublicUser[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [username, setUsername] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [password, setPassword] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      setUsers(await listUsers());
+      setError(null);
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function handleCreate(event: FormEvent) {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const created = await createUser({ username, displayName, password });
+      setNotice(`已创建 @${created.username}。请把初始密码单独告知对方。`);
+      setUsername("");
+      setDisplayName("");
+      setPassword("");
+      await refresh();
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="settings">
+      <div className="settings-card wide">
+        <div className="settings-head">
+          <strong>用户管理</strong>
+          <button className="ghost" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        {loading ? (
+          <p className="hint">正在加载账号…</p>
+        ) : (
+          <ul className="user-list">
+            {users.map((item) => (
+              <li key={item.id}>
+                <span className={`dot ${item.role === "admin" ? "admin" : ""}`} />
+                <div className="user-main">
+                  <div className="member-line">
+                    <span className="member-name">{item.displayName}</span>
+                    <span className="user-handle">@{item.username}</span>
+                    <span className={`role ${item.role}`}>{item.role === "admin" ? "管理员" : "成员"}</span>
+                  </div>
+                  <div className="member-meta">
+                    绑定 @主智能体 · 创建于 {new Date(item.createdAt).toLocaleDateString()}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        <form className="admin-create" onSubmit={(event) => void handleCreate(event)}>
+          <strong>创建账号</strong>
+          <div className="admin-fields">
+            <label>
+              用户名
+              <input value={username} onChange={(event) => setUsername(event.target.value)} />
+            </label>
+            <label>
+              显示名称
+              <input
+                value={displayName}
+                placeholder="可选"
+                onChange={(event) => setDisplayName(event.target.value)}
+              />
+            </label>
+            <label>
+              初始密码
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </label>
+          </div>
+          {error && <p className="auth-error">{error}</p>}
+          {notice && <p className="settings-message">{notice}</p>}
+          <div className="settings-actions">
+            <button className="primary" type="submit" disabled={busy}>
+              {busy ? "创建中…" : "创建账号"}
+            </button>
+            <span className="hint">新账号首次登录时自动创建自己的房间与主智能体。</span>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function SettingsPanel({
   settings,
   onClose,
@@ -337,7 +702,7 @@ function SettingsPanel({
       setApiKey("");
       setMessage("已保存，下一条消息生效");
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : String(err));
+      setMessage(messageOf(err));
     } finally {
       setBusy(false);
     }
@@ -402,7 +767,7 @@ function SettingsPanel({
           {message && <span className="settings-message">{message}</span>}
         </div>
         <p className="hint">
-          Key 只保存在本机 data/settings.json（已 gitignore）。演示桩模式不需要 Key，可以直接体验派发流程。
+          Key 只保存在你自己的 data/workspaces 目录下（已 gitignore），其他账号看不到。演示桩模式不需要 Key。
         </p>
       </div>
     </div>

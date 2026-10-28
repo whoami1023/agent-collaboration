@@ -9,6 +9,18 @@ export type ControlScope = "children" | "none";
 export type SenderKind = "user" | "member" | "system";
 export type MessageKind = "chat" | "announce" | "system";
 export type TaskStatus = "todo" | "doing" | "blocked" | "done" | "failed";
+export type UserRole = "admin" | "user";
+
+export interface PublicUser {
+  id: string;
+  username: string;
+  displayName: string;
+  role: UserRole;
+  createdAt: number;
+  /** The main agent this account is bound to inside its own room. */
+  mainAgentId: string;
+  roomId: string;
+}
 
 export interface Limits {
   maxConcurrent: number;
