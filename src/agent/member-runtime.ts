@@ -5,7 +5,13 @@ import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
 import type { LlmMessage } from "../provider/types";
 import { resolveProvider, type ProviderDeps } from "../provider/registry";
+import type { SkillLibrary } from "../skills/library";
+import type { MemorySearchManager } from "../memory/manager";
+import { resolveTriggerRecall } from "../memory/recall";
 import { runAgentLoop } from "./loop";
+import { DEFAULT_COMPACTION_SETTINGS } from "./context/compaction";
+import { resolveMaxActiveTranscriptBytes, type TranscriptByteCompactionLatch } from "./context/bounded-context";
+import type { ContextBudgetConfig } from "./context/budget";
 import { buildTools, type SpawnInput } from "./tools";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
 
@@ -14,6 +20,9 @@ export interface RuntimeDeps {
   board: Workboard;
   getProviderDeps(): ProviderDeps;
   getLimits(): Limits;
+  skills: SkillLibrary;
+  ownerId: string;
+  memory?: MemorySearchManager;
   spawn(parent: Member, input: SpawnInput, trigger: RoomMessage): Promise<string>;
   onFinished?(memberId: string): void;
 }
@@ -26,6 +35,8 @@ export class MemberRuntime {
   private controller: AbortController | null = null;
   private pending: LlmMessage[] = [];
   private running = false;
+  /** 跨运行保留的字节压缩失败闩（OpenClaw transcriptByteCompactionLatch 的本项目等价物）。 */
+  private readonly byteCompactionState: { latch?: TranscriptByteCompactionLatch } = {};
 
   constructor(
     readonly member: Member,
@@ -96,6 +107,16 @@ export class MemberRuntime {
         }
       }
       const parent = this.member.spawnedBy ? bus.getMember(this.member.spawnedBy) : undefined;
+      const skills = this.deps.skills.listForAgent(this.deps.ownerId);
+      const tools = buildTools(this.member, {
+        bus,
+        board,
+        limits,
+        skills: this.deps.skills,
+        userId: this.deps.ownerId,
+        ...(this.deps.memory ? { memory: this.deps.memory } : {}),
+        spawn: (input) => this.deps.spawn(this.member, input, trigger),
+      });
       const system = buildSystemPrompt({
         roomName: bus.roomName,
         member: this.member,
@@ -103,21 +124,43 @@ export class MemberRuntime {
         parentName: parent?.name ?? null,
         taskTitles,
         limits,
+        skills: skills.map((skill) => ({
+          name: skill.name,
+          description: skill.description,
+          scope: skill.scope,
+        })),
+        availableTools: new Set(tools.map((tool) => tool.schema.name)),
       });
+      // Lane-1 触发召回（移植 active-memory）：在主模型请求前跑，失败即不注入（fail-open）。
+      let recallContext: string | undefined;
+      if (this.deps.memory) {
+        const recall = await resolveTriggerRecall({
+          manager: this.deps.memory,
+          message: trigger.text,
+          signal: controller.signal,
+        }).catch(() => undefined);
+        recallContext = recall?.context;
+      }
       const window = formatRoomWindow(bus.window(limits.maxRoomWindowChars));
       const messages: LlmMessage[] = [
         {
           role: "user",
-          content: `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(this.member, trigger)}`,
+          content:
+            `${recallContext ? `${recallContext}\n\n` : ""}` +
+            `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(this.member, trigger)}`,
         },
       ];
-      const tools = buildTools(this.member, {
-        bus,
-        board,
-        limits,
-        spawn: (input) => this.deps.spawn(this.member, input, trigger),
-      });
       const { provider, model } = resolveProvider(this.member.providerId, this.deps.getProviderDeps());
+
+      const budget: ContextBudgetConfig = {
+        ...(limits.contextWindowTokens && limits.contextWindowTokens > 0
+          ? { contextWindowTokens: limits.contextWindowTokens }
+          : {}),
+        ...(resolveMaxActiveTranscriptBytes(limits.maxActiveTranscriptBytes) !== undefined
+          ? { maxActiveTranscriptBytes: resolveMaxActiveTranscriptBytes(limits.maxActiveTranscriptBytes) }
+          : {}),
+        compaction: { ...DEFAULT_COMPACTION_SETTINGS },
+      };
 
       const result = await runAgentLoop({
         provider,
@@ -127,11 +170,29 @@ export class MemberRuntime {
         tools,
         maxSteps: limits.maxStepsPerRun,
         signal: controller.signal,
+        budget,
+        budgetOwnerId: this.member.id,
+        byteCompactionState: this.byteCompactionState,
+        onContextApplied: (info) => {
+          if (info.kind === "compacted") {
+            this.notice(
+              `@${this.member.name} 上下文已自动压缩：压缩前约 ${info.tokensBefore} tokens，` +
+                `合并了 ${info.replacedMessages} 条历史` +
+                `${info.qualityDegraded ? "（自动摘要失败，仅保留无摘要边界）" : ""}`,
+            );
+          } else {
+            this.notice(
+              `@${this.member.name} 本次请求按字节预算截断：省略 ${info.omittedMessages} 条历史（完整记录仍保存）`,
+            );
+          }
+        },
         onDelta: (text) => this.emit({ type: "delta", runId, memberId: this.member.id, text }),
         onToolCall: (call) =>
           this.emit({ type: "tool", runId, memberId: this.member.id, name: call.name, args: call.args }),
         onToolResult: (call, content) =>
           this.emit({ type: "tool-result", runId, memberId: this.member.id, name: call.name, content }),
+        onRepair: ({ toolNames }) =>
+          this.notice(`@${this.member.name} 的文本式工具调用已被修复执行：${toolNames.join("、")}`),
         pullPending: () => this.pending.splice(0, this.pending.length),
       });
 

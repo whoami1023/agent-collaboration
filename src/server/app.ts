@@ -5,11 +5,13 @@ import type { TaskStatus } from "../core/types";
 import { maskSettings, mergeSettings } from "../core/settings";
 import { AuthError, type AuthService, type PublicUser } from "../auth/auth-service";
 import { buildClearSessionCookie, buildSessionCookie, readSessionToken } from "../auth/cookies";
+import { SkillError, type SkillRecord, type SkillLibrary } from "../skills/library";
 import type { Workspace, WorkspaceRegistry } from "../workspace/workspace";
 
 export interface AppDeps {
   auth: AuthService;
   workspaces: WorkspaceRegistry;
+  skills: SkillLibrary;
   webDist: string;
 }
 
@@ -41,6 +43,16 @@ export function createApp(deps: AppDeps): express.Express {
   const currentUser = (res: Response): PublicUser => res.locals["user"] as PublicUser;
   const workspaceFor = (res: Response): Promise<Workspace> =>
     deps.workspaces.get(currentUser(res));
+
+  const skillView = (record: SkillRecord) => {
+    const owner = record.ownerId
+      ? deps.auth.listUsers().find((candidate) => candidate.id === record.ownerId)
+      : undefined;
+    return {
+      ...record,
+      ownerName: owner?.displayName ?? (record.ownerId ? "已注销账号" : null),
+    };
+  };
 
   const startSession = (res: Response, result: { token: string; expiresAt: number }): void => {
     const maxAge = Math.max(1, Math.floor((result.expiresAt - Date.now()) / 1000));
@@ -98,6 +110,26 @@ export function createApp(deps: AppDeps): express.Express {
     res.json({ user: currentUser(res) });
   });
 
+  app.patch("/api/auth/profile", async (req: Request, res: Response) => {
+    const body = bodyOf(req);
+    const before = currentUser(res);
+    const user = await deps.auth.updateProfile(
+      before.id,
+      {
+        ...("displayName" in body ? { displayName: body["displayName"] } : {}),
+        ...("currentPassword" in body ? { currentPassword: body["currentPassword"] } : {}),
+        ...("newPassword" in body ? { newPassword: body["newPassword"] } : {}),
+      },
+      res.locals["sessionToken"] as string | undefined,
+    );
+    if (user.displayName !== before.displayName) {
+      const workspace = await workspaceFor(res);
+      workspace.renameRoom(user.displayName);
+    }
+    if (body["newPassword"] !== undefined) closeUserStreams(user.id);
+    res.json({ user });
+  });
+
   app.get("/api/users", (_req: Request, res: Response) => {
     if (currentUser(res).role !== "admin") {
       res.status(403).json({ error: "只有管理员可以查看账号列表" });
@@ -118,6 +150,57 @@ export function createApp(deps: AppDeps): express.Express {
       password: stringField(body, "password"),
     });
     res.status(201).json({ user });
+  });
+
+  app.post("/api/users/:id/password", async (req: Request, res: Response) => {
+    const actor = currentUser(res);
+    if (actor.role !== "admin") {
+      res.status(403).json({ error: "只有管理员可以重置密码" });
+      return;
+    }
+    const user = await deps.auth.resetPassword(
+      actor,
+      String(req.params["id"] ?? ""),
+      bodyOf(req)["newPassword"],
+      res.locals["sessionToken"] as string | undefined,
+    );
+    if (user.id !== actor.id) closeUserStreams(user.id);
+    res.json({ user });
+  });
+
+  app.get("/api/skills", (_req: Request, res: Response) => {
+    const user = currentUser(res);
+    res.json({
+      shared: deps.skills.listShared().map(skillView),
+      personal: deps.skills.listPersonal(user.id).map(skillView),
+      canManageShared: user.role === "admin",
+    });
+  });
+
+  app.post("/api/skills", async (req: Request, res: Response) => {
+    const body = bodyOf(req);
+    const skill = await deps.skills.create(currentUser(res), {
+      scope: body["scope"],
+      name: body["name"],
+      description: body["description"],
+      instructions: body["instructions"],
+    });
+    res.status(201).json({ skill: skillView(skill) });
+  });
+
+  app.patch("/api/skills/:id", async (req: Request, res: Response) => {
+    const body = bodyOf(req);
+    const skill = await deps.skills.update(currentUser(res), String(req.params["id"] ?? ""), {
+      ...("name" in body ? { name: body["name"] } : {}),
+      ...("description" in body ? { description: body["description"] } : {}),
+      ...("instructions" in body ? { instructions: body["instructions"] } : {}),
+    });
+    res.json({ skill: skillView(skill) });
+  });
+
+  app.delete("/api/skills/:id", async (req: Request, res: Response) => {
+    await deps.skills.remove(currentUser(res), String(req.params["id"] ?? ""));
+    res.json({ ok: true });
   });
 
   app.get("/api/state", async (_req: Request, res: Response) => {
@@ -242,13 +325,14 @@ export function createApp(deps: AppDeps): express.Express {
 
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return;
-    if (err instanceof AuthError) {
-      if (err.retryAfterMs) {
-        res.setHeader("retry-after", String(Math.ceil(err.retryAfterMs / 1000)));
+    if (err instanceof AuthError || err instanceof SkillError) {
+      const retryAfterMs = err instanceof AuthError ? err.retryAfterMs : undefined;
+      if (retryAfterMs) {
+        res.setHeader("retry-after", String(Math.ceil(retryAfterMs / 1000)));
       }
       res.status(err.status).json({
         error: err.message,
-        ...(err.retryAfterMs ? { retryAfterMs: err.retryAfterMs } : {}),
+        ...(retryAfterMs ? { retryAfterMs } : {}),
       });
       return;
     }

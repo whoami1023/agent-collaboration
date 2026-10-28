@@ -43,6 +43,12 @@ export interface CreateUserInput {
   password: string;
 }
 
+export interface ProfileUpdateInput {
+  displayName?: unknown;
+  currentPassword?: unknown;
+  newPassword?: unknown;
+}
+
 export class AuthError extends Error {
   constructor(
     readonly status: number,
@@ -250,11 +256,7 @@ export class AuthService {
         this.recordFailure(key);
         throw new AuthError(401, "用户名或密码错误");
       }
-      const candidateHash = await scryptAsync(password, user.salt);
-      const expected = Buffer.from(user.passwordHash, "hex");
-      const matches =
-        candidateHash.length === expected.length && timingSafeEqual(candidateHash, expected);
-      if (!matches) {
+      if (!(await matchesPassword(user, password))) {
         this.recordFailure(key);
         throw new AuthError(401, "用户名或密码错误");
       }
@@ -263,6 +265,85 @@ export class AuthService {
       this.pruneSessions();
       await this.persist();
       return result;
+    });
+  }
+
+  async updateProfile(
+    userId: string,
+    input: ProfileUpdateInput,
+    keepToken?: string,
+  ): Promise<PublicUser> {
+    return this.mutate(async () => {
+      const user = this.data.users.find((candidate) => candidate.id === userId);
+      if (!user) throw new AuthError(401, "请先登录");
+
+      let nextDisplayName = user.displayName;
+      if (input.displayName !== undefined) {
+        if (typeof input.displayName !== "string") {
+          throw new AuthError(400, "显示名称格式不正确");
+        }
+        nextDisplayName = input.displayName.trim();
+        if (!nextDisplayName) throw new AuthError(400, "显示名称不能为空");
+        if (nextDisplayName.length > DISPLAY_NAME_MAX) {
+          throw new AuthError(400, `显示名称不能超过 ${DISPLAY_NAME_MAX} 个字符`);
+        }
+      }
+
+      let nextPassword: { salt: string; passwordHash: string } | null = null;
+      const wantsNewPassword = input.newPassword !== undefined;
+      const hasCurrentPassword = input.currentPassword !== undefined;
+      if (wantsNewPassword || hasCurrentPassword) {
+        if (!wantsNewPassword || !hasCurrentPassword) {
+          throw new AuthError(400, "修改密码需要同时提供当前密码和新密码");
+        }
+        const current = normalizeLoginPassword(input.currentPassword);
+        const next = normalizePassword(input.newPassword);
+        if (!(await matchesPassword(user, current))) {
+          throw new AuthError(400, "当前密码不正确");
+        }
+        nextPassword = await hashPassword(next);
+      }
+
+      let changed = false;
+      if (nextDisplayName !== user.displayName) {
+        user.displayName = nextDisplayName;
+        changed = true;
+      }
+      if (nextPassword) {
+        user.salt = nextPassword.salt;
+        user.passwordHash = nextPassword.passwordHash;
+        const keepHash = keepToken ? hashToken(keepToken) : "";
+        this.data.sessions = this.data.sessions.filter(
+          (session) => session.userId !== user.id || session.tokenHash === keepHash,
+        );
+        changed = true;
+      }
+
+      if (changed) await this.persist();
+      return publicUser(user);
+    });
+  }
+
+  async resetPassword(
+    actor: PublicUser,
+    userId: string,
+    newPassword: unknown,
+    keepToken?: string,
+  ): Promise<PublicUser> {
+    return this.mutate(async () => {
+      if (actor.role !== "admin") throw new AuthError(403, "只有管理员可以重置密码");
+      const user = this.data.users.find((candidate) => candidate.id === userId);
+      if (!user) throw new AuthError(404, "账号不存在");
+      const password = normalizePassword(newPassword);
+      const next = await hashPassword(password);
+      user.salt = next.salt;
+      user.passwordHash = next.passwordHash;
+      const keepHash = keepToken ? hashToken(keepToken) : "";
+      this.data.sessions = this.data.sessions.filter(
+        (session) => session.userId !== user.id || session.tokenHash === keepHash,
+      );
+      await this.persist();
+      return publicUser(user);
     });
   }
 
@@ -350,6 +431,12 @@ export class AuthService {
     );
     return next;
   }
+}
+
+async function matchesPassword(user: UserRecord, password: string): Promise<boolean> {
+  const candidateHash = await scryptAsync(password, user.salt);
+  const expected = Buffer.from(user.passwordHash, "hex");
+  return candidateHash.length === expected.length && timingSafeEqual(candidateHash, expected);
 }
 
 async function hashPassword(password: string): Promise<{ salt: string; passwordHash: string }> {

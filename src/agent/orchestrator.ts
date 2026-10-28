@@ -5,19 +5,25 @@ import { newId } from "../core/ids";
 import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
 import { decideWakes } from "../room/wake";
+import type { SkillLibrary } from "../skills/library";
+import type { MemorySearchManager } from "../memory/manager";
 import { MemberRuntime } from "./member-runtime";
 import type { SpawnInput } from "./tools";
 import type { MockHandler } from "../provider/mock";
+import { resolveSpawnAdmission, countChildren } from "./spawn/spawn-plan";
+import { reserveChildAdmissionSlot, LEAF_SPAWN_REJECT_ERROR } from "./spawn/child-admission";
+import { normalizeMemberName } from "./spawn/task-name";
+import { buildSubagentSpawnEnvelope } from "./spawn/system-prompt";
 
 export interface OrchestratorDeps {
   bus: RoomBus;
   board: Workboard;
   getSettings(): Settings;
+  skills: SkillLibrary;
+  ownerId: string;
   mockHandler?: MockHandler;
+  memory?: MemorySearchManager;
 }
-
-const RESERVED_NAMES = new Set(["用户", "系统"]);
-const NAME_RE = /^[\p{L}\p{N}_-]{1,12}$/u;
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
   const existing = bus.listMembers().find((member) => member.role === "main");
@@ -43,6 +49,7 @@ export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
 
 export class Orchestrator {
   private runtimes = new Map<string, MemberRuntime>();
+  private pendingReleases = new Map<string, () => void>();
   private seen = new Set<string>();
   private notices = new Set<string>();
   private queue: Array<() => void> = [];
@@ -141,6 +148,13 @@ export class Orchestrator {
     }
   }
 
+  /** 待启动槽位在子成员跑完时释放；若始终未被唤醒（取消/回合熔断），60 秒后兜底回收。 */
+  private holdAdmissionSlot(memberId: string, release: () => void): void {
+    this.pendingReleases.set(memberId, release);
+    const timer = setTimeout(release, 60_000);
+    timer.unref();
+  }
+
   private runtimeFor(member: Member): MemberRuntime {
     let runtime = this.runtimes.get(member.id);
     if (!runtime) {
@@ -153,7 +167,11 @@ export class Orchestrator {
           ...(deps.mockHandler ? { mockHandler: deps.mockHandler } : {}),
         }),
         getLimits: () => deps.getSettings().limits,
+        skills: deps.skills,
+        ownerId: deps.ownerId,
+        memory: deps.memory,
         spawn: (parent, input, trigger) => this.spawn(parent, input, trigger),
+        onFinished: () => this.pendingReleases.get(member.id)?.(),
       });
       this.runtimes.set(member.id, runtime);
     }
@@ -163,21 +181,28 @@ export class Orchestrator {
   private async spawn(parent: Member, input: SpawnInput, trigger: RoomMessage): Promise<string> {
     const { bus, board } = this.deps;
     const limits: Limits = this.deps.getSettings().limits;
-    if (parent.role !== "main") return "错误：只有主智能体可以创建成员";
+    if (parent.role !== "main" && parent.controlScope !== "children") {
+      return LEAF_SPAWN_REJECT_ERROR;
+    }
 
-    const name = input.name.replace(/^@+/, "").trim();
-    if (!NAME_RE.test(name)) return "错误：成员名只能是 1-12 个中英文、数字、下划线或短横线";
-    if (RESERVED_NAMES.has(name)) return `错误：${name} 是保留名称`;
+    const normalized = normalizeMemberName(input.name);
+    if (normalized.error || !normalized.name) return `错误：${normalized.error ?? "成员名不合法"}`;
+    const name = normalized.name;
     if (bus.findMemberByName(name)) return `错误：成员 @${name} 已存在，请直接 @ 它派活`;
-    if (parent.depth + 1 >= limits.maxSpawnDepth) {
-      return `错误：嵌套深度已达上限 ${limits.maxSpawnDepth}`;
-    }
-    const children = bus
-      .listMembers()
-      .filter((member) => member.spawnedBy === parent.id && member.status !== "cancelled");
-    if (children.length >= limits.maxChildrenPerAgent) {
-      return `错误：@${parent.name} 的直接成员已达上限 ${limits.maxChildrenPerAgent}`;
-    }
+
+    // Ported resolveSpawnAdmission + reserveChildAdmissionSlot：先准入检查，
+    // 再占住待启动槽位，防止同一 tick 的并发派发同时通过活跃子成员计数。
+    const admission = reserveChildAdmissionSlot({
+      controllerKey: parent.id,
+      resolveAdmission: (pendingChildren) =>
+        resolveSpawnAdmission({
+          callerDepth: parent.depth,
+          limits,
+          activeChildren: countChildren(bus.listMembers(), parent.id),
+          additionalActiveChildren: pendingChildren,
+        }),
+    });
+    if (!admission.ok) return `错误：${admission.error}`;
 
     const member: Member = {
       id: newId("m"),
@@ -185,9 +210,9 @@ export class Orchestrator {
       name,
       role: "sub",
       status: "idle",
-      depth: parent.depth + 1,
+      depth: admission.childSessionPatch.depth,
       spawnedBy: parent.id,
-      controlScope: "none",
+      controlScope: admission.childSessionPatch.controlScope,
       contextMode: input.contextMode ?? "isolated",
       systemPrompt: input.systemPrompt ?? "",
       providerId: input.providerId ?? DEFAULT_PROVIDER_ID,
@@ -196,6 +221,18 @@ export class Orchestrator {
     };
     bus.addMember(member);
 
+    // Ported buildSubagentSpawnEnvelope：任务包进子成员信封，回执说明完成模式。
+    const envelope = buildSubagentSpawnEnvelope({
+      completionMode: "announce",
+      spawnMode: "session",
+      task: input.task,
+      requesterName: parent.name,
+      childName: member.name,
+      label: input.task.slice(0, 60),
+      childDepth: member.depth,
+      maxSpawnDepth: admission.maxSpawnDepth,
+    });
+
     const card = board.create({
       title: input.task.slice(0, 60),
       detail: input.task,
@@ -203,17 +240,26 @@ export class Orchestrator {
       ownerId: member.id,
     });
 
+    const release = this.pendingReleases.get(member.id);
+    if (release) release();
+    this.holdAdmissionSlot(member.id, () => {
+      admission.release();
+      this.pendingReleases.delete(member.id);
+    });
+
     bus.append({
       senderId: parent.id,
       senderName: parent.name,
       senderKind: "member",
       kind: "chat",
-      text: `@${member.name} ${input.task}`,
+      text: `@${member.name} ${envelope.message}`,
       taskId: card.id,
       chainRootId: trigger.chainRootId ?? trigger.id,
       depthTurn: (trigger.depthTurn ?? 0) + 1,
     });
 
-    return `已创建成员 @${member.name}（${member.id}），任务卡 ${card.id} 已生成并派发`;
+    return `已创建成员 @${member.name}（${member.id}，深度 ${member.depth}，${
+      member.controlScope === "children" ? "可再下派" : "末端执行"
+    }），任务卡 ${card.id} 已生成并派发。${envelope.acceptedNote}`;
   }
 }

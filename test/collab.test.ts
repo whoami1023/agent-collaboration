@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { RoomBus } from "../src/room/bus";
 import { Workboard } from "../src/workboard/board";
 import { Orchestrator, ensureMainMember } from "../src/agent/orchestrator";
@@ -6,6 +9,13 @@ import { DEFAULT_LIMITS, type Limits } from "../src/core/types";
 import type { Settings } from "../src/core/settings";
 import type { MockHandler } from "../src/provider/mock";
 import { buildTools } from "../src/agent/tools";
+import { SkillLibrary } from "../src/skills/library";
+
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
   const started = Date.now();
@@ -15,10 +25,14 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
   }
 }
 
-function makeRig(handler: MockHandler, overrides: Partial<Limits> = {}) {
+async function makeRig(handler: MockHandler, overrides: Partial<Limits> = {}) {
   const bus = new RoomBus("room_test", "测试群");
   const board = new Workboard("room_test");
   ensureMainMember(bus);
+  const dir = await mkdtemp(join(tmpdir(), "ac-collab-"));
+  tempDirs.push(dir);
+  const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+  await skills.init();
   const settings: Settings = {
     providers: [{ id: "demo", kind: "mock", model: "mock" }],
     activeProviderId: "demo",
@@ -28,9 +42,11 @@ function makeRig(handler: MockHandler, overrides: Partial<Limits> = {}) {
     bus,
     board,
     getSettings: () => settings,
+    skills,
+    ownerId: "u_test",
     mockHandler: handler,
   });
-  return { bus, board, orchestrator, settings };
+  return { bus, board, orchestrator, settings, skills };
 }
 
 function collaborativeHandler(): MockHandler {
@@ -62,7 +78,7 @@ function collaborativeHandler(): MockHandler {
 
 describe("group-chat collaboration", () => {
   it("用户提问 → 主智能体创建成员并 @ 派发 → 子报告 → 主综合", async () => {
-    const { bus, board, orchestrator } = makeRig(collaborativeHandler());
+    const { bus, board, orchestrator } = await makeRig(collaborativeHandler());
 
     orchestrator.sendUserMessage("帮我调研多智能体协同的调度方式");
 
@@ -93,8 +109,8 @@ describe("group-chat collaboration", () => {
     await waitFor(() => orchestrator.activeRuns === 0);
   });
 
-  it("子成员的工具集里没有 spawn_member，主智能体才有", () => {
-    const { bus, board, settings } = makeRig(collaborativeHandler());
+  it("controlScope=none 的成员调用 spawn_member 会被执行侧护栏拒绝", async () => {
+    const { bus, board, settings, skills } = await makeRig(collaborativeHandler());
     const main = bus.listMembers()[0];
     if (!main) throw new Error("缺少主智能体");
     const researcher = {
@@ -112,13 +128,15 @@ describe("group-chat collaboration", () => {
       createdAt: 0,
       lastActiveAt: 0,
     };
-    const spawn = async () => "unused";
-    const deps = { bus, board, limits: settings.limits, spawn };
+    const spawn = async () => "不该被调用";
+    const deps = { bus, board, limits: settings.limits, skills, userId: "u_test", spawn };
     const mainTools = buildTools(main, deps).map((tool) => tool.schema.name);
-    const subTools = buildTools(researcher, deps).map((tool) => tool.schema.name);
+    const subTools = buildTools(researcher, deps);
     expect(mainTools).toContain("spawn_member");
-    expect(subTools).not.toContain("spawn_member");
-    expect(subTools).toContain("task_update");
+    expect(subTools.map((tool) => tool.schema.name)).toContain("task_update");
+    const subSpawn = subTools.find((tool) => tool.schema.name === "spawn_member");
+    const rejected = await subSpawn?.execute({ name: "乙", task: "任务" }, new AbortController().signal);
+    expect(String(rejected)).toContain("末端执行者不能再下派");
   });
 
   it("超过直接成员上限时会拒绝并说明原因", async () => {
@@ -140,7 +158,7 @@ describe("group-chat collaboration", () => {
       return { text: "收到" };
     };
 
-    const { bus, orchestrator } = makeRig(handler, { maxChildrenPerAgent: 1 });
+    const { bus, orchestrator } = await makeRig(handler, { maxChildrenPerAgent: 1 });
     bus.subscribe((event) => {
       if (event.type === "run" && event.event.type === "tool-result") {
         toolResults.push(event.event.content);
@@ -153,23 +171,27 @@ describe("group-chat collaboration", () => {
     expect(toolResults[1]).toContain("上限");
   });
 
-  it("嵌套深度达到上限时拒绝创建", async () => {
+  it("深度上限内的 leaf 成员可创建，但其再下派会被准入拒绝", async () => {
     const toolResults: string[] = [];
     const handler: MockHandler = (request) => {
       const system = request.messages[0]?.content ?? "";
       if (system.includes("里的主智能体")) {
         return { toolCalls: [{ name: "spawn_member", args: { name: "甲", task: "任务甲" } }] };
       }
+      if (system.includes("末端执行者（leaf")) {
+        return { toolCalls: [{ name: "spawn_member", args: { name: "乙", task: "不该成功" } }] };
+      }
       return { text: "收到" };
     };
-    const { bus, orchestrator } = makeRig(handler, { maxSpawnDepth: 1 });
+    const { bus, orchestrator } = await makeRig(handler, { maxSpawnDepth: 1 });
     bus.subscribe((event) => {
       if (event.type === "run" && event.event.type === "tool-result") {
         toolResults.push(event.event.content);
       }
     });
     orchestrator.sendUserMessage("派个任务");
-    await waitFor(() => toolResults.length >= 1);
-    expect(toolResults[0]).toContain("嵌套深度");
+    await waitFor(() => toolResults.length >= 2);
+    expect(toolResults.some((text) => text.includes("末端执行者不能再下派"))).toBe(true);
+    expect(bus.findMemberByName("乙")).toBeUndefined();
   });
 });

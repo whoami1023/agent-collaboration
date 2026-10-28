@@ -1,8 +1,16 @@
 import type { ContextMode, Limits, Member, TaskStatus } from "../core/types";
 import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
+import type { SkillLibrary } from "../skills/library";
+import type { MemorySearchManager } from "../memory/manager";
+import { buildMemoryTools } from "../memory/tools";
 import type { ToolImpl } from "./loop";
 import { formatRoomWindow } from "./prompts";
+import {
+  isSpawnDepthAllowed,
+  spawnDepthRejectError,
+  LEAF_SPAWN_REJECT_ERROR,
+} from "./spawn/child-admission";
 
 export interface SpawnInput {
   name: string;
@@ -16,7 +24,10 @@ export interface ToolDeps {
   bus: RoomBus;
   board: Workboard;
   limits: Limits;
+  skills: SkillLibrary;
+  userId: string;
   spawn(input: SpawnInput): Promise<string>;
+  memory?: MemorySearchManager;
 }
 
 const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done", "failed"];
@@ -36,8 +47,9 @@ function readStringArray(args: Record<string, unknown>, key: string): string[] |
 export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   const tools: ToolImpl[] = [];
 
-  if (member.role === "main") {
-    tools.push({
+  // Ported capability gate：spawn_member 始终注册但受双重护栏——
+  // controlScope（leaf 直接拒绝）与嵌套深度；与 OpenClaw「声明与准入分离」一致。
+  tools.push({
       schema: {
         name: "spawn_member",
         description:
@@ -63,6 +75,10 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
         },
       },
       execute: async (args) => {
+        if (member.controlScope !== "children") return LEAF_SPAWN_REJECT_ERROR;
+        if (!isSpawnDepthAllowed(member.depth, deps.limits.maxSpawnDepth)) {
+          return `错误：${spawnDepthRejectError(member.depth, deps.limits.maxSpawnDepth)}`;
+        }
         const name = readString(args, "name");
         const task = readString(args, "task");
         if (!name) return "错误：name 不能为空";
@@ -78,8 +94,35 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
           ...(providerId ? { providerId } : {}),
         });
       },
-    });
-  }
+  });
+
+  tools.push({
+    schema: {
+      name: "use_skill",
+      description:
+        "读取一个可用技能的完整说明。当任务与某个技能的描述匹配时，先调用本工具，再严格按返回的步骤执行。",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "技能名称，见 system prompt 中的可用技能列表" },
+        },
+        required: ["name"],
+        additionalProperties: false,
+      },
+    },
+    execute: async (args) => {
+      const raw = readString(args, "name");
+      if (!raw) return "错误：name 不能为空";
+      const skill = deps.skills.readForAgent(deps.userId, raw);
+      if (!skill) {
+        const available = deps.skills.listForAgent(deps.userId).map((item) => item.name);
+        return `错误：没有可用的技能 ${raw}${
+          available.length > 0 ? `。可用技能：${available.join("、")}` : ""
+        }`;
+      }
+      return `技能 ${skill.name}（${skill.scope === "shared" ? "共享" : "个人"}）\n描述：${skill.description}\n\n${skill.instructions}`;
+    },
+  });
 
   tools.push({
     schema: {
@@ -206,6 +249,12 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
       return formatRoomWindow(messages) || "（群里还没有消息）";
     },
   });
+
+  // P5：记忆三件套（memory_search / memory_get / memory_append），
+  // 对应 OpenClaw memory-core 插件按 agent 注册工具通道的形态。
+  if (deps.memory) {
+    tools.push(...buildMemoryTools(deps.memory));
+  }
 
   return tools;
 }

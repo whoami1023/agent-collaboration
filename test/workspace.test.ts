@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { SkillLibrary } from "../src/skills/library";
 import { WorkspaceRegistry } from "../src/workspace/workspace";
 
 let dir: string;
@@ -9,7 +10,9 @@ let registry: WorkspaceRegistry;
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "ac-workspace-"));
-  registry = new WorkspaceRegistry(dir);
+  const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+  await skills.init();
+  registry = new WorkspaceRegistry(dir, skills);
 });
 
 afterEach(async () => {
@@ -63,7 +66,9 @@ describe("WorkspaceRegistry", () => {
     await alice.setSettings({ ...alice.getSettings(), activeProviderId: "deepseek" });
     await alice.close();
 
-    const reloaded = new WorkspaceRegistry(dir);
+    const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await skills.init();
+    const reloaded = new WorkspaceRegistry(dir, skills);
     const restored = await reloaded.get({ id: "u_alice", displayName: "Alice" });
     expect(restored.bus.listMessages(10).map((message) => message.text)).toContain(
       "需要保留的消息",

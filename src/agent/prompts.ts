@@ -1,4 +1,8 @@
 import type { Member, RoomMessage } from "../core/types";
+import type { SkillSummary } from "../skills/library";
+import { buildMemoryPromptSection } from "../memory/prompt";
+import { buildSubagentStandingInstructions } from "./spawn/system-prompt";
+import { resolveSubagentCapabilities } from "./spawn/capabilities";
 
 function clock(ts: number): string {
   const date = new Date(ts);
@@ -43,10 +47,25 @@ export interface PromptContext {
   parentName: string | null;
   taskTitles: Map<string, string>;
   limits: { maxChildrenPerAgent: number; maxSpawnDepth: number; maxConcurrent: number };
+  skills: SkillSummary[];
+  /** 本轮实际注册的工具名；记忆指引只描述可用工具（对应 OpenClaw availableTools）。 */
+  availableTools?: Set<string>;
+}
+
+function formatSkills(skills: SkillSummary[]): string {
+  if (skills.length === 0) return "- （暂无可用技能）";
+  return skills
+    .map((skill) => `- ${skill.name}（${skill.scope === "shared" ? "共享" : "个人"}）：${skill.description}`)
+    .join("\n");
 }
 
 export function buildSystemPrompt(context: PromptContext): string {
-  return context.member.role === "main" ? mainPrompt(context) : subPrompt(context);
+  const base = context.member.role === "main" ? mainPrompt(context) : subPrompt(context);
+  // 对应 OpenClaw memory-core 的 promptSection：拼在系统提示尾部，仅描述实际注册的工具。
+  const memorySection = context.availableTools
+    ? buildMemoryPromptSection({ availableTools: context.availableTools }).join("\n")
+    : "";
+  return memorySection ? `${base}\n\n${memorySection.trimEnd()}` : base;
 }
 
 function mainPrompt(context: PromptContext): string {
@@ -55,6 +74,9 @@ function mainPrompt(context: PromptContext): string {
 
 群成员：
 ${formatRoster(member, members, taskTitles)}
+
+可用技能（任务与描述匹配时，先调用 use_skill 读取完整说明，再按其中步骤执行）：
+${formatSkills(context.skills)}
 
 判断与派发
 - 快问快答、你已知或一步能查的，直接自己回答，不要派发。
@@ -71,18 +93,35 @@ ${formatRoster(member, members, taskTitles)}
 }
 
 function subPrompt(context: PromptContext): string {
-  const { member, roomName, members, parentName, taskTitles } = context;
-  return `你是群聊「${roomName}」里的成员 @${member.name}，由 ${parentName ? `@${parentName}` : "主智能体"} 创建，只对分配给你的任务负责。
+  const { member, roomName, members, parentName, taskTitles, limits } = context;
+  const capabilities = resolveSubagentCapabilities({ depth: member.depth, maxSpawnDepth: limits.maxSpawnDepth });
+  const canDelegate = capabilities.role === "orchestrator" && member.controlScope === "children";
+  const delegateRule = canDelegate
+    ? "- 你是协调者（orchestrator，深度 " +
+      member.depth +
+      `，上限 ${limits.maxSpawnDepth}）：可以用 spawn_member 把可并行的子任务下派给你的子成员，等他们交回报告后你再综合。`
+    : "- 你是末端执行者（leaf，深度 " + member.depth + "）：不能再下派成员，只做分给你的任务。";
+  const base = `你是群聊「${roomName}」里的成员 @${member.name}，由 ${parentName ? `@${parentName}` : "主智能体"} 创建，只对分配给你的任务负责。
 
 群成员：
 ${formatRoster(member, members, taskTitles)}
+
+可用技能（任务与描述匹配时，先调用 use_skill 读取完整说明，再按其中步骤执行）：
+${formatSkills(context.skills)}
 
 纪律
 - 你只在被 @${member.name} 或收到分配任务时行动；其他人的闲聊不回应。
 - 一次只发一条完整结论，不刷屏，不发「收到」这类空话。
 - 汇报必须包含：结论、证据（路径/链接/关键输出）、未解决项与不确定点。不要只给承诺。
-- 只 @主智能体补充问题；不要 @其他成员，也不要转派任务。
+${delegateRule}
+- 不要 @ 其他同级成员互相派活；跨线协调必须经过创建你的那一级。
 - 用 task_update 更新任务卡状态，用 task_attach_artifact 登记产出。`;
+  const standing = buildSubagentStandingInstructions({
+    spawnMode: "session",
+    childDepth: member.depth,
+    maxSpawnDepth: limits.maxSpawnDepth,
+  });
+  return `${base}\n${standing}`;
 }
 
 export function buildInstruction(member: Member, trigger: RoomMessage): string {

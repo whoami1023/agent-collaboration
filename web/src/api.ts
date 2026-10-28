@@ -96,6 +96,18 @@ export async function logoutUser(): Promise<void> {
   await request<{ ok: boolean }>("/api/auth/logout", { method: "POST" });
 }
 
+export async function updateProfile(input: {
+  displayName?: string;
+  currentPassword?: string;
+  newPassword?: string;
+}): Promise<PublicUser> {
+  const body = await request<{ user: PublicUser }>("/api/auth/profile", {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+  return body.user;
+}
+
 export async function listUsers(): Promise<PublicUser[]> {
   const body = await request<{ users: PublicUser[] }>("/api/users");
   return body.users;
@@ -111,6 +123,73 @@ export async function createUser(input: {
     body: JSON.stringify(input),
   });
   return body.user;
+}
+
+export async function resetUserPassword(
+  userId: string,
+  newPassword: string,
+): Promise<PublicUser> {
+  const body = await request<{ user: PublicUser }>(
+    `/api/users/${encodeURIComponent(userId)}/password`,
+    { method: "POST", body: JSON.stringify({ newPassword }) },
+  );
+  return body.user;
+}
+
+export type SkillScope = "shared" | "personal";
+
+export interface SkillView {
+  id: string;
+  scope: SkillScope;
+  ownerId: string | null;
+  ownerName: string | null;
+  name: string;
+  description: string;
+  instructions: string;
+  builtin?: boolean;
+  source?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SkillSnapshot {
+  shared: SkillView[];
+  personal: SkillView[];
+  canManageShared: boolean;
+}
+
+export async function fetchSkills(): Promise<SkillSnapshot> {
+  return request<SkillSnapshot>("/api/skills");
+}
+
+export async function createSkill(input: {
+  scope: SkillScope;
+  name: string;
+  description: string;
+  instructions: string;
+}): Promise<SkillView> {
+  const body = await request<{ skill: SkillView }>("/api/skills", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return body.skill;
+}
+
+export async function updateSkill(
+  skillId: string,
+  patch: { name?: string; description?: string; instructions?: string },
+): Promise<SkillView> {
+  const body = await request<{ skill: SkillView }>(`/api/skills/${encodeURIComponent(skillId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+  return body.skill;
+}
+
+export async function deleteSkill(skillId: string): Promise<void> {
+  await request<{ ok: boolean }>(`/api/skills/${encodeURIComponent(skillId)}`, {
+    method: "DELETE",
+  });
 }
 
 export function fetchState(): Promise<StateSnapshot> {

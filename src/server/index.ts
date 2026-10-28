@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { createApp } from "./app";
 import { AuthService } from "../auth/auth-service";
+import { SkillLibrary } from "../skills/library";
 import { WorkspaceRegistry } from "../workspace/workspace";
 
 const root = process.cwd();
@@ -10,10 +11,14 @@ async function main(): Promise<void> {
   const auth = new AuthService(join(dataDir, "auth.json"));
   await auth.init();
 
-  const workspaces = new WorkspaceRegistry(join(dataDir, "workspaces"));
+  const skills = new SkillLibrary(join(dataDir, "skills.json"));
+  await skills.init();
+
+  const workspaces = new WorkspaceRegistry(join(dataDir, "workspaces"), skills);
   const app = createApp({
     auth,
     workspaces,
+    skills,
     webDist: join(root, "web", "dist"),
   });
 

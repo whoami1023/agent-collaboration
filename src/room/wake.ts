@@ -26,6 +26,12 @@ export function decideWakes(message: RoomMessage, members: Member[]): WakeDecisi
       wakes.add(memberId);
       continue;
     }
+    // 移植的血缘规则：controlScope=children 的协调成员对其子成员的点名属于下派，
+    // 不算同级互派；announce 仍只沿 spawnedBy 交回（见文件末尾）。
+    if (sender?.controlScope === "children") {
+      wakes.add(memberId);
+      continue;
+    }
     if (target.role === "main") {
       wakes.add(memberId);
       continue;

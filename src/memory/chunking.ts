@@ -1,0 +1,237 @@
+/**
+ * 移植自 OpenClaw（MIT License, Copyright (c) 2026 OpenClaw Foundation）：
+ * packages/memory-host-sdk/src/host/markdown-chunks.ts —— 逐字移植。
+ * 适配：hashText 用 node:crypto 的 sha256（OpenClaw 用 normalization-core/node-crypto）；
+ * EmbeddingInput/provenance 字段在多模态与来源审计层不在本项目移植范围，已去除。
+ */
+
+import { createHash } from "node:crypto";
+import {
+  CHARS_PER_TOKEN_ESTIMATE,
+  estimateStringChars,
+} from "../agent/context/cjk-chars";
+import { truncateUtf16Safe } from "../agent/context/utf16-slice";
+
+export type MemoryChunk = {
+  startLine: number;
+  endLine: number;
+  entryStartLine?: number;
+  entryEndLine?: number;
+  text: string;
+  hash: string;
+};
+
+export function hashText(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+// Persisted with index metadata so boundary changes rebuild unchanged files.
+export const MEMORY_CHUNKING_VERSION = 6;
+
+type CuratedMarkdownEntry = {
+  startLine: number;
+  endLine: number;
+  text: string;
+  kind: "entry" | "section";
+};
+
+function curatedMarkdownEntryKind(line: string): CuratedMarkdownEntry["kind"] | undefined {
+  return line.startsWith("- ") ? "entry" : /^#{1,6}(?:\s|$)/u.test(line) ? "section" : undefined;
+}
+
+function* curatedMarkdownEntrySpans(lines: string[]) {
+  let startLine = 1;
+  let kind: CuratedMarkdownEntry["kind"] = lines[0]?.startsWith("- ") ? "entry" : "section";
+  for (let index = 1; index < lines.length; index += 1) {
+    const nextKind = curatedMarkdownEntryKind(lines[index] ?? "");
+    if (nextKind) {
+      yield { startLine, endLine: index, kind };
+      startLine = index + 1;
+      kind = nextKind;
+    }
+  }
+  yield { startLine, endLine: lines.length, kind };
+}
+
+export function splitCuratedMarkdownEntries(content: string): CuratedMarkdownEntry[] {
+  const lines = content.split("\n");
+  return Array.from(curatedMarkdownEntrySpans(lines), ({ startLine, endLine, kind }) => ({
+    startLine,
+    endLine,
+    text: lines.slice(startLine - 1, endLine).join("\n"),
+    kind,
+  }));
+}
+
+/** Takes the trailing slice of text within the weighted char budget, without splitting surrogate pairs. */
+function takeTailByEstimatedChars(text: string, budget: number): string {
+  let acc = 0;
+  let start = text.length;
+  while (start > 0) {
+    const previous = start - ((text.codePointAt(start - 2) ?? 0) > 0xffff ? 2 : 1);
+    acc += estimateStringChars(text.slice(previous, start));
+    if (!(acc <= budget)) {
+      break;
+    }
+    start = previous;
+  }
+  return text.slice(start);
+}
+
+/** Incremental text chunking: callers retain only the current chunk and overlap. */
+export function createMarkdownChunker(
+  chunking: { tokens: number; overlap: number },
+  onChunk: (chunk: MemoryChunk) => void,
+) {
+  const maxChars = Math.max(32, chunking.tokens * CHARS_PER_TOKEN_ESTIMATE);
+  const overlapChars = Math.max(0, chunking.overlap * CHARS_PER_TOKEN_ESTIMATE);
+
+  let current: Array<{ line: string; lineNo: number }> = [];
+  let currentChars = 0;
+  let pendingLine = "";
+
+  const flush = () => {
+    const firstEntry = current[0];
+    const lastEntry = current[current.length - 1];
+    if (!firstEntry || !lastEntry) {
+      return;
+    }
+    const text = current.map((entry) => entry.line).join("\n");
+    onChunk({
+      startLine: firstEntry.lineNo,
+      endLine: lastEntry.lineNo,
+      text,
+      hash: hashText(text),
+    });
+  };
+
+  const carryOverlap = (window: number) => {
+    if (window <= 0 || current.length === 0) {
+      current = [];
+      currentChars = 0;
+      return;
+    }
+    let acc = 0;
+    const kept: Array<{ line: string; lineNo: number }> = [];
+    for (let i = current.length - 1; i >= 0; i -= 1) {
+      const entry = current[i];
+      if (!entry) {
+        continue;
+      }
+      const entrySize = estimateStringChars(entry.line) + 1;
+      const remaining = window - acc;
+      if (entrySize > remaining) {
+        // A segment wider than the remaining window keeps only its trailing
+        // slice, measured in the same weighted units as the budget.
+        const tail = kept.length === 0 ? takeTailByEstimatedChars(entry.line, remaining - 1) : "";
+        if (tail.length > 0) {
+          kept.unshift({ line: tail, lineNo: entry.lineNo });
+          acc += estimateStringChars(tail) + 1;
+        }
+        break;
+      }
+      acc += entrySize;
+      kept.unshift(entry);
+      if (acc >= window) {
+        break;
+      }
+    }
+    current = kept;
+    currentChars = acc;
+  };
+
+  const appendSegment = (segment: string, lineNo: number, chars: number) => {
+    const lineSize = chars + 1;
+    if (currentChars + lineSize > maxChars && current.length > 0) {
+      flush();
+      // Carry and the incoming segment share one budget, including line separators.
+      carryOverlap(Math.min(overlapChars, Math.max(0, maxChars - lineSize)));
+    }
+    current.push({ line: segment, lineNo });
+    currentChars += lineSize;
+  };
+
+  return {
+    appendLine(part: string, lineNo: number, endOfLine = true) {
+      const line = pendingLine + part;
+      pendingLine = "";
+      if (line.length === 0 && endOfLine) {
+        appendSegment("", lineNo, 0);
+      } else {
+        for (let start = 0; start < line.length;) {
+          if (!endOfLine && line.length - start <= maxChars) {
+            pendingLine = line.slice(start);
+            break;
+          }
+          const coarse = truncateUtf16Safe(line.slice(start), maxChars);
+          const coarseChars = estimateStringChars(coarse);
+          if (coarseChars > maxChars) {
+            // Rare and supplementary ideographs can cost several tokens each.
+            // Split by the estimator's units while keeping every code point intact.
+            let partStart = 0;
+            let partEnd = 0;
+            let partChars = 0;
+            for (const character of coarse) {
+              const chars = estimateStringChars(character);
+              if (partChars + chars > maxChars) {
+                appendSegment(coarse.slice(partStart, partEnd), lineNo, partChars);
+                partStart = partEnd;
+                partChars = 0;
+              }
+              partEnd += character.length;
+              partChars += chars;
+            }
+            appendSegment(coarse.slice(partStart), lineNo, partChars);
+          } else {
+            appendSegment(coarse, lineNo, coarseChars);
+          }
+          start += coarse.length;
+        }
+      }
+    },
+    flush() {
+      flush();
+      current = [];
+      currentChars = 0;
+    },
+  };
+}
+
+export function chunkMarkdown(
+  content: string,
+  chunking: { tokens: number; overlap: number; perEntry?: boolean },
+): MemoryChunk[] {
+  const lines = content.split("\n");
+  const chunks: MemoryChunk[] = [];
+  const entries = chunking.perEntry
+    ? curatedMarkdownEntrySpans(lines)
+    : [{ startLine: 1, endLine: lines.length, kind: "section" as const }];
+  for (const entry of entries) {
+    const chunker = createMarkdownChunker(chunking, (chunk) => {
+      if (entry.kind === "entry") {
+        chunk.entryStartLine = entry.startLine;
+        chunk.entryEndLine = entry.endLine;
+      }
+      chunks.push(chunk);
+    });
+    for (let i = entry.startLine - 1; i < entry.endLine; i += 1) {
+      chunker.appendLine(lines[i] ?? "", i + 1);
+    }
+    chunker.flush();
+  }
+  return chunks;
+}
+
+/**
+ * Remap chunk startLine/endLine from content-relative positions to original
+ * source line positions. 移植自 OpenClaw（session JSONL 展平后回指源行号）。
+ */
+export function remapChunkLines(chunks: MemoryChunk[], lineMap: number[] | undefined): void {
+  if (!lineMap || lineMap.length === 0) {
+    return;
+  }
+  for (const chunk of chunks) {
+    chunk.startLine = lineMap[chunk.startLine - 1] ?? chunk.startLine;
+    chunk.endLine = lineMap[chunk.endLine - 1] ?? chunk.endLine;
+  }
+}

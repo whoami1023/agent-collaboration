@@ -112,6 +112,100 @@ describe("AuthService", () => {
     expect(result.user.username).toBe("owner");
   });
 
+  it("可以更新显示名称与密码，密码变更会注销其他会话", async () => {
+    const auth = service();
+    await auth.init();
+    const admin = await auth.setupAdmin({
+      username: "owner",
+      displayName: "老板",
+      password: "secret123",
+    });
+    const other = await auth.login("owner", "secret123", "127.0.0.1");
+
+    const renamed = await auth.updateProfile(admin.user.id, { displayName: "  老王  " });
+    expect(renamed.displayName).toBe("老王");
+
+    await expect(
+      auth.updateProfile(admin.user.id, { displayName: "   " }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      auth.updateProfile(admin.user.id, { newPassword: "newsecret1" }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      auth.updateProfile(admin.user.id, {
+        currentPassword: "wrong-pass",
+        newPassword: "newsecret1",
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      auth.updateProfile(admin.user.id, {
+        displayName: "中途失败",
+        currentPassword: "wrong-pass",
+        newPassword: "newsecret1",
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(auth.listUsers()[0]?.displayName).toBe("老王");
+
+    const changed = await auth.updateProfile(
+      admin.user.id,
+      { currentPassword: "secret123", newPassword: "newsecret1" },
+      admin.token,
+    );
+    expect(changed.displayName).toBe("老王");
+    expect(await auth.authenticate(admin.token)).not.toBeNull();
+    expect(await auth.authenticate(other.token)).toBeNull();
+    await expect(auth.login("owner", "secret123", "127.0.0.1")).rejects.toMatchObject({
+      status: 401,
+    });
+    const relogin = await auth.login("owner", "newsecret1", "127.0.0.1");
+    expect(relogin.user.displayName).toBe("老王");
+  });
+
+  it("管理员可以重置他人密码并注销其会话，普通用户被拒绝", async () => {
+    const auth = service();
+    await auth.init();
+    const admin = await auth.setupAdmin({ username: "owner", password: "secret123" });
+    const alice = await auth.createUser(admin.user, {
+      username: "alice",
+      displayName: "Alice",
+      password: "alicepass1",
+    });
+    const aliceSession = await auth.login("alice", "alicepass1", "127.0.0.1");
+    const aliceSecond = await auth.login("alice", "alicepass1", "127.0.0.2");
+    const bob = await auth.createUser(admin.user, {
+      username: "bob",
+      password: "bobpass123",
+    });
+
+    await expect(auth.resetPassword(bob, alice.id, "resetpass1")).rejects.toMatchObject({
+      status: 403,
+    });
+    await expect(auth.resetPassword(admin.user, "u_missing", "resetpass1")).rejects.toMatchObject({
+      status: 404,
+    });
+    await expect(auth.resetPassword(admin.user, alice.id, "short")).rejects.toMatchObject({
+      status: 400,
+    });
+
+    const reset = await auth.resetPassword(admin.user, alice.id, "resetpass1");
+    expect(reset.username).toBe("alice");
+    expect(JSON.stringify(reset)).not.toContain("passwordHash");
+    expect(await auth.authenticate(aliceSession.token)).toBeNull();
+    expect(await auth.authenticate(aliceSecond.token)).toBeNull();
+    expect(await auth.authenticate(admin.token)).not.toBeNull();
+
+    await expect(auth.login("alice", "alicepass1", "127.0.0.1")).rejects.toMatchObject({
+      status: 401,
+    });
+    const relogin = await auth.login("alice", "resetpass1", "127.0.0.1");
+    expect(relogin.user.username).toBe("alice");
+
+    await auth.resetPassword(admin.user, admin.user.id, "adminnew1", admin.token);
+    expect(await auth.authenticate(admin.token)).not.toBeNull();
+    const adminRelogin = await auth.login("owner", "adminnew1", "127.0.0.1");
+    expect(adminRelogin.user.role).toBe("admin");
+  });
+
   it("会话可持久化，过期后失效", async () => {
     const auth = service();
     await auth.init();

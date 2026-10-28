@@ -2,7 +2,9 @@ import { join } from "node:path";
 import { ensureMainMember, Orchestrator } from "../agent/orchestrator";
 import { loadSettings, saveSettings, type Settings } from "../core/settings";
 import type { Member, RoomMessage, TaskCard } from "../core/types";
+import { MemorySearchManager } from "../memory/manager";
 import { RoomBus } from "../room/bus";
+import type { SkillLibrary } from "../skills/library";
 import { readJson, writeJsonAtomic } from "../store/persist";
 import { Workboard } from "../workboard/board";
 
@@ -18,6 +20,10 @@ export interface WorkspaceOwner {
   displayName: string;
 }
 
+function roomNameFor(displayName: string): string {
+  return `${displayName} 的作战室`;
+}
+
 export class Workspace {
   private saveTimer: NodeJS.Timeout | null = null;
   private closed = false;
@@ -29,16 +35,17 @@ export class Workspace {
     readonly board: Workboard,
     readonly orchestrator: Orchestrator,
     private readonly settingsRef: { current: Settings },
+    readonly memory: MemorySearchManager,
   ) {}
 
-  static async load(rootDir: string, owner: WorkspaceOwner): Promise<Workspace> {
+  static async load(rootDir: string, owner: WorkspaceOwner, skills: SkillLibrary): Promise<Workspace> {
     const dir = join(rootDir, owner.id);
     const [state, loadedSettings] = await Promise.all([
       readJson<PersistedState | null>(join(dir, "state.json"), null),
       loadSettings(join(dir, "settings.json")),
     ]);
 
-    const bus = new RoomBus("room_main", `${owner.displayName} 的作战室`);
+    const bus = new RoomBus("room_main", roomNameFor(owner.displayName));
     const board = new Workboard("room_main");
     if (state) {
       bus.hydrate({ seq: state.seq, messages: state.messages });
@@ -50,15 +57,22 @@ export class Workspace {
     ensureMainMember(bus);
 
     const settingsRef = { current: loadedSettings };
+    // P5：每用户工作区一个记忆检索管理器（对应 OpenClaw 每 agent 的 memory manager），
+    // 语料 = 工作区 MEMORY.md/USER.md/memory/**.md + 本群转录（sessions）。
+    const memory = new MemorySearchManager({ workspaceDir: dir, bus });
     const orchestrator = new Orchestrator({
       bus,
       board,
       getSettings: () => settingsRef.current,
+      skills,
+      ownerId: owner.id,
+      memory,
     });
 
-    const workspace = new Workspace(owner.id, dir, bus, board, orchestrator, settingsRef);
+    const workspace = new Workspace(owner.id, dir, bus, board, orchestrator, settingsRef, memory);
     bus.subscribe((event) => {
       if (event.type === "message" || event.type === "member") workspace.scheduleSave();
+      if (event.type === "message") memory.markDirty();
     });
     board.subscribe(() => workspace.scheduleSave());
     await workspace.persist();
@@ -67,6 +81,10 @@ export class Workspace {
 
   getSettings(): Settings {
     return this.settingsRef.current;
+  }
+
+  renameRoom(ownerDisplayName: string): void {
+    this.bus.rename(roomNameFor(ownerDisplayName));
   }
 
   async setSettings(next: Settings): Promise<void> {
@@ -108,12 +126,15 @@ export class Workspace {
 export class WorkspaceRegistry {
   private workspaces = new Map<string, Promise<Workspace>>();
 
-  constructor(private readonly rootDir: string) {}
+  constructor(
+    private readonly rootDir: string,
+    private readonly skills: SkillLibrary,
+  ) {}
 
   get(owner: WorkspaceOwner): Promise<Workspace> {
     const existing = this.workspaces.get(owner.id);
     if (existing) return existing;
-    const created = Workspace.load(this.rootDir, owner).catch((err) => {
+    const created = Workspace.load(this.rootDir, owner, this.skills).catch((err) => {
       this.workspaces.delete(owner.id);
       throw err;
     });

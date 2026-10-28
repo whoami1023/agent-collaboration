@@ -101,6 +101,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       body.tool_choice = "auto";
     }
     if (request.temperature !== undefined) body.temperature = request.temperature;
+    if (request.maxTokens !== undefined) body.max_tokens = request.maxTokens;
 
     const response = await fetch(url, {
       method: "POST",

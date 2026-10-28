@@ -30,6 +30,10 @@ export interface Limits {
   maxRoomWindowChars: number;
   maxTurnsPerUserMessage: number;
   runTimeoutMs: number;
+  /** Provider context window in tokens; >0 enables automatic context compaction. */
+  contextWindowTokens?: number;
+  /** Hard model-view byte ceiling (number or "2mb" style string); unset disables bounding. */
+  maxActiveTranscriptBytes?: number | string;
 }
 
 export const DEFAULT_LIMITS: Limits = {
@@ -40,6 +44,8 @@ export const DEFAULT_LIMITS: Limits = {
   maxRoomWindowChars: 12000,
   maxTurnsPerUserMessage: 12,
   runTimeoutMs: 120000,
+  contextWindowTokens: 64000,
+  maxActiveTranscriptBytes: "2mb",
 };
 
 export interface Member {

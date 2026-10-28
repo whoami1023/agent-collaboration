@@ -26,8 +26,8 @@ const MAX_MESSAGES = 2000;
 
 export class RoomBus {
   readonly roomId: string;
-  readonly roomName: string;
 
+  private name: string;
   private messages: RoomMessage[] = [];
   private members = new Map<string, Member>();
   private listeners = new Set<(event: RoomEvent) => void>();
@@ -35,7 +35,15 @@ export class RoomBus {
 
   constructor(roomId: string, roomName: string) {
     this.roomId = roomId;
-    this.roomName = roomName;
+    this.name = roomName;
+  }
+
+  get roomName(): string {
+    return this.name;
+  }
+
+  rename(roomName: string): void {
+    this.name = roomName;
   }
 
   subscribe(listener: (event: RoomEvent) => void): () => void {

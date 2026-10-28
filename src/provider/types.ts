@@ -24,6 +24,7 @@ export interface LlmRequest {
   messages: LlmMessage[];
   tools: ToolSchema[];
   temperature?: number;
+  maxTokens?: number;
   signal?: AbortSignal;
 }
 
