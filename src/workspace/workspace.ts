@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { ensureMainMember, Orchestrator } from "../agent/orchestrator";
 import { loadSettings, saveSettings, type Settings } from "../core/settings";
 import type { Member, RoomMessage, TaskCard } from "../core/types";
+import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
 import { RoomBus } from "../room/bus";
 import type { SkillLibrary } from "../skills/library";
@@ -57,6 +58,13 @@ export class Workspace {
     ensureMainMember(bus);
 
     const settingsRef = { current: loadedSettings };
+    // 智能体档案文件（对应 OpenClaw 的 generated bootstrap files）：只补写缺失项，
+    // 已存在的文件视为用户内容，绝不覆盖。这样右侧「智能体文件」面板开箱即有内容。
+    await ensureAgentFiles(dir, {
+      displayName: owner.displayName,
+      mainAgentName: bus.listMembers().find((member) => member.role === "main")?.name ?? "主智能体",
+      roomName: bus.roomName,
+    });
     // P5：每用户工作区一个记忆检索管理器（对应 OpenClaw 每 agent 的 memory manager），
     // 语料 = 工作区 MEMORY.md/USER.md/memory/**.md + 本群转录（sessions）。
     const memory = new MemorySearchManager({ workspaceDir: dir, bus });

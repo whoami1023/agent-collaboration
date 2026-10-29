@@ -13,6 +13,7 @@ import { tokenize, normalizeSearchTokens, bm25RankToScore, bm25RelevanceToScore 
 import { stripMemoryAnnotationCarriers, extractCuratedEntryRecallMetadata } from "../src/memory/annotations";
 import { chunkMarkdown, splitCuratedMarkdownEntries } from "../src/memory/chunking";
 import { MemorySearchManager } from "../src/memory/manager";
+import { ensureAgentFiles } from "../src/memory/bootstrap-files";
 import { resolveTriggerRecall, selectStrongTriggerMatches, toTriggerRecallHits } from "../src/memory/recall";
 import { buildMemoryTools } from "../src/memory/tools";
 
@@ -165,6 +166,41 @@ describe("MemorySearchManager 检索", () => {
     const results = await m.search("用户常驻城市是杭州", { lexicalOnly: true });
     expect(results.some((hit) => hit.path === "MEMORY.md" && hit.snippet.includes("杭州"))).toBe(true);
   });
+
+  it("listAgentFiles 按 bootstrap 顺序包含身份文件，memory_get 口径仍不含", async () => {
+    const bus = await seedWorkspace();
+    const m = manager(bus);
+    const created = await ensureAgentFiles(dir, {
+      displayName: "室长",
+      mainAgentName: "主智能体",
+      roomName: "室长 的作战室",
+    });
+    expect(created).toEqual(["USER.md", "SOUL.md", "IDENTITY.md"]);
+
+    const files = await m.listAgentFiles();
+    expect(files.map((file) => file.path)).toEqual([
+      "MEMORY.md",
+      "USER.md",
+      "SOUL.md",
+      "IDENTITY.md",
+      "memory/notes.md",
+    ]);
+
+    const soul = await m.readAgentFile("SOUL.md");
+    expect(soul.content).toContain("我是谁");
+    // 身份文件可读，但工作区状态/设置依旧拒绝。
+    await expect(m.readAgentFile("../state.json")).rejects.toThrow(/只允许读取/);
+    await expect(m.readFile("SOUL.md")).rejects.toThrow(/只允许读取 MEMORY.md、USER.md 或 memory\//);
+
+    // 二次补齐不得覆盖用户已改写的内容。
+    await writeFile(join(dir, "MEMORY.md"), "# 我的记忆\n\n- 自定义\n", "utf8");
+    expect(await ensureAgentFiles(dir, { displayName: "x", mainAgentName: "y", roomName: "z" })).toEqual([]);
+    expect((await m.readAgentFile("MEMORY.md")).content).toContain("自定义");
+
+    // SOUL.md 不属于检索语料（对应 OpenClaw：身份文件走提示词注入，不进 memory 索引）。
+    const hits = await m.search("我是谁", { lexicalOnly: true, sources: ["memory"] });
+    expect(hits.every((hit) => hit.path !== "SOUL.md")).toBe(true);
+  });
 });
 
 describe("lane-1 触发召回（active-memory 移植）", () => {
@@ -177,6 +213,22 @@ describe("lane-1 触发召回（active-memory 移植）", () => {
     expect(recall.context).toContain("<active_memory_plugin>");
     expect(recall.context).toContain("PostgreSQL");
     expect(recall.context).toContain("Source: MEMORY.md#L");
+  });
+
+  it("模板自动补齐后，写法说明文字不会被当成记忆条目注入", async () => {
+    const bus = await seedWorkspace();
+    const m = manager(bus);
+    await ensureAgentFiles(dir, {
+      displayName: "室长",
+      mainAgentName: "主智能体",
+      roomName: "室长 的作战室",
+    });
+    const recall = await resolveTriggerRecall({ manager: m, message: "回复语言 沟通偏好" });
+    expect(recall.hasStrongHit).toBe(true);
+    // 注入的只能是 USER.md 的真实画像条目，说明文字与缩进示例没有触发元数据。
+    expect(recall.context).toContain("默认使用中文");
+    expect(recall.context).not.toContain("写法约定");
+    expect(recall.context).not.toContain("条目格式举例");
   });
 
   it("无关消息不注入（fail-open，不报错）", async () => {

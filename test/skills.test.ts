@@ -283,3 +283,126 @@ describe("SkillLibrary", () => {
     expect(reloaded.listPersonal(alice.id).map((skill) => skill.name)).toEqual(["persist"]);
   });
 });
+
+describe("SkillLibrary 导入 SKILL.md", () => {
+  const skillMd = (name: string, description: string, body = "# 步骤\n先给结论。") =>
+    `---\nname: ${name}\ndescription: ${description}\n---\n\n${body}`;
+
+  it("导入写成个人技能，标记来源，坏文件只影响自己", async () => {
+    const results = await library.importMany(alice, {
+      scope: "personal",
+      files: [
+        { filename: "pdf-forms/SKILL.md", content: skillMd("pdf-forms", "填写 PDF 表单") },
+        { filename: "broken/SKILL.md", content: "---\nname: broken\n---\n\n正文" },
+      ],
+    });
+    expect(results.map((item) => item.ok)).toEqual([true, false]);
+    expect(results[0]).toMatchObject({ action: "created", skill: { name: "pdf-forms" } });
+    expect(results[1]?.error).toContain("description is required");
+    const imported = library.listPersonal(alice.id);
+    expect(imported.map((skill) => skill.name)).toEqual(["pdf-forms"]);
+    expect(imported[0]).toMatchObject({ imported: true, source: "导入自 pdf-forms/SKILL.md" });
+    expect(imported[0]?.instructions).toBe("# 步骤\n先给结论。");
+  });
+
+  it("重名默认失败，勾选覆盖才更新；非管理员不能导入共享", async () => {
+    await library.importMany(alice, {
+      files: [{ filename: "a.md", content: skillMd("dup", "第一版") }],
+    });
+    const clash = await library.importMany(alice, {
+      files: [{ filename: "a.md", content: skillMd("dup", "第二版") }],
+    });
+    expect(clash[0]).toMatchObject({ ok: false });
+    expect(clash[0]?.error).toContain("覆盖");
+
+    const overwritten = await library.importMany(alice, {
+      overwrite: true,
+      files: [{ filename: "a.md", content: skillMd("dup", "第二版", "# 新说明") }],
+    });
+    expect(overwritten[0]).toMatchObject({ ok: true, action: "updated" });
+    expect(library.listPersonal(alice.id)).toHaveLength(1);
+    expect(library.readForAgent(alice.id, "dup")?.description).toBe("第二版");
+
+    await expect(
+      library.importMany(alice, {
+        scope: "shared",
+        files: [{ filename: "a.md", content: skillMd("s", "x") }],
+      }),
+    ).rejects.toMatchObject({ status: 403 });
+    const asShared = await library.importMany(admin, {
+      scope: "shared",
+      files: [{ filename: "a.md", content: skillMd("s", "共享导入") }],
+    });
+    expect(asShared[0]).toMatchObject({ ok: true, skill: { scope: "shared" } });
+    expect(library.listForAgent(bob.id).map((skill) => skill.name)).toContain("s");
+  });
+
+  it("名称写法不规范会被规范化，超长字段截断并给出警告", async () => {
+    const results = await library.importMany(alice, {
+      files: [
+        {
+          filename: "Weekly Report.SKILL.md",
+          content: skillMd("Weekly Report", "x".repeat(200)),
+        },
+      ],
+    });
+    const first = results[0];
+    expect(first?.ok).toBe(true);
+    expect(first?.skill?.name).toBe("weekly-report");
+    expect(first?.skill?.description).toHaveLength(160);
+    expect((first?.warnings ?? []).join("\n")).toContain("规范化");
+    expect((first?.warnings ?? []).join("\n")).toContain("截断");
+  });
+
+  it("声明宿主机依赖的技能带警告导入，正文缺失的文件不会写库", async () => {
+    const results = await library.importMany(alice, {
+      files: [
+        {
+          filename: "needs-shell/SKILL.md",
+          content:
+            '---\nname: needs-shell\ndescription: 用 rg 搜代码\nmetadata: {"openclaw":{"requires":{"bins":["rg"]}}}\n---\n\n正文',
+        },
+        { filename: "empty/SKILL.md", content: "---\nname: empty\ndescription: x\n---\n\n" },
+      ],
+    });
+    expect((results[0]?.warnings ?? []).join("\n")).toContain("宿主机工具");
+    expect(results[1]?.ok).toBe(false);
+    expect(library.listPersonal(alice.id).map((skill) => skill.name)).toEqual(["needs-shell"]);
+
+    const reloaded = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await reloaded.init();
+    expect(reloaded.listPersonal(alice.id)[0]).toMatchObject({
+      name: "needs-shell",
+      imported: true,
+    });
+  });
+
+  it("空列表、超过 20 份、非字符串内容都被拒绝", async () => {
+    await expect(library.importMany(alice, { files: [] })).rejects.toMatchObject({ status: 400 });
+    await expect(
+      library.importMany(alice, {
+        files: Array.from({ length: 21 }, (_unused, index) => ({
+          filename: `a${index}.md`,
+          content: skillMd(`a${index}`, "x"),
+        })),
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    const bad = await library.importMany(alice, {
+      files: [{ filename: "x.md", content: 42 }],
+    });
+    expect(bad[0]).toMatchObject({ ok: false, error: "文件内容为空" });
+  });
+
+  it("同一次导入里的两份同名技能：第二份按覆盖规则处理", async () => {
+    const results = await library.importMany(alice, {
+      overwrite: true,
+      files: [
+        { filename: "one/SKILL.md", content: skillMd("same", "第一份") },
+        { filename: "two/SKILL.md", content: skillMd("same", "第二份") },
+      ],
+    });
+    expect(results.map((item) => item.action)).toEqual(["created", "updated"]);
+    expect(library.listPersonal(alice.id)).toHaveLength(1);
+    expect(library.readForAgent(alice.id, "same")?.description).toBe("第二份");
+  });
+});

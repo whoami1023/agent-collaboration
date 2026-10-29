@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent } from "react";
+import type {
+  CSSProperties,
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
 import type { PublicUser, RoomEvent, RoomMessage, TaskCard } from "../../src/core/types";
 import { Icon } from "./icons";
-import SkillLibraryDialog from "./SkillLibrary";
+import SkillLibraryPanel from "./SkillLibrary";
 import {
   ApiError,
   cancelMember,
@@ -10,6 +15,8 @@ import {
   createUser,
   fetchBootstrap,
   fetchMe,
+  fetchMemberFileContent,
+  fetchMemberFiles,
   fetchState,
   listUsers,
   loginUser,
@@ -21,14 +28,80 @@ import {
   setupAdmin,
   subscribeEvents,
   updateProfile,
+  type AgentFileContent,
+  type AgentFileEntry,
   type MaskedSettings,
   type StateSnapshot,
 } from "./api";
+import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdown/MarkdownText";
 
 type ThemeMode = "light" | "dark";
 type SettingsTab = "profile" | "model" | "appearance";
 
 const THEME_KEY = "ac_theme";
+const LAYOUT_KEY = "ac_layout";
+
+const SIDEBAR_MIN = 200;
+const SIDEBAR_MAX = 420;
+const PANEL_MIN = 220;
+const PANEL_MAX = 720;
+/** 中间聊天区在任何拖拽下都不许被挤到不可用。 */
+const CHAT_MIN = 460;
+const PANE_STEP = 16;
+
+interface PaneWidths {
+  sidebar: number;
+  panel: number;
+}
+
+type PaneName = keyof PaneWidths;
+
+function compactWidths(): PaneWidths {
+  return window.innerWidth <= 1180 ? { sidebar: 240, panel: 272 } : { sidebar: 264, panel: 300 };
+}
+
+function clampTo(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
+function sidebarMax(pane: PaneWidths): number {
+  return Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, window.innerWidth - pane.panel - CHAT_MIN));
+}
+
+function panelMax(pane: PaneWidths): number {
+  return Math.max(PANEL_MIN, Math.min(PANEL_MAX, window.innerWidth - pane.sidebar - CHAT_MIN));
+}
+
+function fitPanes(next: PaneWidths): PaneWidths {
+  const sidebar = Math.round(clampTo(next.sidebar, SIDEBAR_MIN, sidebarMax(next)));
+  const widened: PaneWidths = { ...next, sidebar };
+  return { ...widened, panel: Math.round(clampTo(next.panel, PANEL_MIN, panelMax(widened))) };
+}
+
+function readStoredPanes(): PaneWidths | null {
+  try {
+    const raw = localStorage.getItem(LAYOUT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PaneWidths>;
+    if (typeof parsed.sidebar !== "number" || typeof parsed.panel !== "number") return null;
+    return { sidebar: parsed.sidebar, panel: parsed.panel };
+  } catch {
+    return null;
+  }
+}
+
+function readPanes(): PaneWidths {
+  return fitPanes(readStoredPanes() ?? compactWidths());
+}
+
+function writePanes(next: PaneWidths): void {
+  try {
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify(next));
+  } catch {
+    // storage can be unavailable in private mode
+  }
+}
 
 interface RunState {
   memberId: string;
@@ -343,7 +416,14 @@ function RoomView({
   const [error, setError] = useState<string | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [usersOpen, setUsersOpen] = useState(false);
-  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(() => {
+    try {
+      return localStorage.getItem("ac_skills") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [membersOpen, setMembersOpen] = useState(true);
   const [navOpen, setNavOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [boardOpen, setBoardOpen] = useState(() => {
@@ -354,7 +434,18 @@ function RoomView({
     }
   });
   const [newTaskTitle, setNewTaskTitle] = useState("");
+  const [panes, setPanes] = useState<PaneWidths>(readPanes);
+  const [draggedPane, setDraggedPane] = useState<PaneName | null>(null);
+  const panesRef = useRef<PaneWidths>(panes);
+  const endDragRef = useRef<(() => void) | null>(null);
+  const [selectedMemberId, setSelectedMemberId] = useState<string | null>(null);
+  const [filesRefreshSeq, setFilesRefreshSeq] = useState(0);
+  const [agentFiles, setAgentFiles] = useState<AgentFileEntry[] | null>(null);
+  const [agentFileError, setAgentFileError] = useState<string | null>(null);
+  const [openFilePath, setOpenFilePath] = useState<string | null>(null);
+  const [openFile, setOpenFile] = useState<AgentFileContent | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const checkingSession = useRef(false);
   const accountRef = useRef<HTMLDivElement | null>(null);
 
@@ -383,6 +474,96 @@ function RoomView({
       // storage can be unavailable in private mode
     }
   }, [boardOpen]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("ac_skills", skillsOpen ? "1" : "0");
+    } catch {
+      // storage can be unavailable in private mode
+    }
+  }, [skillsOpen]);
+
+  // 拖拽回调要在下一次渲染前就读到最新宽度，所以把 state 镜像到 ref。
+  useEffect(() => {
+    panesRef.current = panes;
+  }, [panes]);
+
+  useEffect(() => {
+    // 以存下的宽度意图重新适配：窗口先缩小再放大时，栏宽能回到用户设定的值。
+    const handleResize = () => setPanes(fitPanes(readStoredPanes() ?? panesRef.current));
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (!draggedPane) return;
+    document.body.classList.add("pane-dragging");
+    return () => document.body.classList.remove("pane-dragging");
+  }, [draggedPane]);
+
+  useEffect(() => () => endDragRef.current?.(), []);
+
+  function commitPanes(next: PaneWidths) {
+    panesRef.current = next;
+    setPanes(next);
+  }
+
+  function resizePane(pane: PaneName, rawWidth: number) {
+    const current = panesRef.current;
+    // 拖动时以另一栏的现有宽度为上限，不顺手把对方压到最小。
+    const min = pane === "sidebar" ? SIDEBAR_MIN : PANEL_MIN;
+    const max = pane === "sidebar" ? sidebarMax(current) : panelMax(current);
+    const next = fitPanes({ ...current, [pane]: Math.round(clampTo(rawWidth, min, max)) });
+    if (next.sidebar === current.sidebar && next.panel === current.panel) return;
+    commitPanes(next);
+  }
+
+  function handlePanePointerDown(pane: PaneName, event: ReactPointerEvent<HTMLButtonElement>) {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = panesRef.current[pane];
+    // 监听挂在 window 上而不是 setPointerCapture：指针越出 9px 命中区甚至离开窗口时仍然跟手。
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      endDragRef.current = null;
+      setDraggedPane(null);
+      writePanes(panesRef.current);
+    };
+    function move(moveEvent: PointerEvent) {
+      const delta = moveEvent.clientX - startX;
+      // 右边界在面板左边，向左拖才是「右边变大」，方向取反。
+      resizePane(pane, pane === "sidebar" ? startWidth + delta : startWidth - delta);
+    }
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    endDragRef.current = stop;
+    setDraggedPane(pane);
+  }
+
+  function handlePaneKeyDown(pane: PaneName, event: ReactKeyboardEvent<HTMLButtonElement>) {
+    const grow = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+    if (grow === 0 && event.key !== "Home") return;
+    event.preventDefault();
+    const current = panesRef.current;
+    if (event.key === "Home") {
+      commitPanes(compactWidths());
+      writePanes(panesRef.current);
+      return;
+    }
+    // 右边界在面板左侧：ArrowLeft 让面板变宽。
+    const direction = pane === "sidebar" ? grow : -grow;
+    resizePane(pane, current[pane] + direction * PANE_STEP);
+    writePanes(panesRef.current);
+  }
+
+  function resetPaneWidth(pane: PaneName) {
+    resizePane(pane, compactWidths()[pane]);
+    writePanes(panesRef.current);
+  }
 
   useEffect(() => {
     let alive = true;
@@ -454,6 +635,13 @@ function RoomView({
     return map;
   }, [members]);
 
+  const selectedMember = members.find((member) => member.id === selectedMemberId);
+  const inWarRoom = !skillsOpen && !selectedMember;
+  /** 技能库 / 智能体文件独占右侧整块区域：此时连作战室（群聊）一起收起。 */
+  const takeover = skillsOpen || Boolean(selectedMember);
+  const panelVisible = boardOpen || takeover;
+  const runningCount = members.filter((member) => member.status === "running").length;
+
   async function handleSend() {
     const text = draft.trim();
     if (!text) return;
@@ -472,6 +660,92 @@ function RoomView({
     } catch (err) {
       setError(messageOf(err));
     }
+  }
+
+  // 点击成员 → 右侧切到「智能体文件」面板；语料与记忆检索同一白名单。
+  useEffect(() => {
+    if (!selectedMemberId) return;
+    let alive = true;
+    setAgentFiles(null);
+    setAgentFileError(null);
+    setOpenFilePath(null);
+    setOpenFile(null);
+    fetchMemberFiles(selectedMemberId)
+      .then((list) => {
+        if (!alive) return;
+        setAgentFiles(list);
+        const first = list[0]?.path ?? null;
+        setOpenFilePath(first);
+        if (first === null) setOpenFile(null);
+      })
+      .catch((err: unknown) => {
+        if (alive) setAgentFileError(messageOf(err));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [selectedMemberId, filesRefreshSeq]);
+
+  // 房间来新消息（记忆可能被写入/转录增长）时静默刷新文件清单，保持当前打开的文件。
+  useEffect(() => {
+    if (!selectedMemberId) return;
+    let alive = true;
+    fetchMemberFiles(selectedMemberId)
+      .then((list) => {
+        if (alive) setAgentFiles(list);
+      })
+      .catch(() => {
+        // 静默刷新失败不打扰用户，手动刷新可重试
+      });
+    return () => {
+      alive = false;
+    };
+  }, [selectedMemberId, messages.length]);
+
+  function reloadAgentFiles() {
+    setFilesRefreshSeq((seq) => seq + 1);
+  }
+
+  function closeAgentFiles() {
+    setSelectedMemberId(null);
+    setFilesRefreshSeq((seq) => seq + 1);
+  }
+
+  useEffect(() => {
+    if (!selectedMemberId || !openFilePath) return;
+    let alive = true;
+    setOpenFile(null);
+    fetchMemberFileContent(selectedMemberId, openFilePath)
+      .then((file) => {
+        if (alive) setOpenFile(file);
+      })
+      .catch((err: unknown) => {
+        if (alive) setAgentFileError(messageOf(err));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [selectedMemberId, openFilePath]);
+
+  function openAgentFiles(memberId: string) {
+    setSelectedMemberId(memberId);
+    setSkillsOpen(false);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
+  function openSkills() {
+    setSkillsOpen(true);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
+  /** 作战室＝聊天本身：收起右侧的技能库/智能体文件，把焦点还给输入框。 */
+  function goToWarRoom() {
+    setSkillsOpen(false);
+    setSelectedMemberId(null);
+    setNavOpen(false);
+    requestAnimationFrame(() => composerRef.current?.focus());
   }
 
   async function handleAddTask() {
@@ -512,8 +786,23 @@ function RoomView({
   );
 
   return (
-    <div className={`shell${boardOpen ? "" : " board-closed"}`}>
+    <div
+      className={`shell${panelVisible ? "" : " board-closed"}${takeover ? " panel-full" : ""}${draggedPane ? " pane-dragging" : ""}`}
+      style={{ "--sidebar-w": `${panes.sidebar}px`, "--panel-w": `${panes.panel}px` } as CSSProperties}
+    >
       {navOpen && <div className="scrim" onClick={() => setNavOpen(false)} />}
+
+      <PaneResizer
+        pane="sidebar"
+        value={panes.sidebar}
+        min={SIDEBAR_MIN}
+        max={sidebarMax(panes)}
+        dragging={draggedPane === "sidebar"}
+        label="拖拽调整左侧成员栏宽度"
+        onPointerDown={handlePanePointerDown}
+        onKeyDown={handlePaneKeyDown}
+        onReset={resetPaneWidth}
+      />
 
       <aside className={`sidebar${navOpen ? " open" : ""}`}>
         <div className="sidebar-top">
@@ -539,33 +828,65 @@ function RoomView({
             </button>
           </div>
 
+          <button
+            type="button"
+            className={`room-entry${inWarRoom ? " active" : ""}`}
+            aria-pressed={inWarRoom}
+            title="回到群聊与任务看板"
+            onClick={goToWarRoom}
+          >
+            <span className="room-entry-icon">
+              <Icon name="chat" size={15} />
+            </span>
+            <span className="room-entry-text">
+              <strong>作战室</strong>
+              <small>{user.displayName} 的群聊 · 任务看板</small>
+            </span>
+            {runningCount > 0 && <span className="room-entry-live">{runningCount} 运行中</span>}
+          </button>
+
+          <div className="nav-section">工作区</div>
+
           <nav className="sidebar-nav" aria-label="功能">
             <button
               type="button"
-              className="nav-item"
-              onClick={() => {
-                setNavOpen(false);
-                setSkillsOpen(true);
-              }}
+              className={`nav-item${skillsOpen ? " active" : ""}`}
+              aria-pressed={skillsOpen}
+              onClick={() => (skillsOpen ? setSkillsOpen(false) : openSkills())}
             >
               <Icon name="book" />
               <span className="nav-label">技能库</span>
-              <span className="nav-hint">共享 · 个人</span>
+              <span className="nav-hint">共享 · 个人 · 导入</span>
+            </button>
+
+            <button
+              type="button"
+              className="nav-item"
+              aria-expanded={membersOpen}
+              onClick={() => setMembersOpen((open) => !open)}
+            >
+              <Icon name="users" />
+              <span className="nav-label">成员</span>
+              <span className="nav-count">{members.length}</span>
+              <span className={`chevron${membersOpen ? " up" : ""}`}>
+                <Icon name="chevron" />
+              </span>
             </button>
           </nav>
-
-          <div className="section-label">
-            成员
-            <span className="section-count">{members.length}</span>
-          </div>
-          <ul className="member-list">
+          {membersOpen && (
+            <ul className="member-list">
             {members.map((member) => (
-              <li key={member.id} className="member-row">
+              <li key={member.id} className={`member-row${selectedMemberId === member.id ? " active" : ""}`}>
                 <span className="member-avatar">
                   {initialOf(member.name)}
                   <span className={`status-dot ${member.status}`} />
                 </span>
-                <div className="member-main">
+                <button
+                  type="button"
+                  className="member-main"
+                  title="查看该智能体的记忆与相关文件"
+                  onClick={() => openAgentFiles(member.id)}
+                >
                   <div className="member-line">
                     <span className="member-name">@{member.name}</span>
                     <span className={`role-pill ${member.role}`}>
@@ -584,7 +905,7 @@ function RoomView({
                       ? ` · ${runs[member.id]?.tools.at(-1)}`
                       : ""}
                   </div>
-                </div>
+                </button>
                 {member.status === "running" && (
                   <button className="btn sm" onClick={() => void handleCancel(member.id)}>
                     取消
@@ -592,7 +913,8 @@ function RoomView({
                 )}
               </li>
             ))}
-          </ul>
+            </ul>
+          )}
         </div>
 
         <div className="sidebar-foot" ref={accountRef}>
@@ -704,18 +1026,46 @@ function RoomView({
           <span className="env-pill">
             {activeProvider ? `${activeProvider.id} · ${activeProvider.model}` : "未配置模型"}
           </span>
-          <button
-            type="button"
-            className="btn ghost board-toggle"
-            aria-pressed={boardOpen}
-            aria-controls="task-board"
-            title={boardOpen ? "收起任务看板" : "展开任务看板"}
-            onClick={() => setBoardOpen((open) => !open)}
-          >
-            <Icon name="columns" />
-            <span>任务看板</span>
-            <span className="chip">{tasks.length}</span>
-          </button>
+          {skillsOpen ? (
+            <button
+              type="button"
+              className="btn ghost board-toggle"
+              aria-pressed
+              aria-controls="skills-panel"
+              title="关闭技能库，回到作战室"
+              onClick={() => setSkillsOpen(false)}
+            >
+              <Icon name="book" />
+              <span>技能库</span>
+              <span className="chip">共享 · 个人</span>
+            </button>
+          ) : selectedMember ? (
+            <button
+              type="button"
+              className="btn ghost board-toggle"
+              aria-pressed
+              aria-controls="agent-files-panel"
+              title="收起智能体文件，回到作战室"
+              onClick={() => setSelectedMemberId(null)}
+            >
+              <Icon name="inspect" />
+              <span>智能体文件</span>
+              <span className="chip">@{selectedMember.name}</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn ghost board-toggle"
+              aria-pressed={boardOpen}
+              aria-controls="task-board"
+              title={boardOpen ? "收起任务看板" : "展开任务看板"}
+              onClick={() => setBoardOpen((open) => !open)}
+            >
+              <Icon name="columns" />
+              <span>任务看板</span>
+              <span className="chip">{tasks.length}</span>
+            </button>
+          )}
         </header>
 
         {error && (
@@ -753,7 +1103,11 @@ function RoomView({
                       </span>
                     </header>
                     <div className="bubble-text">
-                      {run.text || <span className="typing">…</span>}
+                      {run.text ? (
+                        <MarkdownText text={run.text} streaming />
+                      ) : (
+                        <span className="typing">…</span>
+                      )}
                     </div>
                   </article>
                 );
@@ -765,6 +1119,7 @@ function RoomView({
           <div className="composer-wrap">
             <div className="composer">
               <textarea
+                ref={composerRef}
                 value={draft}
                 placeholder={`以 ${user.displayName} 的身份发消息… 用 @成员名 指派任务`}
                 onChange={(event) => setDraft(event.target.value)}
@@ -793,11 +1148,41 @@ function RoomView({
         </div>
       </main>
 
+      <PaneResizer
+        pane="panel"
+        value={panes.panel}
+        min={PANEL_MIN}
+        max={panelMax(panes)}
+        dragging={draggedPane === "panel"}
+        label="拖拽调整右侧面板宽度"
+        onPointerDown={handlePanePointerDown}
+        onKeyDown={handlePaneKeyDown}
+        onReset={resetPaneWidth}
+      />
+
+      {skillsOpen ? (
+        <aside id="skills-panel" className="board-panel" aria-label="技能库">
+          <SkillLibraryPanel onClose={() => setSkillsOpen(false)} />
+        </aside>
+      ) : selectedMember ? (
+        <aside id="agent-files-panel" className="board-panel" aria-label="智能体文件">
+          <AgentFilesPanel
+            member={{ id: selectedMember.id, name: selectedMember.name }}
+            files={agentFiles}
+            fileError={agentFileError}
+            activePath={openFilePath}
+            content={openFile}
+            onSelectPath={setOpenFilePath}
+            onRefresh={reloadAgentFiles}
+            onClose={closeAgentFiles}
+          />
+        </aside>
+      ) : (
       <aside
         id="task-board"
         className="board-panel"
         aria-label="任务看板"
-        inert={!boardOpen}
+        inert={!panelVisible}
       >
         <div className="board-sheet">
           <div className="board-head">
@@ -857,6 +1242,7 @@ function RoomView({
           </div>
         </div>
       </aside>
+      )}
 
       {settingsTab && (
         <SettingsDialog
@@ -875,9 +1261,142 @@ function RoomView({
       )}
 
       {usersOpen && user.role === "admin" && <AdminPanel onClose={() => setUsersOpen(false)} />}
-
-      {skillsOpen && <SkillLibraryDialog onClose={() => setSkillsOpen(false)} />}
     </div>
+  );
+}
+
+function AgentFilesPanel({
+  member,
+  files,
+  fileError,
+  activePath,
+  content,
+  onSelectPath,
+  onRefresh,
+  onClose,
+}: {
+  member: { id: string; name: string };
+  files: AgentFileEntry[] | null;
+  fileError: string | null;
+  activePath: string | null;
+  content: AgentFileContent | null;
+  onSelectPath: (path: string) => void;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="board-sheet files-sheet">
+      <div className="board-head">
+        <span className="section-label">智能体文件</span>
+        <div className="board-head-actions">
+          <span className="chip">@{member.name}</span>
+          <button
+            type="button"
+            className="btn icon ghost board-close"
+            aria-label="刷新文件清单"
+            title="刷新文件清单"
+            onClick={onRefresh}
+          >
+            <Icon name="refresh" />
+          </button>
+          <button
+            type="button"
+            className="btn icon ghost board-close"
+            aria-label="关闭智能体文件面板"
+            title="关闭面板，回到作战室"
+            onClick={onClose}
+          >
+            <Icon name="close" />
+          </button>
+        </div>
+      </div>
+      <div className="files-tabs" role="tablist" aria-label="文件列表">
+        {files === null && !fileError && (
+          <span className="chip" role="status">
+            载入中…
+          </span>
+        )}
+        {fileError && <span className="files-error">{fileError}</span>}
+        {files?.map((file) => (
+          <button
+            key={file.path}
+            type="button"
+            role="tab"
+            aria-selected={activePath === file.path}
+            className={`file-tab${activePath === file.path ? " active" : ""}`}
+            title={`${file.path} · ${formatBytes(file.sizeBytes)} · ${clock(file.updatedAt)}`}
+            onClick={() => onSelectPath(file.path)}
+          >
+            {file.path}
+          </button>
+        ))}
+      </div>
+      <div className="board-body files-body">
+        {content ? (
+          <>
+            <div className="files-path-line">
+              <span className="files-path">{content.path}</span>
+              <span className="files-lines">{content.totalLines} 行</span>
+            </div>
+            <pre className="files-content">{content.content}</pre>
+            {content.truncated && (
+              <p className="files-note">较长的文件按记忆检索口径截断展示。</p>
+            )}
+          </>
+        ) : fileError ? (
+          <p className="files-empty">{fileError}</p>
+        ) : (
+          <p className="files-empty">
+            这个工作区还没有可读的智能体文件。首次加载会自动生成 MEMORY.md、USER.md、SOUL.md
+            与 IDENTITY.md 模板；若被删除，重新打开房间会再次补齐。
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+function PaneResizer({
+  pane,
+  value,
+  min,
+  max,
+  dragging,
+  label,
+  onPointerDown,
+  onKeyDown,
+  onReset,
+}: {
+  pane: PaneName;
+  value: number;
+  min: number;
+  max: number;
+  dragging: boolean;
+  label: string;
+  onPointerDown: (pane: PaneName, event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onKeyDown: (pane: PaneName, event: ReactKeyboardEvent<HTMLButtonElement>) => void;
+  onReset: (pane: PaneName) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`pane-resizer ${pane === "sidebar" ? "left" : "right"}${dragging ? " dragging" : ""}`}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-valuenow={value}
+      aria-valuetext={`${label}：${value} 像素`}
+      title="拖动调整宽度 · 方向键 ±16 · Home 或双击恢复默认"
+      onPointerDown={(event) => onPointerDown(pane, event)}
+      onKeyDown={(event) => onKeyDown(pane, event)}
+      onDoubleClick={() => onReset(pane)}
+    />
   );
 }
 
@@ -903,19 +1422,47 @@ function MessageBubble({
   message: RoomMessage;
   nameById: Map<string, string>;
 }) {
+  const [source, setSource] = useState(false);
   if (message.senderKind === "system") {
     return <div className="system-line">{message.text}</div>;
   }
   const isUser = message.senderKind === "user";
+  // 结构判断以去掉脚手架后的可见正文为准：否则「整段都是 invoke 块」的消息会被当纯文本原样显示。
+  const visible = isUser ? "" : visibleMessageText(message.text);
+  const renderPreview = !isUser && visible.length > 0;
+  const toggleable = renderPreview && (hasMarkdownStructure(visible) || visible !== message.text);
   return (
     <article className={`bubble ${isUser ? "user" : "member"} ${message.kind}`}>
       <header className="bubble-head">
         <span className="sender">{isUser ? "你" : `@${message.senderName}`}</span>
         {message.kind === "announce" && <span className="chip accent">报告</span>}
         {message.taskId && <span className="chip">{message.taskId.slice(0, 12)}</span>}
+        {toggleable && (
+          <button
+            type="button"
+            className={`chip markdown-toggle${source ? " active" : ""}`}
+            aria-pressed={source}
+            onClick={() => setSource((current) => !current)}
+          >
+            {source ? "预览" : "原文"}
+          </button>
+        )}
         <span className="time">{clock(message.ts)}</span>
       </header>
-      <div className="bubble-text">{message.text}</div>
+      {renderPreview && !source ? (
+        <div className="bubble-text">
+          <MarkdownText text={message.text} />
+        </div>
+      ) : renderPreview ? (
+        <div className="bubble-text">{visible}</div>
+      ) : !isUser ? (
+        // 整条消息都是内部脚手架：没有可见内容，不把原始标签摊给用户看。
+        <div className="bubble-text">
+          <span className="markdown-empty">…</span>
+        </div>
+      ) : (
+        <div className="bubble-text">{message.text}</div>
+      )}
     </article>
   );
 }

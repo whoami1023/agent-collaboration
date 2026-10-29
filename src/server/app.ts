@@ -30,7 +30,13 @@ function stringField(body: Record<string, unknown>, key: string): string {
 
 export function createApp(deps: AppDeps): express.Express {
   const app = express();
-  app.use(express.json({ limit: "1mb" }));
+  const jsonBody = express.json({ limit: "1mb" });
+  // 一次导入最多 20 份 SKILL.md（每份上限 256 KB），正文体积远超普通接口，单独放宽这一个路由的上限。
+  const skillImportBody = express.json({ limit: "6mb" });
+  app.use((req, res, next) => {
+    if (req.path === "/api/skills/import") return skillImportBody(req, res, next);
+    return jsonBody(req, res, next);
+  });
 
   const streams = new Map<string, Set<Response>>();
   const closeUserStreams = (userId: string): void => {
@@ -188,6 +194,21 @@ export function createApp(deps: AppDeps): express.Express {
     res.status(201).json({ skill: skillView(skill) });
   });
 
+  app.post("/api/skills/import", async (req: Request, res: Response) => {
+    const body = bodyOf(req);
+    const results = await deps.skills.importMany(currentUser(res), {
+      scope: body["scope"],
+      overwrite: body["overwrite"],
+      files: body["files"],
+    });
+    res.json({
+      results: results.map((item) => ({
+        ...item,
+        skill: item.skill ? skillView(item.skill) : undefined,
+      })),
+    });
+  });
+
   app.patch("/api/skills/:id", async (req: Request, res: Response) => {
     const body = bodyOf(req);
     const skill = await deps.skills.update(currentUser(res), String(req.params["id"] ?? ""), {
@@ -264,6 +285,41 @@ export function createApp(deps: AppDeps): express.Express {
     res.json({ cancelled });
   });
 
+  app.get("/api/members/:id/files", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const memberId = String(req.params["id"] ?? "");
+    if (!workspace.bus.listMembers().some((member) => member.id === memberId)) {
+      res.status(404).json({ error: "成员不存在" });
+      return;
+    }
+    try {
+      res.json({ files: await workspace.memory.listAgentFiles() });
+    } catch (err) {
+      res.status(400).json({ error: errorMessage(err) });
+    }
+  });
+
+  app.get("/api/members/:id/files/content", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const memberId = String(req.params["id"] ?? "");
+    if (!workspace.bus.listMembers().some((member) => member.id === memberId)) {
+      res.status(404).json({ error: "成员不存在" });
+      return;
+    }
+    const relPath = typeof req.query["path"] === "string" ? req.query["path"] : "";
+    try {
+      const file = await workspace.memory.readAgentFile(relPath);
+      res.json({
+        path: relPath.trim().replaceAll("\\", "/").replace(/^\.\//, ""),
+        content: file.content,
+        totalLines: file.totalLines,
+        truncated: file.truncated,
+      });
+    } catch (err) {
+      res.status(400).json({ error: errorMessage(err) });
+    }
+  });
+
   app.post("/api/tasks", async (req: Request, res: Response) => {
     const body = bodyOf(req);
     const title = stringField(body, "title").trim();
@@ -336,9 +392,21 @@ export function createApp(deps: AppDeps): express.Express {
       });
       return;
     }
+    const clientStatus = (err as { status?: number; statusCode?: number } | null)?.status
+      ?? (err as { statusCode?: number } | null)?.statusCode;
+    if (typeof clientStatus === "number" && clientStatus >= 400 && clientStatus < 500) {
+      res
+        .status(clientStatus)
+        .json({
+          error:
+            clientStatus === 413
+              ? "导入内容过大：单次最多 20 份 SKILL.md，每份不超过 256 KB"
+              : "请求体格式不正确",
+        });
+      return;
+    }
     console.error("请求处理失败", err);
     res.status(500).json({ error: "服务器内部错误" });
   });
-
   return app;
 }

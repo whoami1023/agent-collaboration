@@ -147,9 +147,19 @@ export interface SkillView {
   description: string;
   instructions: string;
   builtin?: boolean;
+  imported?: boolean;
   source?: string;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface SkillImportResult {
+  filename: string;
+  ok: boolean;
+  action?: "created" | "updated";
+  skill?: SkillView;
+  error?: string;
+  warnings?: string[];
 }
 
 export interface SkillSnapshot {
@@ -173,6 +183,17 @@ export async function createSkill(input: {
     body: JSON.stringify(input),
   });
   return body.skill;
+}
+
+export async function importSkills(input: {
+  scope: SkillScope;
+  overwrite: boolean;
+  files: { filename: string; content: string }[];
+}): Promise<{ results: SkillImportResult[] }> {
+  return request<{ results: SkillImportResult[] }>("/api/skills/import", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
 
 export async function updateSkill(
@@ -209,6 +230,35 @@ export async function cancelMember(memberId: string): Promise<boolean> {
     method: "POST",
   });
   return body.cancelled;
+}
+
+export interface AgentFileEntry {
+  path: string;
+  sizeBytes: number;
+  updatedAt: number;
+}
+
+export interface AgentFileContent {
+  path: string;
+  content: string;
+  totalLines: number;
+  truncated: boolean;
+}
+
+export async function fetchMemberFiles(memberId: string): Promise<AgentFileEntry[]> {
+  const body = await request<{ files: AgentFileEntry[] }>(
+    `/api/members/${encodeURIComponent(memberId)}/files`,
+  );
+  return body.files;
+}
+
+export async function fetchMemberFileContent(
+  memberId: string,
+  path: string,
+): Promise<AgentFileContent> {
+  return request<AgentFileContent>(
+    `/api/members/${encodeURIComponent(memberId)}/files/content?path=${encodeURIComponent(path)}`,
+  );
 }
 
 export async function createTask(title: string): Promise<TaskCard> {

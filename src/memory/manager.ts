@@ -28,6 +28,7 @@ import {
   extractCuratedEntryRecallMetadata,
   stripMemoryAnnotationCarriers,
 } from "./annotations";
+import { AGENT_FILE_ORDER } from "./bootstrap-files";
 import { chunkMarkdown, hashText, remapChunkLines, type MemoryChunk } from "./chunking";
 import type { MemoryEmbeddingProvider } from "./embedding";
 import { cosineSimilarity, HashProjectionEmbeddingProvider } from "./embedding";
@@ -896,9 +897,58 @@ export class MemorySearchManager {
     }
   }
 
+  /** Web 端「智能体文件」面板清单：记忆语料 + 身份/性格文件，按 bootstrap 顺序排列。 */
+  async listAgentFiles(): Promise<Array<{ path: string; sizeBytes: number; updatedAt: number }>> {
+    const { workspaceDir } = this.options;
+    const files = await this.listMemoryFiles();
+    for (const name of NON_MEMORY_AGENT_FILES) {
+      const abs = path.join(workspaceDir, name);
+      if (await isRegularMarkdown(abs)) files.push(abs);
+    }
+    const listed: Array<{ path: string; sizeBytes: number; updatedAt: number }> = [];
+    for (const abs of files) {
+      const entry = await this.buildFileEntry(abs);
+      if (!entry) continue;
+      try {
+        const stat = await fs.stat(abs);
+        listed.push({ path: entry.path, sizeBytes: stat.size, updatedAt: stat.mtimeMs });
+      } catch {
+        // 竞态删除：跳过
+      }
+    }
+    return listed.sort(
+      (left, right) => agentFileRank(left.path) - agentFileRank(right.path) || left.path.localeCompare(right.path),
+    );
+  }
+
+  /** 「智能体文件」面板的读取口径：记忆根之外还允许工作区根部的身份文件。 */
+  async readAgentFile(
+    relPath: string,
+  ): Promise<{ content: string; truncated: boolean; totalLines: number; more: boolean }> {
+    return this.readWithin(
+      relPath,
+      (abs, root) => isMemoryRootPath(abs, root) || NON_MEMORY_AGENT_FILES.some((name) => abs === path.join(root, name)),
+      `只允许读取 MEMORY.md、USER.md、SOUL.md、IDENTITY.md 或 memory/ 下的文件：${relPath}`,
+    );
+  }
+
   /** memory_get 的安全读取：路径必须解析回工作区内且属于记忆根。 */
   async readFile(
     relPath: string,
+    params?: { from?: number; lines?: number },
+  ): Promise<{ content: string; truncated: boolean; totalLines: number; more: boolean }> {
+    return this.readWithin(
+      relPath,
+      (abs, root) => isMemoryRootPath(abs, root),
+      `只允许读取 MEMORY.md、USER.md 或 memory/ 下的文件：${relPath}`,
+      params,
+    );
+  }
+
+  private async readWithin(
+    relPath: string,
+    isAllowed: (absPath: string, workspaceRoot: string) => boolean,
+    refusal: string,
     params?: { from?: number; lines?: number },
   ): Promise<{ content: string; truncated: boolean; totalLines: number; more: boolean }> {
     const { workspaceDir } = this.options;
@@ -906,15 +956,12 @@ export class MemorySearchManager {
     if (!normalized || normalized.includes("\0") || path.isAbsolute(normalized)) {
       throw new Error(`路径不合法：${relPath}`);
     }
-    const absPath = path.resolve(workspaceDir, normalized);
-    const rootInside =
-      absPath === path.resolve(workspaceDir, "MEMORY.md") ||
-      absPath === path.resolve(workspaceDir, "USER.md") ||
-      absPath.startsWith(path.resolve(workspaceDir, "memory") + path.sep);
-    if (!rootInside) {
-      throw new Error(`只允许读取 MEMORY.md、USER.md 或 memory/ 下的文件：${relPath}`);
+    const workspaceRoot = path.resolve(workspaceDir);
+    const absPath = path.resolve(workspaceRoot, normalized);
+    if (!isAllowed(absPath, workspaceRoot)) {
+      throw new Error(refusal);
     }
-    const realDir = await fs.realpath(workspaceDir).catch(() => path.resolve(workspaceDir));
+    const realDir = await fs.realpath(workspaceDir).catch(() => workspaceRoot);
     const realPath = await fs.realpath(absPath).catch(() => undefined);
     if (!realPath || !isPathInsideDir(realDir, realPath)) {
       throw new Error(`路径越出工作区：${relPath}`);
@@ -961,6 +1008,23 @@ function isAscii(value: string): boolean {
 function isPathInsideDir(dir: string, target: string): boolean {
   const relative = path.relative(dir, target);
   return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+/** 记忆语料根：MEMORY.md、USER.md 与 memory/**.md（对应 OpenClaw 的 listMemoryFiles 范围）。 */
+function isMemoryRootPath(absPath: string, workspaceRoot: string): boolean {
+  return (
+    absPath === path.join(workspaceRoot, "MEMORY.md") ||
+    absPath === path.join(workspaceRoot, "USER.md") ||
+    absPath.startsWith(path.join(workspaceRoot, "memory") + path.sep)
+  );
+}
+
+/** 不属于检索语料、但属于智能体档案的工作区文件（性格与身份）。 */
+const NON_MEMORY_AGENT_FILES: readonly string[] = ["SOUL.md", "IDENTITY.md"];
+
+function agentFileRank(relPath: string): number {
+  const index = (AGENT_FILE_ORDER as readonly string[]).indexOf(relPath);
+  return index === -1 ? AGENT_FILE_ORDER.length : index;
 }
 
 async function isRegularMarkdown(absPath: string): Promise<boolean> {

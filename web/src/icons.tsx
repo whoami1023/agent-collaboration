@@ -13,7 +13,12 @@ export type IconName =
   | "chevron"
   | "chevronRight"
   | "columns"
-  | "book";
+  | "book"
+  | "chat"
+  | "inspect"
+  | "refresh"
+  | "import"
+  | "folder";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
   menu: <path d="M4 6h16M4 12h16M4 18h16" />,
@@ -67,6 +72,37 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
       <path d="M12 6.4C10 4.8 7.5 4.1 4 4.3v13.3c3.5-.2 6 .5 8 2.1 2-1.6 4.5-2.3 8-2.1V4.3c-3.5-.2-6 .5-8 2.1Z" />
       <path d="M12 6.4v13.3" />
     </>
+  ),
+  chat: (
+    <>
+      <path d="M4 5.5h16v11H9.5L5 20v-3.5H4Z" />
+      <path d="M8 9.5h8M8 12.5h5" />
+    </>
+  ),
+  inspect: (
+    <>
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4" />
+      <path d="M14 3v5h5" />
+      <path d="M14 8h5" />
+      <circle cx="17.5" cy="16.5" r="3" />
+      <path d="M19.8 18.8 22 21" />
+    </>
+  ),
+  refresh: (
+    <>
+      <path d="M20 12a8 8 0 1 1-2.3-5.6" />
+      <path d="M20 4v4h-4" />
+    </>
+  ),
+  import: (
+    <>
+      <path d="M12 3v10" />
+      <path d="m8 9 4 4 4-4" />
+      <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+    </>
+  ),
+  folder: (
+    <path d="M3 8a2 2 0 0 1 2-2h4l2 2.5h6A2 2 0 0 1 19 11v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
   ),
 };
 

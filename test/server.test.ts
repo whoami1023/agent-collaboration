@@ -329,6 +329,82 @@ describe("多用户 API", () => {
     expect((await call("/api/skills", { cookie: aliceCookie })).body["shared"]).toEqual([]);
   });
 
+  it("导入 SKILL.md：共享要管理员，坏文件逐条返回，个人技能带导入标记", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "ownerpass1" },
+    });
+    const adminCookie = setup.cookie as string;
+    await call("/api/users", {
+      method: "POST",
+      cookie: adminCookie,
+      body: { username: "alice", displayName: "Alice", password: "alicepass1" },
+    });
+    const aliceCookie = (
+      await call("/api/auth/login", {
+        method: "POST",
+        body: { username: "alice", password: "alicepass1" },
+      })
+    ).cookie as string;
+
+    const forbidden = await call("/api/skills/import", {
+      method: "POST",
+      cookie: aliceCookie,
+      body: {
+        scope: "shared",
+        files: [{ filename: "pdf-forms/SKILL.md", content: "---\nname: x\ndescription: y\n---\n正文" }],
+      },
+    });
+    expect(forbidden.status).toBe(403);
+
+    const imported = await call("/api/skills/import", {
+      method: "POST",
+      cookie: aliceCookie,
+      body: {
+        files: [
+          {
+            filename: "pdf-forms/SKILL.md",
+            content: "---\nname: pdf-forms\ndescription: 填写 PDF 表单\n---\n\n1. 读取字段",
+          },
+          { filename: "broken/SKILL.md", content: "---\nname: broken\n---\n\n正文" },
+        ],
+      },
+    });
+    expect(imported.status).toBe(200);
+    const results = imported.body["results"] as Record<string, unknown>[];
+    expect(results[0]).toMatchObject({ ok: true, action: "created" });
+    expect((results[0]?.["skill"] as Record<string, unknown>)["imported"]).toBe(true);
+    expect(results[1]).toMatchObject({ ok: false });
+    expect(typeof results[1]?.["error"]).toBe("string");
+
+    const snapshot = await call("/api/skills", { cookie: aliceCookie });
+    const personal = snapshot.body["personal"] as Record<string, unknown>[];
+    expect(personal).toHaveLength(1);
+    expect(personal[0]).toMatchObject({
+      name: "pdf-forms",
+      imported: true,
+      source: "导入自 pdf-forms/SKILL.md",
+    });
+
+    const sharedImport = await call("/api/skills/import", {
+      method: "POST",
+      cookie: adminCookie,
+      body: {
+        scope: "shared",
+        files: [
+          {
+            filename: "notes/SKILL.md",
+            content: "---\nname: notes\ndescription: 记笔记\n---\n\n先列要点",
+          },
+        ],
+      },
+    });
+    expect(sharedImport.status).toBe(200);
+    expect(
+      ((await call("/api/skills", { cookie: aliceCookie })).body["shared"] as unknown[]).length,
+    ).toBe(1);
+  });
+
   it("登录失败限流、退出后会话失效，SSE 也需要登录", async () => {
     const setup = await call("/api/auth/setup", {
       method: "POST",

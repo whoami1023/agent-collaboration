@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -75,6 +75,25 @@ describe("WorkspaceRegistry", () => {
     );
     expect(restored.board.list().map((task) => task.title)).toContain("需要保留的任务");
     expect(restored.getSettings().activeProviderId).toBe("deepseek");
+    await reloaded.closeAll();
+  });
+
+  it("首次加载即生成智能体档案文件，且不覆盖已有内容", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    const files = await alice.memory.listAgentFiles();
+    expect(files.map((file) => file.path)).toEqual(["MEMORY.md", "USER.md", "SOUL.md", "IDENTITY.md"]);
+    const soul = await alice.memory.readAgentFile("SOUL.md");
+    expect(soul.content).toContain("我是谁");
+
+    // 手工改写后重新加载：模板绝不覆盖用户内容。
+    await writeFile(join(dir, "u_alice", "MEMORY.md"), "# 我的记忆\n\n- 自定义条目\n", "utf8");
+    const skills2 = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await skills2.init();
+    const reloaded = new WorkspaceRegistry(dir, skills2);
+    const again = await reloaded.get({ id: "u_alice", displayName: "Alice" });
+    const memory = await again.memory.readAgentFile("MEMORY.md");
+    expect(memory.content).toContain("自定义条目");
+    expect(memory.content).not.toContain("示例：");
     await reloaded.closeAll();
   });
 });

@@ -3,6 +3,7 @@ import { newId } from "../core/ids";
 import type { PublicUser } from "../core/types";
 import { writeJsonAtomic } from "../store/persist";
 import { BUILTIN_SHARED_SKILLS } from "./builtin";
+import { parseSkillMarkdown, skillNameFromFile, SkillMarkdownError } from "./skill-md";
 
 export type SkillScope = "shared" | "personal";
 
@@ -14,6 +15,7 @@ export interface SkillRecord {
   description: string;
   instructions: string;
   builtin?: boolean;
+  imported?: boolean;
   source?: string;
   createdAt: number;
   updatedAt: number;
@@ -32,6 +34,26 @@ export interface SkillInput {
   instructions?: unknown;
 }
 
+export interface SkillImportFile {
+  filename?: unknown;
+  content?: unknown;
+}
+
+export interface SkillImportInput {
+  scope?: unknown;
+  overwrite?: unknown;
+  files?: unknown;
+}
+
+export interface SkillImportResult {
+  filename: string;
+  ok: boolean;
+  action?: "created" | "updated";
+  skill?: SkillRecord;
+  error?: string;
+  warnings?: string[];
+}
+
 export interface SkillLibraryOptions {
   seedShared?: boolean;
   now?: () => number;
@@ -46,6 +68,8 @@ const NAME_RE = /^[a-z0-9][a-z0-9-]{0,47}$/;
 const DESCRIPTION_MAX = 160;
 const INSTRUCTIONS_MAX = 20000;
 const MAX_SKILLS = 500;
+const MAX_IMPORT_FILES = 20;
+const MAX_FILENAME_CHARS = 120;
 
 export class SkillError extends Error {
   constructor(
@@ -96,6 +120,32 @@ function normalizeInstructions(raw: unknown): string {
 
 function byName(a: SkillRecord, b: SkillRecord): number {
   return a.name.localeCompare(b.name);
+}
+
+function importFilenameOf(raw: unknown): string {
+  if (typeof raw !== "string") return "SKILL.md";
+  const trimmed = raw.trim();
+  return trimmed ? trimmed.slice(-MAX_FILENAME_CHARS) : "SKILL.md";
+}
+
+/** 导入的 SKILL.md 常超出我们的字段上限：截断并提示，好过整条技能被拒。 */
+function fitImportedField(value: string, max: number, label: string, warnings: string[]): string {
+  if (value.length <= max) return value;
+  warnings.push(`${label}过长（${value.length} 字符），已截断到 ${max} 字符。`);
+  return value.slice(0, max);
+}
+
+/** SKILL.md 的 name 写法五花八门（`PDF Forms`、`pdf_forms`），统一转成小写短横线 slug。 */
+function importedName(raw: string, warnings: string[]): string {
+  try {
+    return normalizeName(raw);
+  } catch {
+    const slugged = skillNameFromFile(raw);
+    if (!slugged) throw new SkillError(400, `技能名称无法转成小写短横线格式：${raw}`);
+    if (slugged.length > 48) throw new SkillError(400, `技能名称过长：${slugged}`);
+    warnings.push(`技能名称已规范化为 ${slugged}。`);
+    return slugged;
+  }
 }
 
 export class SkillLibrary {
@@ -248,6 +298,107 @@ export class SkillLibrary {
         this.data.removedBuiltins = [...removed];
       }
       await this.persist();
+    });
+  }
+
+  async importMany(user: PublicUser, input: SkillImportInput): Promise<SkillImportResult[]> {
+    return this.mutate(async () => {
+      const scope = normalizeScope(input.scope);
+      if (scope === "shared" && user.role !== "admin") {
+        throw new SkillError(403, "只有管理员可以导入共享技能");
+      }
+      const overwrite = input.overwrite === true;
+      const entries = Array.isArray(input.files) ? input.files : null;
+      if (!entries || entries.length === 0) {
+        throw new SkillError(400, "请选择或粘贴至少一份 SKILL.md");
+      }
+      if (entries.length > MAX_IMPORT_FILES) {
+        throw new SkillError(400, `单次最多导入 ${MAX_IMPORT_FILES} 份技能`);
+      }
+      const ownerId = user.id;
+      const results: SkillImportResult[] = [];
+      let changed = false;
+
+      for (const entry of entries) {
+        const filename = importFilenameOf((entry as SkillImportFile | null)?.["filename"]);
+        const content = (entry as SkillImportFile | null)?.["content"];
+        if (typeof content !== "string" || !content.trim()) {
+          results.push({ filename, ok: false, error: "文件内容为空" });
+          continue;
+        }
+        try {
+          const parsed = parseSkillMarkdown(content, { filename });
+          const warnings = [...parsed.warnings];
+          const name = importedName(parsed.name, warnings);
+          const description = fitImportedField(
+            parsed.description,
+            DESCRIPTION_MAX,
+            "技能描述",
+            warnings,
+          );
+          const instructions = fitImportedField(
+            parsed.instructions,
+            INSTRUCTIONS_MAX,
+            "技能说明",
+            warnings,
+          );
+          const source = `导入自 ${filename}`;
+          const existing = this.data.skills.find(
+            (skill) => skill.scope === scope && skill.ownerId === ownerId && skill.name === name,
+          );
+          if (existing) {
+            if (!overwrite) {
+              results.push({
+                filename,
+                ok: false,
+                error: "已有同名技能，勾选「覆盖」才能更新",
+                warnings,
+              });
+              continue;
+            }
+            existing.description = description;
+            existing.instructions = instructions;
+            existing.source = source;
+            existing.imported = true;
+            existing.updatedAt = this.now();
+            changed = true;
+            results.push({ filename, ok: true, action: "updated", skill: existing, warnings });
+            continue;
+          }
+          if (this.data.skills.length >= MAX_SKILLS) {
+            results.push({ filename, ok: false, error: `技能总数不能超过 ${MAX_SKILLS} 个` });
+            continue;
+          }
+          const now = this.now();
+          const record: SkillRecord = {
+            id: newId("sk"),
+            scope,
+            ownerId,
+            name,
+            description,
+            instructions,
+            imported: true,
+            source,
+            createdAt: now,
+            updatedAt: now,
+          };
+          this.data.skills.push(record);
+          changed = true;
+          results.push({ filename, ok: true, action: "created", skill: record, warnings });
+        } catch (err) {
+          results.push({
+            filename,
+            ok: false,
+            error:
+              err instanceof SkillError || err instanceof SkillMarkdownError
+                ? err.message
+                : `SKILL.md 解析失败：${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+      }
+
+      if (changed) await this.persist();
+      return results;
     });
   }
 
