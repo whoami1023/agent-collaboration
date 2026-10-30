@@ -1,7 +1,15 @@
 import { join } from "node:path";
 import { ensureMainMember, Orchestrator } from "../agent/orchestrator";
+import { SessionArchives, summaryOf } from "../archive/session-archive";
 import { loadSettings, saveSettings, type Settings } from "../core/settings";
-import type { Member, RoomMessage, RoomMode, TaskCard } from "../core/types";
+import type {
+  Member,
+  RoomMessage,
+  RoomMode,
+  SessionArchiveDetail,
+  SessionArchiveSummary,
+  TaskCard,
+} from "../core/types";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
 import { WorkspaceFiles } from "../files/workspace-files";
@@ -40,6 +48,7 @@ export class Workspace {
     private readonly settingsRef: { current: Settings },
     readonly memory: MemorySearchManager,
     readonly files: WorkspaceFiles,
+    readonly archives: SessionArchives,
   ) {}
 
   static async load(rootDir: string, owner: WorkspaceOwner, skills: SkillLibrary): Promise<Workspace> {
@@ -83,18 +92,36 @@ export class Workspace {
       files,
     });
 
-    const workspace = new Workspace(owner.id, dir, bus, board, orchestrator, settingsRef, memory, files);
+    const workspace = new Workspace(
+      owner.id,
+      dir,
+      bus,
+      board,
+      orchestrator,
+      settingsRef,
+      memory,
+      files,
+      new SessionArchives(dir),
+    );
     bus.subscribe((event) => {
       if (
         event.type === "message" ||
         event.type === "messages-cleared" ||
+        event.type === "session-archived" ||
+        event.type === "session-restored" ||
         event.type === "mode" ||
         event.type === "member" ||
         event.type === "member-removed"
       ) {
         workspace.scheduleSave();
       }
-      if (event.type === "message" || event.type === "messages-cleared") memory.markDirty();
+      if (
+        event.type === "message" ||
+        event.type === "messages-cleared" ||
+        event.type === "session-restored"
+      ) {
+        memory.markDirty();
+      }
     });
     board.subscribe(() => workspace.scheduleSave());
     await workspace.persist();
@@ -111,6 +138,62 @@ export class Workspace {
 
   setRoomMode(mode: RoomMode): RoomMode {
     return this.orchestrator.setRoomMode(mode);
+  }
+
+  /**
+   * /clear：先静默中止在跑的成员，把群聊记录、任务卡与 files/ 成果整体归档，再清空作战室。
+   * 智能体长期记忆（MEMORY.md、USER.md、memory/）与成员档案不进归档、也不受影响。
+   */
+  async clearRoomSession(): Promise<{
+    cleared: number;
+    tasksCleared: number;
+    cancelled: number;
+    archived: SessionArchiveSummary | null;
+  }> {
+    const cancelled = this.orchestrator.cancelAllRuns();
+    const archived = await this.captureRoomSession();
+    const cleared = this.bus.clearMessages();
+    const tasksCleared = this.board.clearAll();
+    if (archived) this.bus.emit({ type: "session-archived", archive: archived });
+    await this.persist();
+    return { cleared, tasksCleared, cancelled, archived };
+  }
+
+  /**
+   * 恢复一份归档：当前内容非空时先自动存成新归档（恢复是「交换」，不会丢东西），
+   * 再把归档里的消息、任务卡与文件放回作战室。seq 取两边较大值，保证序号继续单调递增。
+   */
+  async restoreArchive(id: string): Promise<{
+    archive: SessionArchiveDetail;
+    autoArchived: SessionArchiveSummary | null;
+    restoredFiles: string[];
+    conflicts: string[];
+    cancelled: number;
+  }> {
+    const cancelled = this.orchestrator.cancelAllRuns();
+    const autoArchived = await this.captureRoomSession();
+    const { archive, restoredFiles, conflicts } = await this.archives.restore(id);
+    const currentSeq = this.bus.snapshot().seq;
+    this.bus.hydrate({
+      seq: Math.max(archive.seq, currentSeq),
+      messages: archive.messages,
+      mode: this.bus.roomMode,
+    });
+    this.board.hydrate(archive.tasks);
+    this.memory.markDirty();
+    this.bus.emit({ type: "session-restored", archive: summaryOf(archive) });
+    await this.persist();
+    return { archive, autoArchived, restoredFiles, conflicts, cancelled };
+  }
+
+  private async captureRoomSession(): Promise<SessionArchiveSummary | null> {
+    const snapshot = this.bus.snapshot();
+    return this.archives.capture({
+      roomName: this.bus.roomName,
+      seq: snapshot.seq,
+      messages: snapshot.messages,
+      tasks: this.board.list(),
+    });
   }
 
   async setSettings(next: Settings): Promise<void> {

@@ -6,8 +6,32 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
 } from "react";
-import type { Member, PublicUser, RoomEvent, RoomMessage, RoomMode, TaskCard } from "../../src/core/types";
-import { Icon } from "./icons";
+import type {
+  Member,
+  PublicUser,
+  RoomEvent,
+  RoomMessage,
+  RoomMode,
+  SessionArchiveDetail,
+  SessionArchiveSummary,
+  TaskCard,
+} from "../../src/core/types";
+import { Icon, type IconName } from "./icons";
+import {
+  LAYOUT_KEY,
+  PANE_STEP,
+  PANEL_MIN,
+  SIDEBAR_MIN,
+  clampTo,
+  defaultPanes,
+  fitPanes,
+  panelMax,
+  pickStoredPanes,
+  preferredPanelWidth,
+  sidebarMax,
+  type PaneName,
+  type PaneWidths,
+} from "./layout";
 import SkillLibraryPanel from "./SkillLibrary";
 import {
   buildContextReport,
@@ -27,7 +51,10 @@ import {
   createTask,
   createUser,
   createWorkspaceFolder,
+  deleteArchive,
   deleteWorkspaceFile,
+  fetchArchive,
+  fetchArchives,
   fetchBootstrap,
   fetchMe,
   fetchMemberFileContent,
@@ -43,6 +70,7 @@ import {
   patchTask,
   removeMember,
   resetUserPassword,
+  restoreArchive,
   saveMemberFile,
   saveMemberSkills,
   saveSettings,
@@ -67,62 +95,22 @@ import { CsvPreview, RichPreviewBody } from "./FilePreviews";
 
 type ThemeMode = "light" | "dark";
 type SettingsTab = "profile" | "model" | "appearance";
+/** 右侧面板的三个视图：任务看板、文件工作区、归档区。 */
+type RightTab = "tasks" | "files" | "archives";
 
 const THEME_KEY = "ac_theme";
-const LAYOUT_KEY = "ac_layout";
-
-const SIDEBAR_MIN = 200;
-const SIDEBAR_MAX = 420;
-const PANEL_MIN = 220;
-const PANEL_MAX = 720;
-/** 中间聊天区在任何拖拽下都不许被挤到不可用。 */
-const CHAT_MIN = 460;
-const PANE_STEP = 16;
-
-interface PaneWidths {
-  sidebar: number;
-  panel: number;
-}
-
-type PaneName = keyof PaneWidths;
-
-function compactWidths(): PaneWidths {
-  return window.innerWidth <= 1180 ? { sidebar: 240, panel: 272 } : { sidebar: 264, panel: 300 };
-}
-
-function clampTo(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
-  return Math.min(max, Math.max(min, value));
-}
-
-function sidebarMax(pane: PaneWidths): number {
-  return Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, window.innerWidth - pane.panel - CHAT_MIN));
-}
-
-function panelMax(pane: PaneWidths): number {
-  return Math.max(PANEL_MIN, Math.min(PANEL_MAX, window.innerWidth - pane.sidebar - CHAT_MIN));
-}
-
-function fitPanes(next: PaneWidths): PaneWidths {
-  const sidebar = Math.round(clampTo(next.sidebar, SIDEBAR_MIN, sidebarMax(next)));
-  const widened: PaneWidths = { ...next, sidebar };
-  return { ...widened, panel: Math.round(clampTo(next.panel, PANEL_MIN, panelMax(widened))) };
-}
 
 function readStoredPanes(): PaneWidths | null {
   try {
-    const raw = localStorage.getItem(LAYOUT_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<PaneWidths>;
-    if (typeof parsed.sidebar !== "number" || typeof parsed.panel !== "number") return null;
-    return { sidebar: parsed.sidebar, panel: parsed.panel };
+    return pickStoredPanes(localStorage.getItem(LAYOUT_KEY));
   } catch {
     return null;
   }
 }
 
 function readPanes(): PaneWidths {
-  return fitPanes(readStoredPanes() ?? compactWidths());
+  const vw = window.innerWidth;
+  return fitPanes(vw, readStoredPanes() ?? defaultPanes(vw));
 }
 
 function writePanes(next: PaneWidths): void {
@@ -194,6 +182,28 @@ function statusLabel(status: TaskCard["status"]): string {
     default:
       return "待办";
   }
+}
+
+/** 右侧面板三个视图的显示名与图标，标签栏、顶栏切换和收起按钮共用一份。 */
+const RIGHT_TAB_META: Record<RightTab, { title: string; icon: IconName }> = {
+  tasks: { title: "任务看板", icon: "columns" },
+  files: { title: "文件工作区", icon: "folder" },
+  archives: { title: "归档区", icon: "archive" },
+};
+
+function rightTabTitle(tab: RightTab): string {
+  return RIGHT_TAB_META[tab].title;
+}
+
+/** 归档时间：同一天只显示时刻，跨天补上日期，列表按新到旧排。 */
+function archiveStamp(ts: number): string {
+  const date = new Date(ts);
+  const today = new Date();
+  const sameDay = date.toDateString() === today.toDateString();
+  if (sameDay) return `今天 ${clock(ts)}`;
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${month}-${day} ${clock(ts)}`;
 }
 
 export default function App() {
@@ -477,13 +487,20 @@ function RoomView({
     }
   });
   const [newTaskTitle, setNewTaskTitle] = useState("");
-  const [rightTab, setRightTab] = useState<"tasks" | "files">(() => {
+  const [rightTab, setRightTab] = useState<RightTab>(() => {
     try {
-      return localStorage.getItem("ac_right_tab") === "files" ? "files" : "tasks";
+      const stored = localStorage.getItem("ac_right_tab");
+      return stored === "files" || stored === "archives" ? stored : "tasks";
     } catch {
       return "tasks";
     }
   });
+  const [archives, setArchives] = useState<SessionArchiveSummary[] | null>(null);
+  const [archivesError, setArchivesError] = useState<string | null>(null);
+  const [openArchiveId, setOpenArchiveId] = useState<string | null>(null);
+  const [archiveDetail, setArchiveDetail] = useState<SessionArchiveDetail | null>(null);
+  const [archiveDetailError, setArchiveDetailError] = useState<string | null>(null);
+  const [restoringArchive, setRestoringArchive] = useState(false);
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFileEntry[] | null>(null);
   const [workspaceFilesTruncated, setWorkspaceFilesTruncated] = useState(false);
   const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
@@ -505,6 +522,8 @@ function RoomView({
   const [draggedPane, setDraggedPane] = useState<PaneName | null>(null);
   const panesRef = useRef<PaneWidths>(panes);
   const endDragRef = useRef<(() => void) | null>(null);
+  /** 打开文件预览时临时加宽右栏的记录；用户在预览期间手动改过宽度就不再自动还原。 */
+  const previewFitRef = useRef<{ from: number; overridden: boolean } | null>(null);
   const [selectedMemberId, setSelectedMemberId] = useState<string | null>(null);
   const [newMemberOpen, setNewMemberOpen] = useState(false);
   const [agentFiles, setAgentFiles] = useState<AgentFileEntry[] | null>(null);
@@ -572,10 +591,40 @@ function RoomView({
 
   useEffect(() => {
     // 以存下的宽度意图重新适配：窗口先缩小再放大时，栏宽能回到用户设定的值。
-    const handleResize = () => setPanes(fitPanes(readStoredPanes() ?? panesRef.current));
+    const handleResize = () => {
+      const vw = window.innerWidth;
+      const intent = readStoredPanes() ?? panesRef.current;
+      const fitted = previewFitRef.current
+        ? { ...intent, panel: Math.max(intent.panel, preferredPanelWidth(vw)) }
+        : intent;
+      commitPanes(fitPanes(vw, fitted));
+    };
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
+
+  /**
+   * 预览文件时右栏才是主角：自动升到最优预览宽度（只加宽、不写进用户存下的布局），
+   * 关闭预览后还原；期间用户手动拖过/重置过就尊重手动结果。
+   */
+  useEffect(() => {
+    const vw = window.innerWidth;
+    if (!openWorkspacePath) {
+      const fit = previewFitRef.current;
+      previewFitRef.current = null;
+      if (!fit || fit.overridden) return;
+      const current = panesRef.current;
+      if (current.panel === fit.from) return;
+      commitPanes(fitPanes(vw, { ...current, panel: fit.from }));
+      return;
+    }
+    if (previewFitRef.current) return;
+    const current = panesRef.current;
+    const optimal = fitPanes(vw, { ...current, panel: preferredPanelWidth(vw) }).panel;
+    if (current.panel >= optimal) return;
+    previewFitRef.current = { from: current.panel, overridden: false };
+    commitPanes({ ...current, panel: optimal });
+  }, [openWorkspacePath]);
 
   useEffect(() => {
     if (!draggedPane) return;
@@ -591,11 +640,13 @@ function RoomView({
   }
 
   function resizePane(pane: PaneName, rawWidth: number) {
+    const vw = window.innerWidth;
     const current = panesRef.current;
+    if (pane === "panel" && previewFitRef.current) previewFitRef.current.overridden = true;
     // 拖动时以另一栏的现有宽度为上限，不顺手把对方压到最小。
     const min = pane === "sidebar" ? SIDEBAR_MIN : PANEL_MIN;
-    const max = pane === "sidebar" ? sidebarMax(current) : panelMax(current);
-    const next = fitPanes({ ...current, [pane]: Math.round(clampTo(rawWidth, min, max)) });
+    const max = pane === "sidebar" ? sidebarMax(vw, current) : panelMax(vw, current);
+    const next = fitPanes(vw, { ...current, [pane]: Math.round(clampTo(rawWidth, min, max)) });
     if (next.sidebar === current.sidebar && next.panel === current.panel) return;
     commitPanes(next);
   }
@@ -632,8 +683,10 @@ function RoomView({
     event.preventDefault();
     const current = panesRef.current;
     if (event.key === "Home") {
-      commitPanes(compactWidths());
-      writePanes(panesRef.current);
+      previewFitRef.current = null;
+      const next = fitPanes(window.innerWidth, defaultPanes(window.innerWidth));
+      commitPanes(next);
+      writePanes(next);
       return;
     }
     // 右边界在面板左侧：ArrowLeft 让面板变宽。
@@ -643,9 +696,54 @@ function RoomView({
   }
 
   function resetPaneWidth(pane: PaneName) {
-    resizePane(pane, compactWidths()[pane]);
+    resizePane(pane, defaultPanes(window.innerWidth)[pane]);
     writePanes(panesRef.current);
   }
+
+  const refreshArchives = useCallback(async () => {
+    try {
+      setArchives(await fetchArchives());
+      setArchivesError(null);
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setArchivesError(messageOf(err));
+    }
+  }, [onSessionLost]);
+
+  /** 归档与恢复都会整体替换会话内容（消息、任务卡、文件），一律以服务端为准重新拉一份视图。 */
+  const reloadSession = useCallback(async () => {
+    setRuns({});
+    try {
+      setState(await fetchState());
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    }
+    await refreshArchives();
+  }, [onSessionLost, refreshArchives]);
+
+  useEffect(() => {
+    if (!openArchiveId) {
+      setArchiveDetail(null);
+      setArchiveDetailError(null);
+      return;
+    }
+    let alive = true;
+    setArchiveDetail(null);
+    setArchiveDetailError(null);
+    fetchArchive(openArchiveId)
+      .then((detail) => {
+        if (alive) setArchiveDetail(detail);
+      })
+      .catch((err: unknown) => {
+        if (!alive) return;
+        if (isUnauthorized(err)) onSessionLost();
+        else setArchiveDetailError(messageOf(err));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [openArchiveId, onSessionLost]);
 
   useEffect(() => {
     let alive = true;
@@ -677,6 +775,7 @@ function RoomView({
     const unsubscribe = subscribeEvents((event: RoomEvent) => {
       setState((current) => applyEvent(current, event));
       if (event.type === "messages-cleared") setRuns({});
+      if (event.type === "session-archived" || event.type === "session-restored") void reloadSession();
       setRuns((current) => {
         if (event.type !== "run") return current;
         const run = event.event;
@@ -702,7 +801,7 @@ function RoomView({
       alive = false;
       unsubscribe();
     };
-  }, [onSessionLost]);
+  }, [onSessionLost, reloadSession]);
 
   const messages = state?.messages ?? [];
   const members = state?.members ?? [];
@@ -753,6 +852,12 @@ function RoomView({
     if (rightTab !== "files" || !boardOpen) return;
     void refreshWorkspaceFiles();
   }, [rightTab, boardOpen, messages.length, refreshWorkspaceFiles]);
+
+  // 归档列表只在「归档」标签可见时拉取：切标签、展开面板或别的入口刚做完归档都会走到这里。
+  useEffect(() => {
+    if (rightTab !== "archives" || !boardOpen) return;
+    void refreshArchives();
+  }, [rightTab, boardOpen, refreshArchives]);
 
   // 当前目录被删除（或改名）后回退到最近的仍存在的上级目录。
   useEffect(() => {
@@ -992,27 +1097,86 @@ function RoomView({
     const runningNote =
       runningCount > 0 ? `\n\n正在运行的 ${runningCount} 个智能体会先被中止本轮回复。` : "";
     const confirmed = window.confirm(
-      `确定清除当前作战室的全部聊天记录吗？${runningNote}\n\n任务看板、文件工作区和智能体记忆不受影响。`,
+      `确定清空当前作战室吗？聊天记录、任务卡与文件工作区里的成果会整体归档，随时可以在右侧「归档」里恢复。${runningNote}\n\n智能体记忆（MEMORY.md、USER.md、memory/）与成员档案不进归档，也不受影响。`,
     );
     if (!confirmed) return;
     setClearingChat(true);
     setError(null);
     try {
       const result = await clearMessages();
-      setState((current) => (current ? { ...current, messages: [] } : current));
+      setState((current) =>
+        current ? { ...current, messages: [], tasks: [] } : current,
+      );
       setRuns({});
+      // 文件工作区里的顶层成果被整体移进了归档，当前打开的预览也不再存在。
+      closeWorkspacePreview();
+      await Promise.all([refreshArchives(), refreshWorkspaceFiles()]);
+      if (result.archived) {
+        // 刚存好的归档直接展开，用户一眼能看到自己清掉了什么。
+        setRightTab("archives");
+        setOpenArchiveId(result.archived.id);
+      }
       setChatNotice(
-        result.cleared === 0
-          ? "聊天记录本来就是空的。"
-          : `已清除 ${result.cleared} 条聊天记录${
+        result.archived
+          ? `已归档 ${result.archived.messageCount} 条消息、${result.archived.taskCount} 张任务卡、${
+              result.archived.fileCount
+            } 个文件${
               result.cancelled > 0 ? `，并中止了 ${result.cancelled} 个正在运行的成员` : ""
-            }。`,
+            }；作战室已清空，可在右侧「归档」恢复。`
+          : "作战室本来就是空的，没有生成归档。",
       );
     } catch (err) {
       if (isUnauthorized(err)) onSessionLost();
       else setError(messageOf(err));
     } finally {
       setClearingChat(false);
+    }
+  }
+
+  async function handleRestoreArchive(archive: SessionArchiveSummary) {
+    if (restoringArchive) return;
+    const confirmed = window.confirm(
+      `恢复这份归档？会放回 ${archive.messageCount} 条消息、${archive.taskCount} 张任务卡、${archive.fileCount} 个文件。\n\n当前作战室的内容先自动存成一份新归档，所以这一步不会丢东西。`,
+    );
+    if (!confirmed) return;
+    setRestoringArchive(true);
+    setError(null);
+    try {
+      const result = await restoreArchive(archive.id);
+      // 恢复会整体替换消息、任务卡与文件工作区：以服务端为准重拉一遍，别再留旧预览。
+      closeWorkspacePreview();
+      setOpenArchiveId(null);
+      await Promise.all([reloadSession(), refreshWorkspaceFiles()]);
+      setChatNotice(
+        `已恢复 ${result.archive.messageCount} 条消息、${result.archive.taskCount} 张任务卡、${result.restoredFiles.length} 个文件` +
+          (result.autoArchived ? "；清空前的内容已另存为新归档" : "") +
+          (result.conflicts.length > 0
+            ? `；${result.conflicts.length} 个同名文件保留了当前版本，未覆盖`
+            : "") +
+          "。",
+      );
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    } finally {
+      setRestoringArchive(false);
+    }
+  }
+
+  async function handleDeleteArchive(archive: SessionArchiveSummary) {
+    const confirmed = window.confirm(
+      `删除这份归档？其中的 ${archive.messageCount} 条消息、${archive.taskCount} 张任务卡与 ${archive.fileCount} 个文件会被永久移除，无法再恢复。`,
+    );
+    if (!confirmed) return;
+    setError(null);
+    try {
+      await deleteArchive(archive.id);
+      if (openArchiveId === archive.id) setOpenArchiveId(null);
+      await refreshArchives();
+      setChatNotice("已删除归档。");
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
     }
   }
 
@@ -1262,7 +1426,7 @@ function RoomView({
         pane="sidebar"
         value={panes.sidebar}
         min={SIDEBAR_MIN}
-        max={sidebarMax(panes)}
+        max={sidebarMax(window.innerWidth, panes)}
         dragging={draggedPane === "sidebar"}
         label="拖拽调整左侧成员栏宽度"
         onPointerDown={handlePanePointerDown}
@@ -1601,19 +1765,17 @@ function RoomView({
               className="btn ghost board-toggle"
               aria-pressed={boardOpen}
               aria-controls="side-panel"
-              title={
-                boardOpen
-                  ? "收起右侧面板"
-                  : rightTab === "files"
-                    ? "展开文件工作区"
-                    : "展开任务看板"
-              }
+              title={boardOpen ? "收起右侧面板" : `展开${rightTabTitle(rightTab)}`}
               onClick={() => setBoardOpen((open) => !open)}
             >
-              <Icon name={rightTab === "files" ? "folder" : "columns"} />
-              <span>{rightTab === "files" ? "文件工作区" : "任务看板"}</span>
+              <Icon name={RIGHT_TAB_META[rightTab].icon} />
+              <span>{rightTabTitle(rightTab)}</span>
               <span className="chip">
-                {rightTab === "files" ? (workspaceFileCount ?? "·") : tasks.length}
+                {rightTab === "files"
+                  ? (workspaceFileCount ?? "·")
+                  : rightTab === "archives"
+                    ? (archives?.length ?? "·")
+                    : tasks.length}
               </span>
             </button>
           )}
@@ -1796,7 +1958,7 @@ function RoomView({
         pane="panel"
         value={panes.panel}
         min={PANEL_MIN}
-        max={panelMax(panes)}
+        max={panelMax(window.innerWidth, panes)}
         dragging={draggedPane === "panel"}
         label="拖拽调整右侧面板宽度"
         onPointerDown={handlePanePointerDown}
@@ -1837,7 +1999,7 @@ function RoomView({
       <aside
         id="side-panel"
         className="board-panel"
-        aria-label="任务与文件"
+        aria-label="任务、文件与归档"
         inert={!panelVisible}
       >
         <div className="board-sheet">
@@ -1865,13 +2027,24 @@ function RoomView({
                 <span>文件</span>
                 <span className="chip">{workspaceFileCount ?? "·"}</span>
               </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={rightTab === "archives"}
+                className={`right-tab${rightTab === "archives" ? " active" : ""}`}
+                onClick={() => setRightTab("archives")}
+              >
+                <Icon name="archive" size={14} />
+                <span>归档</span>
+                <span className="chip">{archives?.length ?? "·"}</span>
+              </button>
             </div>
             <div className="board-head-actions">
               <button
                 type="button"
                 className="btn icon ghost board-close"
-                aria-label={rightTab === "files" ? "收起文件工作区" : "收起任务看板"}
-                title={rightTab === "files" ? "收起文件工作区" : "收起任务看板"}
+                aria-label={`收起${rightTabTitle(rightTab)}`}
+                title={`收起${rightTabTitle(rightTab)}`}
                 onClick={() => setBoardOpen(false)}
               >
                 <Icon name="chevronRight" />
@@ -1933,6 +2106,20 @@ function RoomView({
                 ))}
               </div>
             </>
+          ) : rightTab === "archives" ? (
+            <ArchivePanel
+              archives={archives}
+              owners={nameById}
+              error={archivesError}
+              openId={openArchiveId}
+              detail={archiveDetail}
+              detailError={archiveDetailError}
+              busy={restoringArchive}
+              onRefresh={() => void refreshArchives()}
+              onToggle={(id) => setOpenArchiveId((current) => (current === id ? null : id))}
+              onRestore={(archive) => void handleRestoreArchive(archive)}
+              onDelete={(archive) => void handleDeleteArchive(archive)}
+            />
           ) : (
             <WorkspaceFilesPanel
               files={workspaceFiles}
@@ -2426,6 +2613,164 @@ function WorkspaceFilesPanel({
         {truncated && <p className="files-note">文件较多，仅显示前 500 项。</p>}
       </div>
       {dragging && <div className="workspace-drop-hint">松开即可上传文件</div>}
+    </div>
+  );
+}
+
+/** 归档区：列出每次 /clear（以及恢复前的自动交换）存下的会话快照，可展开看内容、整体恢复或永久删除。 */
+function ArchivePanel({
+  archives,
+  owners,
+  error,
+  openId,
+  detail,
+  detailError,
+  busy,
+  onRefresh,
+  onToggle,
+  onRestore,
+  onDelete,
+}: {
+  archives: SessionArchiveSummary[] | null;
+  owners: Map<string, string>;
+  error: string | null;
+  openId: string | null;
+  detail: SessionArchiveDetail | null;
+  detailError: string | null;
+  busy: boolean;
+  onRefresh: () => void;
+  onToggle: (id: string) => void;
+  onRestore: (archive: SessionArchiveSummary) => void;
+  onDelete: (archive: SessionArchiveSummary) => void;
+}) {
+  const items = archives ?? [];
+  return (
+    <div className="archive-panel">
+      <div className="archive-head">
+        <p className="files-note">
+          /clear 会把群聊记录、任务卡与文件成果整体存成一份归档。恢复时当前内容先自动存成新归档再交换，所以反复恢复也不会丢东西。
+        </p>
+        <button
+          type="button"
+          className="btn icon ghost"
+          aria-label="刷新归档列表"
+          title="刷新归档列表"
+          onClick={onRefresh}
+        >
+          <Icon name="refresh" />
+        </button>
+      </div>
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="board-body">
+        {archives === null && !error && <p className="empty small">正在读取归档…</p>}
+        {archives !== null && items.length === 0 && (
+          <p className="empty small">还没有归档。在作战室输入 /clear 即可归档当前内容。</p>
+        )}
+        {items.map((archive) => {
+          const isOpen = archive.id === openId;
+          return (
+            <article key={archive.id} className={`archive-card${isOpen ? " open" : ""}`}>
+              <div className="archive-line">
+                <button
+                  type="button"
+                  className="archive-main"
+                  aria-expanded={isOpen}
+                  onClick={() => onToggle(archive.id)}
+                >
+                  <span className="archive-title">
+                    <Icon name="archive" size={14} />
+                    <span>{archive.roomName}</span>
+                  </span>
+                  <span className="archive-meta">
+                    {archiveStamp(archive.createdAt)} · {archive.messageCount} 条消息 ·{" "}
+                    {archive.taskCount} 张任务卡 · {archive.fileCount} 个文件 ·{" "}
+                    {formatBytes(archive.totalBytes)}
+                  </span>
+                </button>
+                <div className="archive-actions">
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={busy}
+                    title="把这份归档放回作战室，当前内容会先自动归档"
+                    onClick={() => onRestore(archive)}
+                  >
+                    <Icon name="restore" size={14} />
+                    <span>{busy ? "处理中…" : "恢复"}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn icon ghost workspace-delete"
+                    disabled={busy}
+                    aria-label="永久删除这份归档"
+                    title="永久删除这份归档"
+                    onClick={() => onDelete(archive)}
+                  >
+                    <Icon name="trash" />
+                  </button>
+                </div>
+              </div>
+              {isOpen && (
+                <div className="archive-detail">
+                  {detailError && (
+                    <p className="form-error" role="alert">
+                      {detailError}
+                    </p>
+                  )}
+                  {detail === null && !detailError && <p className="files-note">正在读取归档内容…</p>}
+                  {detail && (
+                    <>
+                      <h4>任务卡</h4>
+                      {detail.tasks.length === 0 ? (
+                        <p className="files-note">这份归档里没有任务卡。</p>
+                      ) : (
+                        <ul className="archive-list">
+                          {detail.tasks.map((task) => (
+                            <li key={task.id}>
+                              <span className={`status-chip ${task.status}`}>
+                                {statusLabel(task.status)}
+                              </span>
+                              <span className="archive-list-title">{task.title}</span>
+                              <span className="archive-list-meta">
+                                {task.ownerId ? `@${owners.get(task.ownerId) ?? "已移除成员"}` : "未指派"}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      <h4>文件成果</h4>
+                      {detail.files.length === 0 ? (
+                        <p className="files-note">这份归档里没有文件。</p>
+                      ) : (
+                        <ul className="archive-list">
+                          {detail.files.slice(0, 100).map((file) => (
+                            <li key={file.path}>
+                              <Icon name="file" size={14} />
+                              <span className="archive-list-title" title={file.path}>
+                                {file.path}
+                              </span>
+                              <span className="archive-list-meta">
+                                {formatBytes(file.sizeBytes)}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {detail.files.length > 100 && (
+                        <p className="files-note">文件较多，仅显示前 100 个。</p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+            </article>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -2997,6 +3342,9 @@ function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnaps
   if (!current) return current;
   if (event.type === "messages-cleared") {
     return current.messages.length === 0 ? current : { ...current, messages: [] };
+  }
+  if (event.type === "tasks-cleared") {
+    return current.tasks.length === 0 ? current : { ...current, tasks: [] };
   }
   if (event.type === "mode") {
     if (current.room.mode === event.mode) return current;

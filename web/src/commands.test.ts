@@ -229,6 +229,8 @@ describe("命令报告", () => {
     const help = buildHelpReport();
     for (const command of SLASH_COMMANDS) expect(help).toContain(command.usage);
     expect(help).toContain("不会作为聊天消息发给智能体");
-    expect(help).toContain("任务看板、文件工作区与智能体记忆不受影响");
+    expect(help).toContain("智能体记忆不受影响");
+    // /clear 现在是归档语义：帮助里要说清任务看板与文件工作区可恢复。
+    expect(help).toContain("整体归档（可恢复）");
   });
 });

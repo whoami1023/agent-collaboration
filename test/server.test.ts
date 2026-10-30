@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import ExcelJS from "exceljs";
@@ -873,6 +873,116 @@ describe("清空聊天记录 API", () => {
     const messages = stateAfter.body["messages"] as Array<{ text: string; seq: number }>;
     expect(messages[0]?.text).toBe("新消息");
     expect(messages[0]?.seq).toBeGreaterThan(lastSeq);
+  });
+});
+
+describe("会话归档 API", () => {
+  async function owner() {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const userId = (setup.body["user"] as Record<string, unknown>)["id"] as string;
+    return { cookie: setup.cookie as string, userId };
+  }
+
+  async function addLiveFile(userId: string, relPath: string, content: string): Promise<void> {
+    const abs = join(dir, "workspaces", userId, "files", relPath);
+    await mkdir(join(abs, ".."), { recursive: true });
+    await writeFile(abs, content, "utf8");
+  }
+
+  it("未登录一律拒绝", async () => {
+    expect((await call("/api/archives")).status).toBe(401);
+    expect((await call("/api/archives/arch_000000000000")).status).toBe(401);
+    expect((await call("/api/archives/arch_000000000000/restore", { method: "POST" })).status).toBe(401);
+    expect((await call("/api/archives/arch_000000000000", { method: "DELETE" })).status).toBe(401);
+  });
+
+  it("/clear 归档消息、任务卡与文件；恢复时先把当前内容另存一份", async () => {
+    const { cookie, userId } = await owner();
+    await call("/api/tasks", { method: "POST", cookie, body: { title: "写一份报告" } });
+    await addLiveFile(userId, "report.md", "第一版结论");
+
+    const cleared = await call("/api/messages", { method: "DELETE", cookie });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body["tasksCleared"]).toBe(1);
+    const archived = cleared.body["archived"] as Record<string, unknown>;
+    expect(archived).toMatchObject({
+      messageCount: 0,
+      taskCount: 1,
+      fileCount: 1,
+      totalBytes: Buffer.byteLength("第一版结论"),
+    });
+    const archiveId = String(archived["id"]);
+
+    // 作战室三样都空了：智能体下一轮不会再看到上一任务的任务卡与成果。
+    const emptied = await call("/api/state", { cookie });
+    expect(emptied.body["messages"]).toEqual([]);
+    expect(emptied.body["tasks"]).toEqual([]);
+    expect(((await call("/api/files", { cookie })).body["files"] as unknown[]).length).toBe(0);
+
+    const listed = await call("/api/archives", { cookie });
+    expect(listed.body["archives"]).toEqual([
+      expect.objectContaining({ id: archiveId, taskCount: 1, fileCount: 1 }),
+    ]);
+    const detail = await call(`/api/archives/${archiveId}`, { cookie });
+    const archive = detail.body["archive"] as Record<string, unknown>;
+    expect((archive["tasks"] as Array<{ title: string }>)[0]?.title).toBe("写一份报告");
+    expect((archive["files"] as Array<{ path: string }>)[0]?.path).toBe("report.md");
+
+    // 恢复前先做点新内容：交换语义下这些会被另存成新归档，而不是被覆盖掉。
+    await call("/api/tasks", { method: "POST", cookie, body: { title: "新一轮任务" } });
+    await addLiveFile(userId, "next.md", "新的成果");
+
+    const restored = await call(`/api/archives/${archiveId}/restore`, {
+      method: "POST",
+      cookie,
+      body: {},
+    });
+    expect(restored.status).toBe(200);
+    expect(restored.body["restoredFiles"]).toEqual(["report.md"]);
+    expect(restored.body["conflicts"]).toEqual([]);
+    expect(restored.body["autoArchived"]).toMatchObject({ taskCount: 1, fileCount: 1 });
+
+    const back = await call("/api/state", { cookie });
+    expect((back.body["tasks"] as Array<{ title: string }>).map((task) => task.title)).toEqual([
+      "写一份报告",
+    ]);
+    expect((back.body["messages"] as Array<{ text: string }>).length).toBe(0);
+    const files = await call("/api/files", { cookie });
+    expect(
+      ((files.body["files"] as Array<{ path: string }>).map((file) => file.path)).includes("report.md"),
+    ).toBe(true);
+
+    // 归档仍按剩余内容改写：report.md 已被移走，list 不能再报 1 个文件。
+    const after = await call("/api/archives", { cookie });
+    const archivedList = after.body["archives"] as Array<Record<string, unknown>>;
+    expect(archivedList.length).toBe(2);
+    expect(archivedList.find((item) => item["id"] === archiveId)).toMatchObject({
+      taskCount: 1,
+      fileCount: 0,
+      totalBytes: 0,
+    });
+
+    const removed = await call(`/api/archives/${archiveId}`, { method: "DELETE", cookie });
+    expect(removed.body["removed"]).toBe(archiveId);
+    expect((await call("/api/archives", { cookie })).body["archives"]).toHaveLength(1);
+  });
+
+  it("空的作战室不生成归档；非法或不存在的归档 ID 分别报 400/404", async () => {
+    const { cookie } = await owner();
+    const cleared = await call("/api/messages", { method: "DELETE", cookie });
+    expect(cleared.body["archived"]).toBeNull();
+    expect((await call("/api/archives", { cookie })).body["archives"]).toEqual([]);
+
+    expect((await call("/api/archives/nope", { cookie })).status).toBe(400);
+    expect((await call("/api/archives/arch_000000000000", { cookie })).status).toBe(404);
+    expect(
+      (await call("/api/archives/arch_000000000000/restore", { method: "POST", cookie, body: {} }))
+        .status,
+    ).toBe(404);
+    expect((await call("/api/archives/nope", { method: "DELETE", cookie })).status).toBe(400);
   });
 });
 

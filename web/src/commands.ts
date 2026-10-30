@@ -10,7 +10,7 @@ export interface SlashCommandDef {
 /** 前端本地命令表：解析、帮助文案与可用性共用一份，避免散落的正则。 */
 export const SLASH_COMMANDS: SlashCommandDef[] = [
   { name: "help", usage: "/help", summary: "查看可用命令与说明" },
-  { name: "clear", usage: "/clear", summary: "清空当前作战室的聊天记录（会先中止运行中的成员）" },
+  { name: "clear", usage: "/clear", summary: "归档并清空作战室（聊天记录、任务卡、文件成果），可在右侧归档区恢复" },
   { name: "stop", usage: "/stop", summary: "中止当前作战室里所有正在运行的成员" },
   { name: "status", usage: "/status", summary: "查看成员、任务、模型与运行状态" },
   {
@@ -183,7 +183,7 @@ export function buildContextReport(data: CommandData): string {
     `· 模型视图字节上限：${transcriptBytes ?? "未设置"}`,
     `· 运行限制：最多 ${stepLimit} 步工具调用、单次超时 ${formatDuration(timeout)}、并发 ${concurrency}`,
     "· 记忆召回：运行前按消息检索 MEMORY.md、USER.md、memory/**/*.md 与群聊转录，命中才注入",
-    "· 历史记录：消息不会自动删除；/clear 只清空当前作战室聊天记录",
+    "· 历史记录：消息不会自动删除；/clear 会把作战室整体归档，随时可恢复",
     "",
     "说明：字符与 token 为前端估算，实际上下文由服务端按运行时预算裁剪。",
   ].join("\n");
@@ -194,6 +194,6 @@ export function buildHelpReport(): string {
     "可用命令（在本机执行，不会作为聊天消息发给智能体）",
     ...SLASH_COMMANDS.map((command) => `· ${command.usage} — ${command.summary}`),
     "",
-    "/clear 与 /stop 会影响正在运行的成员；任务看板、文件工作区与智能体记忆不受影响。",
+    "/clear 与 /stop 会影响正在运行的成员；/clear 会把任务看板与文件工作区整体归档（可恢复），智能体记忆不受影响。",
   ].join("\n");
 }

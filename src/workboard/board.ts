@@ -106,6 +106,16 @@ export class Workboard {
     this.emit(task);
   }
 
+  /** 清空整块看板（归档作战室时用）：无任务时不广播，避免多一次无意义落盘。 */
+  clearAll(): number {
+    const cleared = this.tasks.size;
+    if (cleared === 0) return 0;
+    this.tasks = new Map();
+    const event: RoomEvent = { type: "tasks-cleared" };
+    for (const listener of [...this.listeners]) listener(event);
+    return cleared;
+  }
+
   private require(id: string): TaskCard {
     const task = this.tasks.get(id);
     if (!task) throw new Error(`任务不存在：${id}`);

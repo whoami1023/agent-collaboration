@@ -2903,6 +2903,167 @@ body.pane-dragging * {
   font-size: var(--text-xs);
 }
 
+/* ---------- 归档区 ---------- */
+
+.archive-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  padding: 10px 12px 0;
+}
+
+.archive-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  flex: none;
+}
+
+.archive-head .files-note {
+  flex: 1;
+  margin: 0;
+  line-height: 1.55;
+}
+
+.archive-panel .board-body {
+  padding: 0 0 var(--space-4);
+}
+
+.archive-card {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  transition: border-color 0.18s var(--ease), box-shadow 0.18s var(--ease);
+}
+
+.archive-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.archive-card.open {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+
+.archive-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.archive-main {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.archive-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.archive-title svg {
+  flex: none;
+  color: var(--muted);
+}
+
+.archive-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archive-meta {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.archive-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.archive-actions .btn {
+  padding: 4px 8px;
+  font-size: var(--text-xs);
+}
+
+.archive-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.archive-detail h4 {
+  margin: 6px 0 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.archive-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.archive-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.archive-list li > svg {
+  flex: none;
+  color: var(--muted);
+}
+
+.archive-list-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archive-list-meta {
+  flex: none;
+  color: var(--muted);
+}
+
 /* ---------- modal ---------- */
 
 .modal-backdrop {
@@ -4016,7 +4177,7 @@ body.pane-dragging * {
 
 /* ---------- responsive ---------- */
 
-/* Column widths below 1180px come from JS defaults (App.tsx), because the
+/* Column widths below 1180px come from JS defaults (web/src/layout.ts), because the
    shell's --sidebar-w/--panel-w are inline custom properties and would always
    beat a media-query override on the same element. */
 

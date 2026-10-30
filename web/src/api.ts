@@ -5,6 +5,8 @@ import type {
   RoomEvent,
   RoomMessage,
   RoomMode,
+  SessionArchiveDetail,
+  SessionArchiveSummary,
   TaskCard,
 } from "../../src/core/types";
 
@@ -292,10 +294,55 @@ export async function sendMessage(text: string): Promise<RoomMessage> {
   return body.message;
 }
 
-export function clearMessages(): Promise<{ cleared: number; cancelled: number }> {
-  return request<{ cleared: number; cancelled: number }>("/api/messages", {
+/** /clear：中止在跑的成员，把群聊记录、任务卡与文件成果归档后清空作战室。 */
+export function clearMessages(): Promise<{
+  cleared: number;
+  tasksCleared: number;
+  cancelled: number;
+  archived: SessionArchiveSummary | null;
+}> {
+  return request<{
+    cleared: number;
+    tasksCleared: number;
+    cancelled: number;
+    archived: SessionArchiveSummary | null;
+  }>("/api/messages", { method: "DELETE" });
+}
+
+export async function fetchArchives(): Promise<SessionArchiveSummary[]> {
+  const body = await request<{ archives: SessionArchiveSummary[] }>("/api/archives");
+  return body.archives;
+}
+
+export async function fetchArchive(id: string): Promise<SessionArchiveDetail> {
+  const body = await request<{ archive: SessionArchiveDetail }>(
+    `/api/archives/${encodeURIComponent(id)}`,
+  );
+  return body.archive;
+}
+
+/** 恢复归档：服务端会先把当前内容自动存成新归档，返回里的 autoArchived 为 null 表示当前本来就是空的。 */
+export function restoreArchive(id: string): Promise<{
+  archive: SessionArchiveSummary;
+  autoArchived: SessionArchiveSummary | null;
+  restoredFiles: string[];
+  conflicts: string[];
+  cancelled: number;
+}> {
+  return request<{
+    archive: SessionArchiveSummary;
+    autoArchived: SessionArchiveSummary | null;
+    restoredFiles: string[];
+    conflicts: string[];
+    cancelled: number;
+  }>(`/api/archives/${encodeURIComponent(id)}/restore`, { method: "POST" });
+}
+
+export async function deleteArchive(id: string): Promise<string> {
+  const body = await request<{ removed: string }>(`/api/archives/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+  return body.removed;
 }
 
 export async function cancelAllMembers(): Promise<number> {

@@ -119,6 +119,32 @@ export interface TaskCard {
   updatedAt: number;
 }
 
+/** 一次归档的摘要：群聊记录、任务卡与文件工作区的整体快照说明。 */
+export interface SessionArchiveSummary {
+  id: string;
+  createdAt: number;
+  roomName: string;
+  messageCount: number;
+  taskCount: number;
+  fileCount: number;
+  totalBytes: number;
+}
+
+/** 归档里保存的一个文件工作区条目（只收文件，目录不单列）。 */
+export interface SessionArchiveFileEntry {
+  path: string;
+  sizeBytes: number;
+  updatedAt: number;
+}
+
+/** 归档全文：恢复要放回的消息、任务卡与文件清单。 */
+export interface SessionArchiveDetail extends SessionArchiveSummary {
+  seq: number;
+  messages: RoomMessage[];
+  tasks: TaskCard[];
+  files: SessionArchiveFileEntry[];
+}
+
 export type AgentEvent =
   | { type: "run-start"; runId: string; memberId: string }
   | { type: "delta"; runId: string; memberId: string; text: string }
@@ -131,6 +157,9 @@ export type AgentEvent =
 export type RoomEvent =
   | { type: "message"; message: RoomMessage }
   | { type: "messages-cleared" }
+  | { type: "tasks-cleared" }
+  | { type: "session-archived"; archive: SessionArchiveSummary }
+  | { type: "session-restored"; archive: SessionArchiveSummary }
   | { type: "mode"; mode: RoomMode }
   | { type: "member"; member: Member }
   | { type: "member-removed"; memberId: string }

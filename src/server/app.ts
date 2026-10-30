@@ -13,6 +13,7 @@ import {
 } from "../skills/categories";
 import { resolveSkillSelection } from "../skills/selection";
 import { MAX_UPLOAD_BYTES, WorkspaceFileError } from "../files/workspace-files";
+import { summaryOf } from "../archive/session-archive";
 import { buildRichPreview } from "../files/rich-preview";
 import type { Workspace, WorkspaceRegistry } from "../workspace/workspace";
 
@@ -25,6 +26,11 @@ export interface AppDeps {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** 归档相关接口的错误口径：找不到归档是 404，ID 不合法等输入问题一律 400。 */
+function archiveErrorStatus(err: unknown): number {
+  return errorMessage(err) === "归档不存在" ? 404 : 400;
 }
 
 function bodyOf(req: Request): Record<string, unknown> {
@@ -350,13 +356,52 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
-  // /clear：先静默中止在跑的成员，再清空聊天记录并立即落盘；任务、文件、记忆不受影响。
+  // /clear：静默中止在跑的成员，把群聊记录、任务卡与 files/ 成果整体归档，再清空作战室并落盘。
+  // 智能体长期记忆与成员档案不进归档、也不受影响；恢复入口在 /api/archives。
   app.delete("/api/messages", async (_req: Request, res: Response) => {
     const workspace = await workspaceFor(res);
-    const cancelled = workspace.orchestrator.cancelAllRuns();
-    const cleared = workspace.bus.clearMessages();
-    await workspace.persist();
-    res.json({ cleared, cancelled });
+    res.json(await workspace.clearRoomSession());
+  });
+
+  app.get("/api/archives", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    res.json({ archives: await workspace.archives.list() });
+  });
+
+  app.get("/api/archives/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json({ archive: await workspace.archives.read(String(req.params["id"] ?? "")) });
+    } catch (err) {
+      res.status(archiveErrorStatus(err)).json({ error: errorMessage(err) });
+    }
+  });
+
+  // 恢复一份归档：当前内容会先自动存成新归档，因此这一步不会丢任何东西。
+  app.post("/api/archives/:id/restore", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      const result = await workspace.restoreArchive(String(req.params["id"] ?? ""));
+      res.json({
+        archive: summaryOf(result.archive),
+        autoArchived: result.autoArchived,
+        restoredFiles: result.restoredFiles,
+        conflicts: result.conflicts,
+        cancelled: result.cancelled,
+      });
+    } catch (err) {
+      res.status(archiveErrorStatus(err)).json({ error: errorMessage(err) });
+    }
+  });
+
+  app.delete("/api/archives/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      const removed = await workspace.archives.remove(String(req.params["id"] ?? ""));
+      res.json({ removed: removed.id });
+    } catch (err) {
+      res.status(archiveErrorStatus(err)).json({ error: errorMessage(err) });
+    }
   });
 
   app.post("/api/members", async (req: Request, res: Response) => {

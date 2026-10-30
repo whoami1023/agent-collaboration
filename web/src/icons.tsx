@@ -27,6 +27,8 @@ export type IconName =
   | "upload"
   | "edit"
   | "trash"
+  | "archive"
+  | "restore"
   | "check";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
@@ -163,6 +165,19 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
       <path d="M9 7V4.5h6V7" />
       <path d="M6.5 7l1 12.5h9L17.5 7" />
       <path d="M10 11v5M14 11v5" />
+    </>
+  ),
+  archive: (
+    <>
+      <path d="M3.5 8.5h17V11h-17z" />
+      <path d="M5 11h14v7.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 18.5Z" />
+      <path d="M10 14.5h4" />
+    </>
+  ),
+  restore: (
+    <>
+      <path d="M4.5 12a7.5 7.5 0 1 0 2.8-5.8" />
+      <path d="M4 4v4.5h4.5" />
     </>
   ),
   check: <path d="m5 12.5 4.5 4.5L19 7" />,
