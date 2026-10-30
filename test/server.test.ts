@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -767,6 +767,295 @@ describe("成员技能授权 API", () => {
     const aliceCookie = aliceLogin.cookie as string;
     expect(
       (await call(`/api/members/${memberId}/skills`, { cookie: aliceCookie })).status,
+    ).toBe(404);
+  });
+});
+
+describe("清空聊天记录 API", () => {
+  async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+    const started = Date.now();
+    while (!predicate()) {
+      if (Date.now() - started > timeoutMs) throw new Error("等待超时");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
+  it("DELETE /api/messages 中止运行、清空历史并立即落盘", async () => {
+    expect((await call("/api/messages", { method: "DELETE" })).status).toBe(401);
+
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const cookie = setup.cookie as string;
+    const userId = (setup.body["user"] as Record<string, unknown>)["id"] as string;
+
+    await call("/api/messages", {
+      method: "POST",
+      cookie,
+      body: { text: "帮我调研多智能体协同的调度方式" },
+    });
+    const workspace = await registry.get({ id: userId, displayName: "老板" });
+    await waitFor(
+      () =>
+        workspace.orchestrator.activeRuns === 0 &&
+        workspace.bus.listMessages().some((message) => message.senderKind === "member"),
+    );
+
+    const before = await call("/api/state", { cookie });
+    expect((before.body["messages"] as unknown[]).length).toBeGreaterThanOrEqual(2);
+
+    const cleared = await call("/api/messages", { method: "DELETE", cookie });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body["cleared"]).toBeGreaterThanOrEqual(2);
+    expect(typeof cleared.body["cancelled"]).toBe("number");
+
+    const after = await call("/api/state", { cookie });
+    expect(after.body["messages"]).toEqual([]);
+
+    const persisted = JSON.parse(
+      await readFile(join(dir, "workspaces", userId, "state.json"), "utf8"),
+    ) as { messages: unknown[]; seq: number; members: unknown[]; tasks: unknown[] };
+    expect(persisted.messages).toEqual([]);
+    expect(persisted.seq).toBeGreaterThan(0);
+    expect(persisted.members.length).toBeGreaterThan(0);
+  });
+
+  it("清空后新消息从空历史继续，seq 不回溯", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const cookie = setup.cookie as string;
+
+    await call("/api/messages", { method: "POST", cookie, body: { text: "旧消息" } });
+    const stateBefore = await call("/api/state", { cookie });
+    const lastSeq = Math.max(
+      ...(stateBefore.body["messages"] as Array<{ seq: number }>).map((message) => message.seq),
+    );
+
+    await call("/api/messages", { method: "DELETE", cookie });
+    await call("/api/messages", { method: "POST", cookie, body: { text: "新消息" } });
+
+    const stateAfter = await call("/api/state", { cookie });
+    const messages = stateAfter.body["messages"] as Array<{ text: string; seq: number }>;
+    expect(messages[0]?.text).toBe("新消息");
+    expect(messages[0]?.seq).toBeGreaterThan(lastSeq);
+  });
+});
+
+describe("停止运行 API", () => {
+  it("未登录拒绝；已登录返回中止的成员数量", async () => {
+    expect((await call("/api/members/cancel-all", { method: "POST" })).status).toBe(401);
+
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const cookie = setup.cookie as string;
+
+    const stopped = await call("/api/members/cancel-all", { method: "POST", cookie });
+    expect(stopped.status).toBe(200);
+    expect(stopped.body["cancelled"]).toBe(0);
+  });
+});
+
+describe("文件工作区 API", () => {
+  async function login(): Promise<string> {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    return setup.cookie as string;
+  }
+
+  async function upload(
+    cookie: string | undefined,
+    path: string,
+    bytes: Uint8Array,
+    options: { overwrite?: boolean } = {},
+  ): Promise<Response> {
+    const query = `path=${encodeURIComponent(path)}${options.overwrite ? "&overwrite=1" : ""}`;
+    return fetch(`${baseUrl}/api/files?${query}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/octet-stream",
+        ...(cookie ? { cookie } : {}),
+      },
+      body: bytes,
+    });
+  }
+
+  it("未登录拒绝读写；上传后可列出、预览、下载，同名需显式覆盖", async () => {
+    expect((await call("/api/files")).status).toBe(401);
+    expect((await call("/api/files/content?path=a.txt")).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/files/download?path=a.txt`)).status).toBe(401);
+    expect((await upload(undefined, "a.txt", new TextEncoder().encode("x"))).status).toBe(401);
+
+    const cookie = await login();
+    const created = await upload(cookie, "reports/周报.md", new TextEncoder().encode("# 周报\n\n完成文件工作区"));
+    expect(created.status).toBe(201);
+    expect((await created.json()) as Record<string, unknown>).toMatchObject({
+      file: { path: "reports/周报.md", sizeBytes: Buffer.byteLength("# 周报\n\n完成文件工作区") },
+    });
+
+    const listed = await call("/api/files", { cookie });
+    expect(listed.status).toBe(200);
+    expect(listed.body["truncated"]).toBe(false);
+    const files = listed.body["files"] as Record<string, unknown>[];
+    expect(files.map((file) => file["path"])).toContain("reports/周报.md");
+
+    const content = await call(`/api/files/content?path=${encodeURIComponent("reports/周报.md")}`, { cookie });
+    expect(content.status).toBe(200);
+    expect(content.body["preview"]).toBe("text");
+    expect(content.body["content"]).toBe("# 周报\n\n完成文件工作区");
+
+    const download = await fetch(
+      `${baseUrl}/api/files/download?path=${encodeURIComponent("reports/周报.md")}`,
+      { headers: { cookie } },
+    );
+    expect(download.status).toBe(200);
+    expect(download.headers.get("content-type")).toBe("application/octet-stream");
+    expect(download.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(download.headers.get("content-disposition")).toContain("attachment");
+    expect(download.headers.get("content-disposition")).toContain(
+      `filename*=UTF-8''${encodeURIComponent("周报.md")}`,
+    );
+    expect(await download.text()).toBe("# 周报\n\n完成文件工作区");
+
+    const conflict = await upload(cookie, "reports/周报.md", new TextEncoder().encode("改"));
+    expect(conflict.status).toBe(409);
+    const overwritten = await upload(cookie, "reports/周报.md", new TextEncoder().encode("改"), {
+      overwrite: true,
+    });
+    expect(overwritten.status).toBe(201);
+    expect(await (await fetch(`${baseUrl}/api/files/download?path=${encodeURIComponent("reports/周报.md")}`, {
+      headers: { cookie },
+    })).text()).toBe("改");
+  });
+
+  it("图片/PDF 允许内联，HTML 与 SVG 只能作为附件；路径逃逸与空路径被拒", async () => {
+    const cookie = await login();
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    expect((await upload(cookie, "assets/logo.png", png)).status).toBe(201);
+    const inline = await fetch(`${baseUrl}/api/files/download?path=assets%2Flogo.png&inline=1`, {
+      headers: { cookie },
+    });
+    expect(inline.status).toBe(200);
+    expect(inline.headers.get("content-type")).toBe("image/png");
+    expect(inline.headers.get("content-disposition")).toContain("inline");
+    expect(Buffer.from(await inline.arrayBuffer())).toEqual(png);
+
+    // HTML 不允许以 text/html 内联，只以 text/plain 展示源码。
+    expect((await upload(cookie, "page.html", new TextEncoder().encode("<script>x()</script>"))).status).toBe(201);
+    const html = await fetch(`${baseUrl}/api/files/download?path=page.html&inline=1`, { headers: { cookie } });
+    expect(html.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(html.headers.get("x-content-type-options")).toBe("nosniff");
+
+    expect((await upload(cookie, "icon.svg", new TextEncoder().encode("<svg/>"))).status).toBe(201);
+    const svg = await fetch(`${baseUrl}/api/files/download?path=icon.svg&inline=1`, { headers: { cookie } });
+    expect(svg.headers.get("content-type")).toBe("application/octet-stream");
+
+    expect((await upload(cookie, "../escape.txt", new TextEncoder().encode("x"))).status).toBe(400);
+    expect((await upload(cookie, "C:/Windows/x.txt", new TextEncoder().encode("x"))).status).toBe(400);
+    expect((await upload(cookie, "", new TextEncoder().encode("x"))).status).toBe(400);
+    expect((await call(`/api/files/content?path=${encodeURIComponent("nope.txt")}`, { cookie })).status).toBe(404);
+  });
+
+  it("新建目录：登录后可建，重名 409，非法路径 400", async () => {
+    expect(
+      (await call("/api/files/folder", { method: "POST", body: { path: "资料" } })).status,
+    ).toBe(401);
+
+    const cookie = await login();
+    const created = await call("/api/files/folder", {
+      method: "POST",
+      cookie,
+      body: { path: "资料/2026" },
+    });
+    expect(created.status).toBe(201);
+    expect(created.body["folder"]).toMatchObject({ path: "资料/2026", kind: "dir" });
+
+    const listed = await call("/api/files", { cookie });
+    expect((listed.body["files"] as Record<string, unknown>[]).map((file) => [file["path"], file["kind"]])).toEqual([
+      ["资料", "dir"],
+      ["资料/2026", "dir"],
+    ]);
+
+    expect(
+      (
+        await call("/api/files/folder", {
+          method: "POST",
+          cookie,
+          body: { path: "资料/2026" },
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (await call("/api/files/folder", { method: "POST", cookie, body: { path: "../x" } })).status,
+    ).toBe(400);
+    expect(
+      (await call("/api/files/folder", { method: "POST", cookie, body: { path: "  " } })).status,
+    ).toBe(400);
+    expect(
+      (await call("/api/files/folder", { method: "POST", cookie, body: {} })).status,
+    ).toBe(400);
+  });
+
+  it("删除文件：登录后可删，删后不可读；非空目录 409，越界 400", async () => {
+    expect((await call("/api/files?path=a.txt", { method: "DELETE" })).status).toBe(401);
+
+    const cookie = await login();
+    await upload(cookie, "temp/a.txt", new TextEncoder().encode("a"));
+    await upload(cookie, "temp/b.txt", new TextEncoder().encode("b"));
+
+    const removed = await call(`/api/files?path=${encodeURIComponent("temp/a.txt")}`, {
+      method: "DELETE",
+      cookie,
+    });
+    expect(removed.status).toBe(200);
+    expect(removed.body["removed"]).toBe("temp/a.txt");
+    expect(
+      (await call(`/api/files/content?path=${encodeURIComponent("temp/a.txt")}`, { cookie })).status,
+    ).toBe(404);
+    expect(
+      (await call(`/api/files?path=${encodeURIComponent("temp/a.txt")}`, { method: "DELETE", cookie }))
+        .status,
+    ).toBe(404);
+
+    expect(
+      (await call(`/api/files?path=temp`, { method: "DELETE", cookie })).status,
+    ).toBe(409);
+    await call(`/api/files?path=${encodeURIComponent("temp/b.txt")}`, { method: "DELETE", cookie });
+    expect((await call(`/api/files?path=temp`, { method: "DELETE", cookie })).status).toBe(200);
+    expect((await call("/api/files", { cookie })).body["files"]).toEqual([]);
+
+    expect(
+      (await call("/api/files?path=..%2Fescape.txt", { method: "DELETE", cookie })).status,
+    ).toBe(400);
+    expect((await call("/api/files", { method: "DELETE", cookie })).status).toBe(400);
+  });
+
+  it("文件工作区按账号隔离", async () => {
+    const cookie = await login();
+    await call("/api/users", {
+      method: "POST",
+      cookie,
+      body: { username: "alice", displayName: "Alice", password: "alicepass1" },
+    });
+    const aliceCookie = (
+      await call("/api/auth/login", {
+        method: "POST",
+        body: { username: "alice", password: "alicepass1" },
+      })
+    ).cookie as string;
+    expect((await upload(cookie, "owner-only.txt", new TextEncoder().encode("owner"))).status).toBe(201);
+
+    const aliceList = await call("/api/files", { cookie: aliceCookie });
+    expect(aliceList.status).toBe(200);
+    expect(aliceList.body["files"]).toEqual([]);
+    expect(
+      (await call("/api/files/content?path=owner-only.txt", { cookie: aliceCookie })).status,
     ).toBe(404);
   });
 });

@@ -1,5 +1,5 @@
 import express, { type NextFunction, type Request, type Response } from "express";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Member, TaskStatus } from "../core/types";
 import { maskSettings, mergeSettings } from "../core/settings";
@@ -7,6 +7,7 @@ import { AuthError, type AuthService, type PublicUser } from "../auth/auth-servi
 import { buildClearSessionCookie, buildSessionCookie, readSessionToken } from "../auth/cookies";
 import { SkillError, type SkillRecord, type SkillLibrary } from "../skills/library";
 import { resolveSkillSelection } from "../skills/selection";
+import { MAX_UPLOAD_BYTES, WorkspaceFileError } from "../files/workspace-files";
 import type { Workspace, WorkspaceRegistry } from "../workspace/workspace";
 
 export interface AppDeps {
@@ -29,13 +30,32 @@ function stringField(body: Record<string, unknown>, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
+function queryField(req: Request, key: string): string {
+  const value = req.query[key];
+  return typeof value === "string" ? value : "";
+}
+
+function contentDisposition(name: string, inline: boolean): string {
+  const fallback = name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  const encoded = encodeURIComponent(name).replace(
+    /['()*]/g,
+    (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `${inline ? "inline" : "attachment"}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
 export function createApp(deps: AppDeps): express.Express {
   const app = express();
   const jsonBody = express.json({ limit: "1mb" });
   // 技能可以带脚本/模板等附带文件：写技能的接口放宽到 12 MB，其余接口保持 1 MB。
   const skillWriteBody = express.json({ limit: "12mb" });
+  // 文件工作区上传走原始字节，单文件上限与 WorkspaceFiles 保持一致。
+  const fileUploadBody = express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES });
   app.use((req, res, next) => {
     const path = req.path;
+    if (path === "/api/files" && req.method === "POST") {
+      return fileUploadBody(req, res, next);
+    }
     if (
       (path === "/api/skills/import" || path === "/api/skills") &&
       (req.method === "POST" || req.method === "PATCH")
@@ -303,6 +323,15 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
+  // /clear：先静默中止在跑的成员，再清空聊天记录并立即落盘；任务、文件、记忆不受影响。
+  app.delete("/api/messages", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const cancelled = workspace.orchestrator.cancelAllRuns();
+    const cleared = workspace.bus.clearMessages();
+    await workspace.persist();
+    res.json({ cleared, cancelled });
+  });
+
   app.post("/api/members", async (req: Request, res: Response) => {
     const body = bodyOf(req);
     const name = stringField(body, "name");
@@ -314,6 +343,11 @@ export function createApp(deps: AppDeps): express.Express {
     } catch (err) {
       res.status(400).json({ error: errorMessage(err) });
     }
+  });
+
+  app.post("/api/members/cancel-all", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    res.json({ cancelled: workspace.orchestrator.stopAllRuns() });
   });
 
   app.post("/api/members/:id/cancel", async (req: Request, res: Response) => {
@@ -384,6 +418,84 @@ export function createApp(deps: AppDeps): express.Express {
     } catch (err) {
       res.status(400).json({ error: errorMessage(err) });
     }
+  });
+
+  app.get("/api/files", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    res.json(await workspace.files.list());
+  });
+
+  app.get("/api/files/content", async (req: Request, res: Response) => {
+    const relPath = queryField(req, "path");
+    if (!relPath.trim()) {
+      res.status(400).json({ error: "path 不能为空" });
+      return;
+    }
+    const workspace = await workspaceFor(res);
+    res.json(await workspace.files.read(relPath));
+  });
+
+  app.get("/api/files/download", async (req: Request, res: Response) => {
+    const relPath = queryField(req, "path");
+    if (!relPath.trim()) {
+      res.status(400).json({ error: "path 不能为空" });
+      return;
+    }
+    const workspace = await workspaceFor(res);
+    const file = await workspace.files.download(relPath);
+    // 只有图片、PDF 与纯文本允许内联；其余一律附件下载，避免同源执行上传的 HTML/SVG。
+    const inline = req.query["inline"] === "1" && file.inlineMime !== null;
+    res.setHeader("content-type", inline ? file.inlineMime! : "application/octet-stream");
+    res.setHeader("content-length", String(file.sizeBytes));
+    res.setHeader("content-disposition", contentDisposition(file.name, inline));
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("cache-control", "private, max-age=0, must-revalidate");
+    const stream = createReadStream(file.absPath);
+    stream.on("error", (err) => {
+      if (res.headersSent) res.destroy(err);
+      else res.status(500).json({ error: "读取文件失败" });
+    });
+    stream.pipe(res);
+  });
+
+  app.post("/api/files/folder", async (req: Request, res: Response) => {
+    const body = bodyOf(req);
+    const relPath = typeof body["path"] === "string" ? body["path"] : "";
+    if (!relPath.trim()) {
+      res.status(400).json({ error: "path 不能为空" });
+      return;
+    }
+    const workspace = await workspaceFor(res);
+    const folder = await workspace.files.createDirectory(relPath);
+    res.status(201).json({ folder });
+  });
+
+  app.delete("/api/files", async (req: Request, res: Response) => {
+    const relPath = queryField(req, "path");
+    if (!relPath.trim()) {
+      res.status(400).json({ error: "path 不能为空" });
+      return;
+    }
+    const workspace = await workspaceFor(res);
+    const removed = await workspace.files.remove(relPath);
+    res.json({ removed: removed.path });
+  });
+
+  app.post("/api/files", async (req: Request, res: Response) => {
+    const relPath = queryField(req, "path");
+    if (!relPath.trim()) {
+      res.status(400).json({ error: "path 不能为空" });
+      return;
+    }
+    if (!Buffer.isBuffer(req.body)) {
+      res.status(400).json({ error: "请求体必须是文件字节" });
+      return;
+    }
+    const workspace = await workspaceFor(res);
+    const file = await workspace.files.write(relPath, req.body, {
+      overwrite: req.query["overwrite"] === "1",
+    });
+    res.status(201).json({ file });
   });
 
   /** 成员级技能视图：enabled=null 表示未限制（跟随技能库全部技能）。 */
@@ -497,8 +609,12 @@ export function createApp(deps: AppDeps): express.Express {
     });
   }
 
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return;
+    if (err instanceof WorkspaceFileError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     if (err instanceof AuthError || err instanceof SkillError) {
       const retryAfterMs = err instanceof AuthError ? err.retryAfterMs : undefined;
       if (retryAfterMs) {
@@ -518,7 +634,9 @@ export function createApp(deps: AppDeps): express.Express {
         .json({
           error:
             clientStatus === 413
-              ? "内容过大：技能接口单次请求不超过 12 MB，单个文件不超过 256 KB，每个技能最多 40 个附带文件"
+              ? req.path === "/api/files"
+                ? `文件不能超过 ${MAX_UPLOAD_BYTES / 1024 / 1024} MB`
+                : "内容过大：技能接口单次请求不超过 12 MB，单个文件不超过 256 KB，每个技能最多 40 个附带文件"
               : "请求体格式不正确",
         });
       return;

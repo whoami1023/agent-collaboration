@@ -7,6 +7,7 @@ import type { Workboard } from "../workboard/board";
 import { decideWakes } from "../room/wake";
 import type { SkillLibrary } from "../skills/library";
 import type { MemorySearchManager } from "../memory/manager";
+import type { WorkspaceFiles } from "../files/workspace-files";
 import { MemberRuntime } from "./member-runtime";
 import type { MockHandler } from "../provider/mock";
 import { resolveSpawnAdmission, countChildren } from "./spawn/spawn-plan";
@@ -21,6 +22,7 @@ export interface OrchestratorDeps {
   ownerId: string;
   mockHandler?: MockHandler;
   memory?: MemorySearchManager;
+  files?: WorkspaceFiles;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -53,6 +55,8 @@ export class Orchestrator {
   private queue: Array<() => void> = [];
   private active = 0;
   private stopped = false;
+  /** /stop 与 /clear 的屏障：停止前已入队的消息不再唤醒成员。 */
+  private stoppedThroughSeq = 0;
 
   constructor(private readonly deps: OrchestratorDeps) {
     deps.bus.subscribe((event) => {
@@ -87,6 +91,26 @@ export class Orchestrator {
 
   cancelMember(memberId: string): boolean {
     return this.runtimes.get(memberId)?.cancel() ?? false;
+  }
+
+  /** 清空聊天记录前中止所有在跑的成员：静默取消，且丢弃它们排队中的 steer。 */
+  cancelAllRuns(): number {
+    return this.stopRuns(true);
+  }
+
+  /** /stop：中止所有在跑的成员，保留「本次运行已取消」提示。 */
+  stopAllRuns(): number {
+    return this.stopRuns(false);
+  }
+
+  private stopRuns(silent: boolean): number {
+    // 停止前已入队的消息（含刚发出、尚未派发的）不再唤醒成员；之后的新消息序号更高，不受影响。
+    this.stoppedThroughSeq = this.deps.bus.snapshot().seq;
+    let cancelled = 0;
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.cancel(silent ? { silent: true } : {})) cancelled += 1;
+    }
+    return cancelled;
   }
 
   /**
@@ -187,6 +211,7 @@ export class Orchestrator {
 
   private dispatch(message: RoomMessage): void {
     const limits = this.deps.getSettings().limits;
+    if (message.seq <= this.stoppedThroughSeq) return;
     const depthTurn = message.depthTurn ?? 0;
     if (depthTurn > limits.maxTurnsPerUserMessage) {
       const chain = message.chainRootId ?? message.id;
@@ -263,7 +288,8 @@ export class Orchestrator {
         getLimits: () => deps.getSettings().limits,
         skills: deps.skills,
         ownerId: deps.ownerId,
-        memory: deps.memory,
+        ...(deps.memory ? { memory: deps.memory } : {}),
+        ...(deps.files ? { files: deps.files } : {}),
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });
       this.runtimes.set(member.id, runtime);

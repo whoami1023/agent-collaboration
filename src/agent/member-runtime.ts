@@ -8,6 +8,7 @@ import { resolveProvider, type ProviderDeps } from "../provider/registry";
 import type { SkillLibrary } from "../skills/library";
 import { selectSkillsForMember } from "../skills/selection";
 import type { MemorySearchManager } from "../memory/manager";
+import type { WorkspaceFiles } from "../files/workspace-files";
 import { resolveTriggerRecall } from "../memory/recall";
 import { runAgentLoop } from "./loop";
 import { DEFAULT_COMPACTION_SETTINGS } from "./context/compaction";
@@ -24,6 +25,7 @@ export interface RuntimeDeps {
   skills: SkillLibrary;
   ownerId: string;
   memory?: MemorySearchManager;
+  files?: WorkspaceFiles;
   onFinished?(memberId: string): void;
 }
 
@@ -35,6 +37,8 @@ export class MemberRuntime {
   private controller: AbortController | null = null;
   private pending: LlmMessage[] = [];
   private running = false;
+  /** 清空聊天记录引起的中止不写「已取消」系统消息，避免刚清空的会话又冒出一条。 */
+  private silentAbort = false;
   /** 跨运行保留的字节压缩失败闩（OpenClaw transcriptByteCompactionLatch 的本项目等价物）。 */
   private readonly byteCompactionState: { latch?: TranscriptByteCompactionLatch } = {};
 
@@ -56,8 +60,11 @@ export class MemberRuntime {
     });
   }
 
-  cancel(): boolean {
+  cancel(options: { silent?: boolean } = {}): boolean {
     if (!this.controller) return false;
+    this.silentAbort = options.silent === true;
+    // 中止即停止本轮：丢弃排队中的 steer，防止取消后又开一轮。
+    this.pending = [];
     this.controller.abort();
     return true;
   }
@@ -119,6 +126,7 @@ export class MemberRuntime {
         skills: this.deps.skills,
         userId: this.deps.ownerId,
         ...(this.deps.memory ? { memory: this.deps.memory } : {}),
+        ...(this.deps.files ? { files: this.deps.files } : {}),
       });
       const system = buildSystemPrompt({
         roomName: bus.roomName,
@@ -235,7 +243,7 @@ export class MemberRuntime {
     } catch (err) {
       if (isAbort(err)) {
         this.emit({ type: "run-aborted", runId, memberId: this.member.id });
-        this.notice(`@${this.member.name} 本次运行已取消`);
+        if (!this.silentAbort) this.notice(`@${this.member.name} 本次运行已取消`);
         this.setStatus("idle");
         return;
       }
@@ -246,6 +254,7 @@ export class MemberRuntime {
     } finally {
       clearTimeout(timeout);
       this.controller = null;
+      this.silentAbort = false;
     }
   }
 

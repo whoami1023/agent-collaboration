@@ -124,6 +124,7 @@ export type AgentEvent =
 
 export type RoomEvent =
   | { type: "message"; message: RoomMessage }
+  | { type: "messages-cleared" }
   | { type: "member"; member: Member }
   | { type: "member-removed"; memberId: string }
   | { type: "task"; task: TaskCard }

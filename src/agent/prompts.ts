@@ -51,6 +51,11 @@ export interface PromptContext {
   availableTools?: Set<string>;
 }
 
+const FILE_WORKSPACE_SECTION = `文件工作区
+- 用户上传的文件和你产出的成果都放在文件工作区（右侧「文件」标签页，根目录 files/）。
+- file_list 查看清单，file_read 读取文本，file_write 写入结果；路径用相对路径（如 reports/a.md），子目录会自动创建。
+- 汇报时给出文件的相对路径作为证据；图片、PDF 等二进制或超大文件请让用户在面板里预览、下载。`;
+
 function formatSkills(skills: SkillSummary[]): string {
   if (skills.length === 0) return "- （暂无可用技能）";
   return skills
@@ -64,7 +69,11 @@ export function buildSystemPrompt(context: PromptContext): string {
   const memorySection = context.availableTools
     ? buildMemoryPromptSection({ availableTools: context.availableTools }).join("\n")
     : "";
-  return memorySection ? `${base}\n\n${memorySection.trimEnd()}` : base;
+  const fileSection =
+    context.availableTools?.has("file_list") === true ? FILE_WORKSPACE_SECTION : "";
+  return [base, memorySection.trim(), fileSection]
+    .filter((section) => section.length > 0)
+    .join("\n\n");
 }
 
 function mainPrompt(context: PromptContext): string {

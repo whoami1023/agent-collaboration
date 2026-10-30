@@ -6,9 +6,11 @@ import { selectSkillsForMember, isSkillSelected } from "../skills/selection";
 import { formatSkillFileSize } from "../skills/skill-files";
 import type { MemorySearchManager } from "../memory/manager";
 import { buildMemoryTools } from "../memory/tools";
+import type { WorkspaceFiles } from "../files/workspace-files";
 import type { ToolImpl } from "./loop";
 import { formatRoomWindow } from "./prompts";
 import { buildWebTools, type WebToolOptions } from "../web/tools";
+import { buildFileTools } from "./file-tools";
 
 export interface ToolDeps {
   bus: RoomBus;
@@ -16,6 +18,7 @@ export interface ToolDeps {
   skills: SkillLibrary;
   userId: string;
   memory?: MemorySearchManager;
+  files?: WorkspaceFiles;
   /** 联网工具注入点：单测可替换 fetch/DNS，生产环境留空走真实网络。 */
   web?: WebToolOptions;
 }
@@ -257,6 +260,9 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   if (deps.memory) {
     tools.push(...buildMemoryTools(deps.memory, member.role === "sub" ? { agentId: member.id } : {}));
   }
+
+  // 文件工作区：用户上传与智能体产出共用 files/ 目录，对应 OpenClaw 的 read/write/ls 文件工具。
+  if (deps.files) tools.push(...buildFileTools(deps.files));
 
   // 联网检索与正文抓取：内置共享技能 web-search / web-fetch / web-browse 的执行底座。
   tools.push(...buildWebTools(deps.web));

@@ -4,6 +4,7 @@ import { loadSettings, saveSettings, type Settings } from "../core/settings";
 import type { Member, RoomMessage, TaskCard } from "../core/types";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
+import { WorkspaceFiles } from "../files/workspace-files";
 import { RoomBus } from "../room/bus";
 import type { SkillLibrary } from "../skills/library";
 import { readJson, writeJsonAtomic } from "../store/persist";
@@ -37,6 +38,7 @@ export class Workspace {
     readonly orchestrator: Orchestrator,
     private readonly settingsRef: { current: Settings },
     readonly memory: MemorySearchManager,
+    readonly files: WorkspaceFiles,
   ) {}
 
   static async load(rootDir: string, owner: WorkspaceOwner, skills: SkillLibrary): Promise<Workspace> {
@@ -68,6 +70,8 @@ export class Workspace {
     // P5：每用户工作区一个记忆检索管理器（对应 OpenClaw 每 agent 的 memory manager），
     // 语料 = 工作区 MEMORY.md/USER.md/memory/**.md + 本群转录（sessions）。
     const memory = new MemorySearchManager({ workspaceDir: dir, bus });
+    // 文件工作区独立于运行时数据：智能体与用户只经 files/ 交换文件。
+    const files = new WorkspaceFiles(dir);
     const orchestrator = new Orchestrator({
       bus,
       board,
@@ -75,14 +79,20 @@ export class Workspace {
       skills,
       ownerId: owner.id,
       memory,
+      files,
     });
 
-    const workspace = new Workspace(owner.id, dir, bus, board, orchestrator, settingsRef, memory);
+    const workspace = new Workspace(owner.id, dir, bus, board, orchestrator, settingsRef, memory, files);
     bus.subscribe((event) => {
-      if (event.type === "message" || event.type === "member" || event.type === "member-removed") {
+      if (
+        event.type === "message" ||
+        event.type === "messages-cleared" ||
+        event.type === "member" ||
+        event.type === "member-removed"
+      ) {
         workspace.scheduleSave();
       }
-      if (event.type === "message") memory.markDirty();
+      if (event.type === "message" || event.type === "messages-cleared") memory.markDirty();
     });
     board.subscribe(() => workspace.scheduleSave());
     await workspace.persist();

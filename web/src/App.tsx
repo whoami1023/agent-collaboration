@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   CSSProperties,
+  DragEvent as ReactDragEvent,
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
@@ -9,17 +10,32 @@ import type { Member, PublicUser, RoomEvent, RoomMessage, TaskCard } from "../..
 import { Icon } from "./icons";
 import SkillLibraryPanel from "./SkillLibrary";
 import {
+  buildContextReport,
+  buildHelpReport,
+  buildStatusReport,
+  getSlashQuery,
+  parseSlashCommand,
+  suggestSlashCommands,
+  type CommandData,
+} from "./commands";
+import {
   ApiError,
+  cancelAllMembers,
   cancelMember,
+  clearMessages,
   createMember,
   createTask,
   createUser,
+  createWorkspaceFolder,
+  deleteWorkspaceFile,
   fetchBootstrap,
   fetchMe,
   fetchMemberFileContent,
   fetchMemberFiles,
   fetchMemberSkills,
   fetchState,
+  fetchWorkspaceFile,
+  fetchWorkspaceFiles,
   listUsers,
   loginUser,
   logoutUser,
@@ -33,11 +49,15 @@ import {
   setupAdmin,
   subscribeEvents,
   updateProfile,
+  uploadWorkspaceFile,
+  workspaceFileDownloadUrl,
   type AgentFileContent,
   type AgentFileEntry,
   type MaskedSettings,
   type MemberSkillsView,
   type StateSnapshot,
+  type WorkspaceFileContent,
+  type WorkspaceFileEntry,
 } from "./api";
 import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdown/MarkdownText";
 
@@ -427,7 +447,12 @@ function RoomView({
   const [state, setState] = useState<StateSnapshot | null>(null);
   const [runs, setRuns] = useState<Record<string, RunState>>({});
   const [draft, setDraft] = useState("");
+  const [suggestIndex, setSuggestIndex] = useState(0);
+  const [suggestDismissed, setSuggestDismissed] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [chatNotice, setChatNotice] = useState<string | null>(null);
+  const [clearingChat, setClearingChat] = useState(false);
+  const [commandOutput, setCommandOutput] = useState<{ title: string; body: string } | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [usersOpen, setUsersOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(() => {
@@ -448,6 +473,25 @@ function RoomView({
     }
   });
   const [newTaskTitle, setNewTaskTitle] = useState("");
+  const [rightTab, setRightTab] = useState<"tasks" | "files">(() => {
+    try {
+      return localStorage.getItem("ac_right_tab") === "files" ? "files" : "tasks";
+    } catch {
+      return "tasks";
+    }
+  });
+  const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFileEntry[] | null>(null);
+  const [workspaceFilesTruncated, setWorkspaceFilesTruncated] = useState(false);
+  const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
+  const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
+  const [openWorkspacePath, setOpenWorkspacePath] = useState<string | null>(null);
+  const [workspaceFileContent, setWorkspaceFileContent] = useState<WorkspaceFileContent | null>(null);
+  const [workspaceFileContentError, setWorkspaceFileContentError] = useState<string | null>(null);
+  const [workspaceFileSeq, setWorkspaceFileSeq] = useState(0);
+  const [uploadingFiles, setUploadingFiles] = useState(false);
+  const [uploadNotice, setUploadNotice] = useState<string | null>(null);
+  const [deletingFilePath, setDeletingFilePath] = useState<string | null>(null);
+  const workspaceFileInput = useRef<HTMLInputElement | null>(null);
   const [panes, setPanes] = useState<PaneWidths>(readPanes);
   const [draggedPane, setDraggedPane] = useState<PaneName | null>(null);
   const panesRef = useRef<PaneWidths>(panes);
@@ -497,6 +541,20 @@ function RoomView({
       // storage can be unavailable in private mode
     }
   }, [skillsOpen]);
+
+  useEffect(() => {
+    if (!chatNotice) return;
+    const timer = setTimeout(() => setChatNotice(null), 5000);
+    return () => clearTimeout(timer);
+  }, [chatNotice]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("ac_right_tab", rightTab);
+    } catch {
+      // storage can be unavailable in private mode
+    }
+  }, [rightTab]);
 
   // 拖拽回调要在下一次渲染前就读到最新宽度，所以把 state 镜像到 ref。
   useEffect(() => {
@@ -609,6 +667,7 @@ function RoomView({
 
     const unsubscribe = subscribeEvents((event: RoomEvent) => {
       setState((current) => applyEvent(current, event));
+      if (event.type === "messages-cleared") setRuns({});
       setRuns((current) => {
         if (event.type !== "run") return current;
         const run = event.event;
@@ -656,12 +715,277 @@ function RoomView({
   const takeover = skillsOpen || newMemberOpen || Boolean(selectedMember);
   const panelVisible = boardOpen || takeover;
   const runningCount = members.filter((member) => member.status === "running").length;
+  const workspaceFileCount =
+    workspaceFiles?.filter((file) => file.kind === "file").length ?? null;
+
+  const refreshWorkspaceFiles = useCallback(async () => {
+    setWorkspaceFilesLoading(true);
+    try {
+      const listing = await fetchWorkspaceFiles();
+      setWorkspaceFiles(listing.files);
+      setWorkspaceFilesTruncated(listing.truncated);
+      setWorkspaceFilesError(null);
+      return listing.files;
+    } catch (err) {
+      if (isUnauthorized(err)) {
+        onSessionLost();
+      } else {
+        setWorkspaceFilesError(messageOf(err));
+      }
+      return null;
+    } finally {
+      setWorkspaceFilesLoading(false);
+    }
+  }, [onSessionLost]);
+
+  // 打开「文件」标签、面板重新展开或群里来了新消息（智能体可能刚写出成果）时刷新清单。
+  useEffect(() => {
+    if (rightTab !== "files" || !boardOpen) return;
+    void refreshWorkspaceFiles();
+  }, [rightTab, boardOpen, messages.length, refreshWorkspaceFiles]);
+
+  useEffect(() => {
+    if (!openWorkspacePath) {
+      setWorkspaceFileContent(null);
+      setWorkspaceFileContentError(null);
+      return;
+    }
+    let alive = true;
+    setWorkspaceFileContent(null);
+    setWorkspaceFileContentError(null);
+    fetchWorkspaceFile(openWorkspacePath)
+      .then((file) => {
+        if (alive) setWorkspaceFileContent(file);
+      })
+      .catch((err: unknown) => {
+        if (!alive) return;
+        if (isUnauthorized(err)) onSessionLost();
+        else setWorkspaceFileContentError(messageOf(err));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [openWorkspacePath, workspaceFileSeq, onSessionLost]);
+
+  function openWorkspaceFile(path: string) {
+    setOpenWorkspacePath(path);
+    setWorkspaceFileSeq((seq) => seq + 1);
+  }
+
+  function closeWorkspacePreview() {
+    setOpenWorkspacePath(null);
+  }
+
+  function reloadWorkspaceFile() {
+    setWorkspaceFileSeq((seq) => seq + 1);
+  }
+
+  async function handleCreateWorkspaceFolder(path: string): Promise<boolean> {
+    setUploadNotice(null);
+    setWorkspaceFilesError(null);
+    try {
+      const folder = await createWorkspaceFolder(path);
+      await refreshWorkspaceFiles();
+      setUploadNotice(`已新建目录：${folder.path}`);
+      return true;
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setWorkspaceFilesError(messageOf(err));
+      return false;
+    }
+  }
+
+  async function handleDeleteWorkspaceEntry(entry: { path: string; name: string; kind: "file" | "dir" }) {
+    const what = entry.kind === "dir" ? `目录「${entry.name}」` : `文件「${entry.name}」`;
+    if (!window.confirm(`确定删除${what}吗？删除后智能体也无法再读取。`)) return;
+    setDeletingFilePath(entry.path);
+    setUploadNotice(null);
+    setWorkspaceFilesError(null);
+    try {
+      await deleteWorkspaceFile(entry.path);
+      if (openWorkspacePath === entry.path) setOpenWorkspacePath(null);
+      await refreshWorkspaceFiles();
+      setUploadNotice(`已删除：${entry.path}`);
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setWorkspaceFilesError(messageOf(err));
+    } finally {
+      setDeletingFilePath(null);
+    }
+  }
+
+  async function handleUploadFiles(input: FileList | File[]) {
+    const picked = Array.from(input);
+    if (picked.length === 0) return;
+    setUploadingFiles(true);
+    setUploadNotice(null);
+    setWorkspaceFilesError(null);
+    try {
+      const uploaded: string[] = [];
+      const conflicts: File[] = [];
+      const failures: string[] = [];
+      for (const file of picked) {
+        try {
+          await uploadWorkspaceFile(file);
+          uploaded.push(file.name);
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 409) conflicts.push(file);
+          else if (isUnauthorized(err)) {
+            onSessionLost();
+            return;
+          } else failures.push(`${file.name}：${messageOf(err)}`);
+        }
+      }
+      if (conflicts.length > 0) {
+        const names = conflicts.map((file) => file.name).join("、");
+        if (window.confirm(`文件工作区已有同名文件：\n${names}\n\n要覆盖吗？`)) {
+          for (const file of conflicts) {
+            try {
+              await uploadWorkspaceFile(file, { overwrite: true });
+              uploaded.push(file.name);
+            } catch (err) {
+              failures.push(`${file.name}：${messageOf(err)}`);
+            }
+          }
+        } else {
+          failures.push(`已跳过同名文件：${names}`);
+        }
+      }
+      if (failures.length > 0) setWorkspaceFilesError(failures.join("；"));
+      setRightTab("files");
+      setBoardOpen(true);
+      await refreshWorkspaceFiles();
+      if (uploaded.length > 0) {
+        setUploadNotice(
+          `已上传 ${uploaded.length} 个文件：${uploaded.join("、")}。在群里 @成员，就能让它用 file_read 读取。`,
+        );
+        openWorkspaceFile(uploaded[0]!);
+      }
+    } finally {
+      setUploadingFiles(false);
+    }
+  }
+
+  function commandData(): CommandData {
+    return {
+      roomName: state?.room.name ?? "作战室",
+      members,
+      messages,
+      tasks,
+      settings: state?.settings ?? null,
+      workspaceFileCount,
+    };
+  }
+
+  async function handleStopAll() {
+    if (runningCount === 0) {
+      setCommandOutput({ title: "停止运行", body: "当前没有正在运行的成员。" });
+      return;
+    }
+    setError(null);
+    try {
+      const cancelled = await cancelAllMembers();
+      setCommandOutput({
+        title: "停止运行",
+        body:
+          cancelled > 0
+            ? `已中止 ${cancelled} 个正在运行的成员。`
+            : "没有找到可中止的运行，可能刚刚已经结束。",
+      });
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    }
+  }
+
+  async function runSlashCommand(name: string, args: string) {
+    if (args && name !== "help") {
+      setCommandOutput({
+        title: `/${name}`,
+        body: `/${name} 不接受参数。用法：/${name}`,
+      });
+      return;
+    }
+    switch (name) {
+      case "clear":
+        setCommandOutput(null);
+        await handleClearChat();
+        return;
+      case "stop":
+        await handleStopAll();
+        return;
+      case "status":
+        setCommandOutput({ title: "作战室状态", body: buildStatusReport(commandData()) });
+        return;
+      case "context":
+        setCommandOutput({ title: "上下文", body: buildContextReport(commandData()) });
+        return;
+      default:
+        setCommandOutput({ title: "可用命令", body: buildHelpReport() });
+    }
+  }
+
+  async function handleClearChat() {
+    if (clearingChat) return;
+    const runningNote =
+      runningCount > 0 ? `\n\n正在运行的 ${runningCount} 个智能体会先被中止本轮回复。` : "";
+    const confirmed = window.confirm(
+      `确定清除当前作战室的全部聊天记录吗？${runningNote}\n\n任务看板、文件工作区和智能体记忆不受影响。`,
+    );
+    if (!confirmed) return;
+    setClearingChat(true);
+    setError(null);
+    try {
+      const result = await clearMessages();
+      setState((current) => (current ? { ...current, messages: [] } : current));
+      setRuns({});
+      setChatNotice(
+        result.cleared === 0
+          ? "聊天记录本来就是空的。"
+          : `已清除 ${result.cleared} 条聊天记录${
+              result.cancelled > 0 ? `，并中止了 ${result.cancelled} 个正在运行的成员` : ""
+            }。`,
+      );
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    } finally {
+      setClearingChat(false);
+    }
+  }
+
+  const slashQuery = getSlashQuery(draft);
+  const slashSuggestions = slashQuery === null ? [] : suggestSlashCommands(slashQuery);
+  const slashMenuOpen = !suggestDismissed && slashSuggestions.length > 0;
+  const slashActiveIndex =
+    slashSuggestions.length > 0 ? Math.min(suggestIndex, slashSuggestions.length - 1) : 0;
+  const slashActive = slashSuggestions[slashActiveIndex];
+
+  function applySlashCompletion(name: string) {
+    setDraft(`/${name}`);
+    setSuggestDismissed(true);
+    setSuggestIndex(0);
+    setError(null);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }
 
   async function handleSend() {
     const text = draft.trim();
-    if (!text) return;
+    if (!text || clearingChat) return;
+    const parsed = parseSlashCommand(text);
+    if (parsed) {
+      setDraft("");
+      if (parsed.kind === "unknown") {
+        setError(`未知命令 /${parsed.name}，输入 /help 查看可用命令。`);
+        return;
+      }
+      setError(null);
+      await runSlashCommand(parsed.command.name, parsed.args);
+      return;
+    }
     setDraft("");
     setError(null);
+    setCommandOutput(null);
     try {
       await sendMessage(text);
     } catch (err) {
@@ -1113,9 +1437,22 @@ function RoomView({
         <button
           type="button"
           className="btn icon ghost"
+          aria-pressed={boardOpen && rightTab === "files"}
+          aria-label="文件工作区"
+          title="文件工作区"
+          onClick={() => {
+            setRightTab("files");
+            setBoardOpen(true);
+          }}
+        >
+          <Icon name="folder" />
+        </button>
+        <button
+          type="button"
+          className="btn icon ghost"
           aria-pressed={boardOpen}
-          aria-label={boardOpen ? "收起任务看板" : "展开任务看板"}
-          title={boardOpen ? "收起任务看板" : "展开任务看板"}
+          aria-label={boardOpen ? "收起右侧面板" : "展开右侧面板"}
+          title={boardOpen ? "收起右侧面板" : "展开右侧面板"}
           onClick={() => setBoardOpen((open) => !open)}
         >
           <Icon name="columns" />
@@ -1172,13 +1509,21 @@ function RoomView({
               type="button"
               className="btn ghost board-toggle"
               aria-pressed={boardOpen}
-              aria-controls="task-board"
-              title={boardOpen ? "收起任务看板" : "展开任务看板"}
+              aria-controls="side-panel"
+              title={
+                boardOpen
+                  ? "收起右侧面板"
+                  : rightTab === "files"
+                    ? "展开文件工作区"
+                    : "展开任务看板"
+              }
               onClick={() => setBoardOpen((open) => !open)}
             >
-              <Icon name="columns" />
-              <span>任务看板</span>
-              <span className="chip">{tasks.length}</span>
+              <Icon name={rightTab === "files" ? "folder" : "columns"} />
+              <span>{rightTab === "files" ? "文件工作区" : "任务看板"}</span>
+              <span className="chip">
+                {rightTab === "files" ? (workspaceFileCount ?? "·") : tasks.length}
+              </span>
             </button>
           )}
         </header>
@@ -1189,7 +1534,29 @@ function RoomView({
           </div>
         )}
 
+        {chatNotice && (
+          <div className="chat-notice" role="status">
+            {chatNotice}
+          </div>
+        )}
+
         <div className="chat-main">
+          {commandOutput && (
+            <section className="command-output" aria-label={commandOutput.title}>
+              <header>
+                <strong>{commandOutput.title}</strong>
+                <button
+                  type="button"
+                  className="command-output-close"
+                  aria-label="关闭命令结果"
+                  onClick={() => setCommandOutput(null)}
+                >
+                  <Icon name="close" size={14} />
+                </button>
+              </header>
+              <pre>{commandOutput.body}</pre>
+            </section>
+          )}
           <div className="messages">
             <div className="messages-inner">
               {messages.length === 0 && (
@@ -1237,20 +1604,89 @@ function RoomView({
                 ref={composerRef}
                 value={draft}
                 placeholder={`以 ${user.displayName} 的身份发消息… 用 @成员名 指派任务`}
-                onChange={(event) => setDraft(event.target.value)}
+                aria-expanded={slashMenuOpen}
+                aria-controls={slashMenuOpen ? "slash-suggest-menu" : undefined}
+                aria-activedescendant={
+                  slashMenuOpen && slashActive ? `slash-suggest-${slashActive.name}` : undefined
+                }
+                onChange={(event) => {
+                  setDraft(event.target.value);
+                  setSuggestDismissed(false);
+                  setSuggestIndex(0);
+                }}
                 onKeyDown={(event) => {
+                  if (slashMenuOpen) {
+                    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                      event.preventDefault();
+                      const delta = event.key === "ArrowDown" ? 1 : -1;
+                      setSuggestIndex(
+                        (current) =>
+                          (current + delta + slashSuggestions.length) % slashSuggestions.length,
+                      );
+                      return;
+                    }
+                    if (event.key === "Tab") {
+                      event.preventDefault();
+                      if (slashActive) applySlashCompletion(slashActive.name);
+                      return;
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setSuggestDismissed(true);
+                      return;
+                    }
+                    // 命令尚未输入完整时，Enter 先补全，再按一次才执行，避免误触 /clear、/stop。
+                    if (
+                      event.key === "Enter" &&
+                      !event.shiftKey &&
+                      slashActive &&
+                      draft.trim() !== `/${slashActive.name}`
+                    ) {
+                      event.preventDefault();
+                      applySlashCompletion(slashActive.name);
+                      return;
+                    }
+                  }
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
                     void handleSend();
                   }
                 }}
               />
+              {slashMenuOpen && (
+                <div className="slash-suggest" id="slash-suggest-menu" role="listbox" aria-label="命令建议">
+                  {slashSuggestions.map((command, index) => (
+                    <div
+                      key={command.name}
+                      id={`slash-suggest-${command.name}`}
+                      role="option"
+                      aria-selected={index === slashActiveIndex}
+                      className={`slash-suggest-item${
+                        index === slashActiveIndex ? " active" : ""
+                      }`}
+                      onMouseEnter={() => setSuggestIndex(index)}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => applySlashCompletion(command.name)}
+                    >
+                      <span className="slash-suggest-name">{command.usage}</span>
+                      <span className="slash-suggest-desc">{command.summary}</span>
+                    </div>
+                  ))}
+                  <div className="slash-suggest-tip">↑↓ 选择 · Tab 补全 · Enter 执行</div>
+                </div>
+              )}
               <button
                 type="button"
                 className="send-btn"
                 aria-label="发送消息"
-                disabled={!draft.trim()}
-                onClick={() => void handleSend()}
+                disabled={!draft.trim() || clearingChat}
+                onClick={() => {
+                  if (slashMenuOpen && slashActive && draft.trim() !== `/${slashActive.name}`) {
+                    applySlashCompletion(slashActive.name);
+                    return;
+                  }
+                  void handleSend();
+                }}
               >
                 <Icon name="send" />
               </button>
@@ -1258,6 +1694,7 @@ function RoomView({
             <div className="composer-hint">
               <span>Enter 发送 · Shift+Enter 换行</span>
               <span>@成员名 指派任务</span>
+              <span>输入 /help 查看命令</span>
             </div>
           </div>
         </div>
@@ -1306,67 +1743,126 @@ function RoomView({
         </aside>
       ) : (
       <aside
-        id="task-board"
+        id="side-panel"
         className="board-panel"
-        aria-label="任务看板"
+        aria-label="任务与文件"
         inert={!panelVisible}
       >
         <div className="board-sheet">
           <div className="board-head">
-            <span className="section-label">任务看板</span>
+            <div className="right-tabs" role="tablist" aria-label="右侧面板">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={rightTab === "tasks"}
+                className={`right-tab${rightTab === "tasks" ? " active" : ""}`}
+                onClick={() => setRightTab("tasks")}
+              >
+                <Icon name="columns" size={14} />
+                <span>任务</span>
+                <span className="chip">{tasks.length}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={rightTab === "files"}
+                className={`right-tab${rightTab === "files" ? " active" : ""}`}
+                onClick={() => setRightTab("files")}
+              >
+                <Icon name="folder" size={14} />
+                <span>文件</span>
+                <span className="chip">{workspaceFileCount ?? "·"}</span>
+              </button>
+            </div>
             <div className="board-head-actions">
-              <span className="chip">{tasks.length}</span>
               <button
                 type="button"
                 className="btn icon ghost board-close"
-                aria-label="收起任务看板"
-                title="收起任务看板"
+                aria-label={rightTab === "files" ? "收起文件工作区" : "收起任务看板"}
+                title={rightTab === "files" ? "收起文件工作区" : "收起任务看板"}
                 onClick={() => setBoardOpen(false)}
               >
                 <Icon name="chevronRight" />
               </button>
             </div>
           </div>
-          <form
-            className="task-add"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void handleAddTask();
+          <input
+            ref={workspaceFileInput}
+            type="file"
+            multiple
+            hidden
+            onChange={(event) => {
+              // FileList 是实时的：清空 value 会把它一起清掉，先复制成普通数组。
+              const picked = Array.from(event.target.files ?? []);
+              event.target.value = "";
+              if (picked.length > 0) void handleUploadFiles(picked);
             }}
-          >
-            <input
-              value={newTaskTitle}
-              placeholder="新增任务卡…"
-              onChange={(event) => setNewTaskTitle(event.target.value)}
+          />
+          {rightTab === "tasks" ? (
+            <>
+              <form
+                className="task-add"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void handleAddTask();
+                }}
+              >
+                <input
+                  value={newTaskTitle}
+                  placeholder="新增任务卡…"
+                  onChange={(event) => setNewTaskTitle(event.target.value)}
+                />
+                <button className="btn" type="submit" aria-label="添加任务">
+                  <Icon name="plus" />
+                </button>
+              </form>
+              <div className="board-body">
+                {tasks.length === 0 && (
+                  <p className="empty small">还没有任务卡。主智能体派活时会自动建卡。</p>
+                )}
+                {tasks.map((task) => (
+                  <article key={task.id} className={`task-card ${task.status}`}>
+                    <div className="task-line">
+                      <span className="task-title">{task.title}</span>
+                      <button
+                        className={`status-chip ${task.status}`}
+                        title="切换状态"
+                        onClick={() => void handleTaskStatus(task)}
+                      >
+                        {statusLabel(task.status)}
+                      </button>
+                    </div>
+                    <div className="task-meta">
+                      {task.ownerId ? `@${nameById.get(task.ownerId) ?? "?"}` : "未指派"}
+                      {task.deps.length > 0 ? ` · 依赖 ${task.deps.length}` : ""}
+                      {task.artifacts.length > 0 ? ` · 成果 ${task.artifacts.length}` : ""}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </>
+          ) : (
+            <WorkspaceFilesPanel
+              files={workspaceFiles}
+              truncated={workspaceFilesTruncated}
+              loading={workspaceFilesLoading}
+              uploading={uploadingFiles}
+              deletingPath={deletingFilePath}
+              error={workspaceFilesError}
+              notice={uploadNotice}
+              activePath={openWorkspacePath}
+              content={workspaceFileContent}
+              contentError={workspaceFileContentError}
+              onRefresh={() => void refreshWorkspaceFiles()}
+              onPickFiles={() => workspaceFileInput.current?.click()}
+              onUpload={(list) => void handleUploadFiles(list)}
+              onOpenFile={openWorkspaceFile}
+              onCloseFile={closeWorkspacePreview}
+              onReloadFile={reloadWorkspaceFile}
+              onDeleteEntry={(entry) => void handleDeleteWorkspaceEntry(entry)}
+              onCreateFolder={handleCreateWorkspaceFolder}
             />
-            <button className="btn" type="submit" aria-label="添加任务">
-              <Icon name="plus" />
-            </button>
-          </form>
-          <div className="board-body">
-            {tasks.length === 0 && (
-              <p className="empty small">还没有任务卡。主智能体派活时会自动建卡。</p>
-            )}
-            {tasks.map((task) => (
-              <article key={task.id} className={`task-card ${task.status}`}>
-                <div className="task-line">
-                  <span className="task-title">{task.title}</span>
-                  <button
-                    className={`status-chip ${task.status}`}
-                    title="切换状态"
-                    onClick={() => void handleTaskStatus(task)}
-                  >
-                    {statusLabel(task.status)}
-                  </button>
-                </div>
-                <div className="task-meta">
-                  {task.ownerId ? `@${nameById.get(task.ownerId) ?? "?"}` : "未指派"}
-                  {task.deps.length > 0 ? ` · 依赖 ${task.deps.length}` : ""}
-                  {task.artifacts.length > 0 ? ` · 成果 ${task.artifacts.length}` : ""}
-                </div>
-              </article>
-            ))}
-          </div>
+          )}
         </div>
       </aside>
       )}
@@ -1388,6 +1884,319 @@ function RoomView({
       )}
 
       {usersOpen && user.role === "admin" && <AdminPanel onClose={() => setUsersOpen(false)} />}
+    </div>
+  );
+}
+
+function WorkspaceFilesPanel({
+  files,
+  truncated,
+  loading,
+  uploading,
+  deletingPath,
+  error,
+  notice,
+  activePath,
+  content,
+  contentError,
+  onRefresh,
+  onPickFiles,
+  onUpload,
+  onOpenFile,
+  onCloseFile,
+  onReloadFile,
+  onDeleteEntry,
+  onCreateFolder,
+}: {
+  files: WorkspaceFileEntry[] | null;
+  truncated: boolean;
+  loading: boolean;
+  uploading: boolean;
+  deletingPath: string | null;
+  error: string | null;
+  notice: string | null;
+  activePath: string | null;
+  content: WorkspaceFileContent | null;
+  contentError: string | null;
+  onRefresh: () => void;
+  onPickFiles: () => void;
+  onUpload: (files: FileList | File[]) => void;
+  onOpenFile: (path: string) => void;
+  onCloseFile: () => void;
+  onReloadFile: () => void;
+  onDeleteEntry: (entry: { path: string; name: string; kind: "file" | "dir" }) => void;
+  onCreateFolder: (path: string) => Promise<boolean>;
+}) {
+  const [dragging, setDragging] = useState(false);
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [folderDraft, setFolderDraft] = useState("");
+  const [creatingBusy, setCreatingBusy] = useState(false);
+
+  function cancelFolder() {
+    setCreatingFolder(false);
+    setFolderDraft("");
+  }
+
+  const dragProps = {
+    onDragOver: (event: ReactDragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      if (event.dataTransfer.types.includes("Files")) setDragging(true);
+    },
+    onDragLeave: (event: ReactDragEvent<HTMLDivElement>) => {
+      if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
+    },
+    onDrop: (event: ReactDragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      setDragging(false);
+      if (event.dataTransfer.files.length > 0) onUpload(event.dataTransfer.files);
+    },
+  };
+
+  if (activePath) {
+    return (
+      <div className={`workspace-files${dragging ? " dropping" : ""}`} {...dragProps}>
+        <div className="workspace-preview">
+          <div className="workspace-preview-head">
+            <button
+              type="button"
+              className="btn icon ghost"
+              aria-label="返回文件列表"
+              title="返回文件列表"
+              onClick={onCloseFile}
+            >
+              <Icon name="back" />
+            </button>
+            <span className="workspace-preview-path" title={activePath}>
+              {activePath}
+            </span>
+            <button
+              type="button"
+              className="btn icon ghost"
+              aria-label="重新读取"
+              title="重新读取"
+              onClick={onReloadFile}
+            >
+              <Icon name="refresh" />
+            </button>
+            <a
+              className="btn icon ghost"
+              href={workspaceFileDownloadUrl(activePath)}
+              download
+              aria-label="下载文件"
+              title="下载文件"
+            >
+              <Icon name="download" />
+            </a>
+            <button
+              type="button"
+              className="btn icon ghost workspace-delete"
+              aria-label="删除文件"
+              title="删除文件"
+              disabled={deletingPath !== null}
+              onClick={() =>
+                onDeleteEntry({
+                  path: activePath,
+                  name: activePath.split("/").pop() ?? activePath,
+                  kind: "file",
+                })
+              }
+            >
+              <Icon name="trash" />
+            </button>
+          </div>
+          {content ? (
+            <div className="workspace-preview-meta">
+              <span>{formatBytes(content.sizeBytes)}</span>
+              <span>{clock(content.updatedAt)}</span>
+              {content.truncated ? <span className="workspace-preview-warn">仅预览开头部分</span> : null}
+            </div>
+          ) : null}
+          {contentError ? (
+            <div className="workspace-preview-body">
+              <p className="files-error">{contentError}</p>
+              <button type="button" className="btn sm" onClick={onReloadFile}>
+                重试
+              </button>
+            </div>
+          ) : !content ? (
+            <div className="workspace-preview-body">
+              <p className="files-note">正在读取文件…</p>
+            </div>
+          ) : content.preview === "image" ? (
+            <div className="workspace-preview-image-wrap">
+              <img
+                className="workspace-preview-image"
+                src={workspaceFileDownloadUrl(activePath, { inline: true })}
+                alt={content.name}
+              />
+            </div>
+          ) : content.preview === "binary" ? (
+            <div className="workspace-preview-body">
+              <p className="files-empty">
+                这是二进制文件（{formatBytes(content.sizeBytes)}），无法直接预览，请下载后查看。
+              </p>
+              <a className="btn" href={workspaceFileDownloadUrl(activePath)} download>
+                <Icon name="download" />
+                <span>下载文件</span>
+              </a>
+            </div>
+          ) : (
+            <pre className="workspace-preview-text">{content.content || "（空文件）"}</pre>
+          )}
+        </div>
+        {dragging && <div className="workspace-drop-hint">松开即可上传文件</div>}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`workspace-files${dragging ? " dropping" : ""}`} {...dragProps}>
+      <div className="board-body workspace-files-body">
+        <div className="workspace-toolbar">
+          <button type="button" className="btn" onClick={onPickFiles} disabled={uploading}>
+            <Icon name="upload" />
+            <span>{uploading ? "上传中…" : "上传文件"}</span>
+          </button>
+          <button
+            type="button"
+            className="btn icon ghost"
+            onClick={() => setCreatingFolder(true)}
+            disabled={creatingFolder || creatingBusy}
+            aria-label="新建目录"
+            title="新建目录"
+          >
+            <Icon name="folderPlus" />
+          </button>
+          <button
+            type="button"
+            className="btn icon ghost"
+            onClick={onRefresh}
+            disabled={loading}
+            aria-label="刷新文件"
+            title="刷新文件"
+          >
+            <Icon name="refresh" />
+          </button>
+          <span className="workspace-count">
+            {loading && files === null ? "读取中" : `${files?.length ?? 0} 项`}
+          </span>
+        </div>
+        {creatingFolder && (
+          <form
+            className="workspace-folder-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const name = folderDraft.trim();
+              if (!name || creatingBusy) return;
+              setCreatingBusy(true);
+              void onCreateFolder(name).then((ok) => {
+                setCreatingBusy(false);
+                if (ok) cancelFolder();
+              });
+            }}
+          >
+            <Icon name="folderPlus" />
+            <input
+              autoFocus
+              value={folderDraft}
+              placeholder="目录名，可多级如 reports/2026"
+              onChange={(event) => setFolderDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") cancelFolder();
+              }}
+            />
+            <button
+              className="btn sm"
+              type="submit"
+              disabled={creatingBusy || !folderDraft.trim()}
+            >
+              {creatingBusy ? "创建中…" : "创建"}
+            </button>
+            <button className="btn sm ghost" type="button" onClick={cancelFolder}>
+              取消
+            </button>
+          </form>
+        )}
+        <p className="workspace-hint">
+          支持拖拽上传，单文件不超过 25 MB；右上角可新建目录归类。智能体通过 file_list / file_read / file_write
+          使用同一目录。
+        </p>
+        {notice && <p className="workspace-notice">{notice}</p>}
+        {error && <p className="files-error">{error}</p>}
+        {files === null && loading && <p className="empty small">正在读取文件…</p>}
+        {files?.length === 0 && (
+          <p className="empty small">还没有文件。上传资料给智能体，或等它写出成果。</p>
+        )}
+        {files?.map((entry) =>
+          entry.kind === "dir" ? (
+            <div key={entry.path} className="workspace-file-row is-dir">
+              <span className="workspace-file-icon">
+                <Icon name="folder" />
+              </span>
+              <span className="workspace-file-main">
+                <span className="workspace-file-name">{entry.name}/</span>
+                {entry.path !== entry.name && (
+                  <span className="workspace-file-meta">{entry.path}</span>
+                )}
+              </span>
+              <button
+                type="button"
+                className="btn icon ghost workspace-delete"
+                aria-label={`删除目录 ${entry.name}`}
+                title={`删除目录 ${entry.name}（仅空目录）`}
+                disabled={deletingPath !== null}
+                onClick={() => onDeleteEntry(entry)}
+              >
+                <Icon name="trash" />
+              </button>
+            </div>
+          ) : (
+            <div
+              key={entry.path}
+              className={`workspace-file-row${activePath === entry.path ? " active" : ""}`}
+            >
+              <button
+                type="button"
+                className="workspace-file-open"
+                title="预览文件"
+                onClick={() => onOpenFile(entry.path)}
+              >
+                <span className="workspace-file-icon">
+                  <Icon name="file" />
+                </span>
+                <span className="workspace-file-main">
+                  <span className="workspace-file-name">{entry.name}</span>
+                  <span className="workspace-file-meta">
+                    {entry.path !== entry.name ? `${entry.path} · ` : ""}
+                    {formatBytes(entry.sizeBytes)} · {clock(entry.updatedAt)}
+                  </span>
+                </span>
+              </button>
+              <a
+                className="btn icon ghost workspace-download"
+                href={workspaceFileDownloadUrl(entry.path)}
+                download={entry.name}
+                aria-label={`下载 ${entry.name}`}
+                title={`下载 ${entry.name}`}
+              >
+                <Icon name="download" />
+              </a>
+              <button
+                type="button"
+                className="btn icon ghost workspace-delete"
+                aria-label={`删除 ${entry.name}`}
+                title={`删除 ${entry.name}`}
+                disabled={deletingPath !== null}
+                onClick={() => onDeleteEntry(entry)}
+              >
+                <Icon name="trash" />
+              </button>
+            </div>
+          ),
+        )}
+        {truncated && <p className="files-note">文件较多，仅显示前 500 项。</p>}
+      </div>
+      {dragging && <div className="workspace-drop-hint">松开即可上传文件</div>}
     </div>
   );
 }
@@ -1910,7 +2719,9 @@ function NewMemberPanel({
 }
 
 function formatBytes(bytes: number): string {
-  return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function PaneResizer({
@@ -1955,6 +2766,9 @@ function PaneResizer({
 
 function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnapshot | null {
   if (!current) return current;
+  if (event.type === "messages-cleared") {
+    return current.messages.length === 0 ? current : { ...current, messages: [] };
+  }
   if (event.type === "message") {
     if (current.messages.some((message) => message.id === event.message.id)) return current;
     return { ...current, messages: [...current.messages, event.message].slice(-400) };

@@ -12,6 +12,7 @@ export type IconName =
   | "plus"
   | "chevron"
   | "chevronRight"
+  | "back"
   | "columns"
   | "book"
   | "chat"
@@ -19,6 +20,10 @@ export type IconName =
   | "refresh"
   | "import"
   | "folder"
+  | "folderPlus"
+  | "file"
+  | "download"
+  | "upload"
   | "edit"
   | "trash"
   | "check";
@@ -64,6 +69,12 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
   plus: <path d="M12 5v14M5 12h14" />,
   chevron: <path d="M6 15l6-6 6 6" />,
   chevronRight: <path d="M9 6l6 6-6 6" />,
+  back: (
+    <>
+      <path d="M19 12H5" />
+      <path d="m11 18-6-6 6-6" />
+    </>
+  ),
   columns: (
     <>
       <rect x="3" y="4" width="18" height="16" rx="2.5" />
@@ -106,6 +117,32 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
   ),
   folder: (
     <path d="M3 8a2 2 0 0 1 2-2h4l2 2.5h6A2 2 0 0 1 19 11v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+  ),
+  folderPlus: (
+    <>
+      <path d="M3 8a2 2 0 0 1 2-2h4l2 2.5h6A2 2 0 0 1 19 11v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+      <path d="M12 11.5v5M9.5 14h5" />
+    </>
+  ),
+  file: (
+    <>
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z" />
+      <path d="M14 3v5h5" />
+    </>
+  ),
+  download: (
+    <>
+      <path d="M12 4v10" />
+      <path d="m8 10 4 4 4-4" />
+      <path d="M5 19h14" />
+    </>
+  ),
+  upload: (
+    <>
+      <path d="M12 19V9" />
+      <path d="m8 13 4-4 4 4" />
+      <path d="M5 4h14" />
+    </>
   ),
   edit: (
     <>

@@ -1,4 +1,5 @@
 import type {
+  Limits,
   Member,
   PublicUser,
   RoomEvent,
@@ -17,7 +18,7 @@ export interface MaskedProvider {
 export interface MaskedSettings {
   providers: MaskedProvider[];
   activeProviderId: string;
-  limits: Record<string, number>;
+  limits: Partial<Limits>;
 }
 
 export interface StateSnapshot {
@@ -259,6 +260,19 @@ export async function sendMessage(text: string): Promise<RoomMessage> {
   return body.message;
 }
 
+export function clearMessages(): Promise<{ cleared: number; cancelled: number }> {
+  return request<{ cleared: number; cancelled: number }>("/api/messages", {
+    method: "DELETE",
+  });
+}
+
+export async function cancelAllMembers(): Promise<number> {
+  const body = await request<{ cancelled: number }>("/api/members/cancel-all", {
+    method: "POST",
+  });
+  return body.cancelled;
+}
+
 export async function cancelMember(memberId: string): Promise<boolean> {
   const body = await request<{ cancelled: boolean }>(`/api/members/${memberId}/cancel`, {
     method: "POST",
@@ -314,6 +328,20 @@ export async function fetchMemberFileContent(
   );
 }
 
+export async function createWorkspaceFolder(path: string): Promise<{ path: string; name: string }> {
+  const body = await request<{ folder: { path: string; name: string } }>("/api/files/folder", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  return body.folder;
+}
+
+export async function deleteWorkspaceFile(path: string): Promise<void> {
+  await request<{ removed: string }>(`/api/files?path=${encodeURIComponent(path)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function saveMemberFile(
   memberId: string,
   path: string,
@@ -323,6 +351,65 @@ export async function saveMemberFile(
     `/api/members/${encodeURIComponent(memberId)}/files/content`,
     { method: "PUT", body: JSON.stringify({ path, content }) },
   );
+}
+
+export interface WorkspaceFileEntry {
+  path: string;
+  name: string;
+  kind: "file" | "dir";
+  sizeBytes: number;
+  updatedAt: number;
+}
+
+export interface WorkspaceFileListing {
+  files: WorkspaceFileEntry[];
+  truncated: boolean;
+}
+
+export interface WorkspaceFileContent {
+  path: string;
+  name: string;
+  sizeBytes: number;
+  updatedAt: number;
+  binary: boolean;
+  preview: "text" | "image" | "binary";
+  inlineMime: string | null;
+  content: string;
+  truncated: boolean;
+}
+
+export function fetchWorkspaceFiles(): Promise<WorkspaceFileListing> {
+  return request<WorkspaceFileListing>("/api/files");
+}
+
+export function fetchWorkspaceFile(path: string): Promise<WorkspaceFileContent> {
+  return request<WorkspaceFileContent>(`/api/files/content?path=${encodeURIComponent(path)}`);
+}
+
+export function workspaceFileDownloadUrl(path: string, options: { inline?: boolean } = {}): string {
+  return `/api/files/download?path=${encodeURIComponent(path)}${options.inline ? "&inline=1" : ""}`;
+}
+
+export async function uploadWorkspaceFile(
+  file: File,
+  options: { path?: string; overwrite?: boolean } = {},
+): Promise<WorkspaceFileEntry> {
+  const relPath = options.path ?? file.name;
+  const query = `path=${encodeURIComponent(relPath)}${options.overwrite ? "&overwrite=1" : ""}`;
+  const response = await fetch(`/api/files?${query}`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/octet-stream" },
+    body: file,
+  });
+  const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok) {
+    throw new ApiError(
+      typeof body["error"] === "string" ? body["error"] : `上传失败 ${response.status}`,
+      response.status,
+    );
+  }
+  return body["file"] as WorkspaceFileEntry;
 }
 
 export interface MemberSkillEntry {

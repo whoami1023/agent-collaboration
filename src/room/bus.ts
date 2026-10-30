@@ -92,6 +92,14 @@ export class RoomBus {
     return this.messages.slice(-limit);
   }
 
+  /** 清空聊天记录：保留 seq 单调递增，避免旧事件与新一轮消息的序号混淆。 */
+  clearMessages(): number {
+    const cleared = this.messages.length;
+    this.messages = [];
+    this.emit({ type: "messages-cleared" });
+    return cleared;
+  }
+
   append(input: AppendInput): RoomMessage {
     const resolved = input.mentions
       ? { ids: [...new Set(input.mentions)], names: [] as string[] }

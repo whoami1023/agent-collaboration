@@ -49,6 +49,73 @@ async function makeRig(handler: MockHandler, overrides: Partial<Limits> = {}) {
 }
 
 describe("group-chat collaboration", () => {
+  it("清空聊天记录后历史为空，seq 继续递增并广播 messages-cleared", () => {
+    const bus = new RoomBus("room_test", "测试群");
+    const events: string[] = [];
+    bus.subscribe((event) => events.push(event.type));
+
+    const first = bus.append({
+      senderId: "u_test",
+      senderName: "用户",
+      senderKind: "user",
+      text: "第一条",
+    });
+    bus.append({ senderId: "u_test", senderName: "用户", senderKind: "user", text: "第二条" });
+    expect(bus.listMessages()).toHaveLength(2);
+    events.length = 0;
+
+    expect(bus.clearMessages()).toBe(2);
+    expect(events).toEqual(["messages-cleared"]);
+    expect(bus.listMessages()).toEqual([]);
+    expect(bus.window(10_000)).toEqual([]);
+
+    const next = bus.append({
+      senderId: "u_test",
+      senderName: "用户",
+      senderKind: "user",
+      text: "清空后的第一条",
+    });
+    expect(next.seq).toBe(first.seq + 2);
+    expect(bus.snapshot().seq).toBe(next.seq);
+  });
+
+  it("清空会话会静默中止在跑的成员：不写取消提示，也不会补发迟到回复", async () => {
+    const handler: MockHandler = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return { text: "迟到的回复不应出现在清空后的会话里。" };
+    };
+    const { bus, orchestrator } = await makeRig(handler);
+    orchestrator.sendUserMessage("先跑一个长任务");
+
+    await waitFor(() => orchestrator.activeRuns === 1);
+    expect(orchestrator.cancelAllRuns()).toBe(1);
+    expect(bus.clearMessages()).toBeGreaterThan(0);
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(bus.listMessages()).toEqual([]);
+    await waitFor(() => orchestrator.activeRuns === 0);
+    expect(bus.listMessages()).toEqual([]);
+  });
+
+  it("/stop 中止所有在跑成员、丢弃排队 steer，并保留取消提示", async () => {
+    const handler: MockHandler = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return { text: "停止后不应出现的回复" };
+    };
+    const { bus, orchestrator } = await makeRig(handler);
+    orchestrator.sendUserMessage("第一轮长任务");
+    await waitFor(() => orchestrator.activeRuns === 1);
+    orchestrator.sendUserMessage("运行中追加的 steer");
+
+    expect(orchestrator.stopAllRuns()).toBe(1);
+    await waitFor(() => bus.listMessages().some((message) => message.text.includes("本次运行已取消")));
+    await waitFor(() => orchestrator.activeRuns === 0);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    expect(bus.listMessages().some((message) => message.text.includes("停止后不应出现"))).toBe(false);
+    expect(bus.listMessages().filter((message) => message.senderKind === "user")).toHaveLength(2);
+  });
+
   it("主智能体没有创建成员的通道，被要求建成员时只能直接回答", async () => {
     let toolNames: string[] = [];
     let system = "";
