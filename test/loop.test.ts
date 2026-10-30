@@ -53,9 +53,10 @@ describe("agent loop", () => {
     expect(result.error).toContain("重复");
   });
 
-  it("达到最大步数会中止", async () => {
+  it("达到最大步数时停止工具调用并生成收尾总结", async () => {
     let counter = 0;
-    const handler: MockHandler = () => {
+    const handler: MockHandler = (request) => {
+      if (request.tools.length === 0) return { text: "收尾总结：已完成调研，未完成压测。" };
       counter += 1;
       return { toolCalls: [{ name: "echo", args: { text: String(counter) } }] };
     };
@@ -68,8 +69,35 @@ describe("agent loop", () => {
       maxSteps: 3,
       signal: new AbortController().signal,
     });
-    expect(result.error).toContain("最大步数");
+    expect(result.error).toBeUndefined();
+    expect(result.maxStepsReached).toBe(true);
+    expect(result.text).toContain("收尾总结");
+    expect(result.steps).toBe(4);
     expect(counter).toBe(3);
+  });
+
+  it("收尾调用失败时保留已有文本，不丢弃整轮进展", async () => {
+    let counter = 0;
+    const handler: MockHandler = (request) => {
+      if (request.tools.length === 0) throw new Error("收尾接口失败");
+      counter += 1;
+      return {
+        text: `阶段发现 ${counter}`,
+        toolCalls: [{ name: "echo", args: { text: String(counter) } }],
+      };
+    };
+    const result = await runAgentLoop({
+      provider: new MockProvider(handler),
+      model: "mock",
+      system: "测试",
+      messages: [{ role: "user", content: "开始" }],
+      tools: [echoTool],
+      maxSteps: 2,
+      signal: new AbortController().signal,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.maxStepsReached).toBe(true);
+    expect(result.text).toContain("阶段发现 2");
   });
 
   it("中止信号会终止运行", async () => {

@@ -484,6 +484,8 @@ function RoomView({
   const [workspaceFilesTruncated, setWorkspaceFilesTruncated] = useState(false);
   const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
   const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
+  /** 文件工作区当前浏览的目录（"" = 根目录）；上传与新建目录都落在这里。 */
+  const [workspaceDir, setWorkspaceDir] = useState("");
   const [openWorkspacePath, setOpenWorkspacePath] = useState<string | null>(null);
   const [workspaceFileContent, setWorkspaceFileContent] = useState<WorkspaceFileContent | null>(null);
   const [workspaceFileContentError, setWorkspaceFileContentError] = useState<string | null>(null);
@@ -744,6 +746,19 @@ function RoomView({
     void refreshWorkspaceFiles();
   }, [rightTab, boardOpen, messages.length, refreshWorkspaceFiles]);
 
+  // 当前目录被删除（或改名）后回退到最近的仍存在的上级目录。
+  useEffect(() => {
+    if (!workspaceDir || !workspaceFiles) return;
+    let next = workspaceDir;
+    while (
+      next &&
+      !workspaceFiles.some((entry) => entry.path === next && entry.kind === "dir")
+    ) {
+      next = next.includes("/") ? next.slice(0, next.lastIndexOf("/")) : "";
+    }
+    if (next !== workspaceDir) setWorkspaceDir(next);
+  }, [workspaceDir, workspaceFiles]);
+
   useEffect(() => {
     if (!openWorkspacePath) {
       setWorkspaceFileContent(null);
@@ -814,20 +829,20 @@ function RoomView({
     }
   }
 
-  async function handleUploadFiles(input: FileList | File[]) {
+  async function handleUploadFiles(input: FileList | File[], dir = "") {
     const picked = Array.from(input);
     if (picked.length === 0) return;
+    const targetFor = (file: File) => (dir ? `${dir}/${file.name}` : file.name);
     setUploadingFiles(true);
     setUploadNotice(null);
     setWorkspaceFilesError(null);
     try {
-      const uploaded: string[] = [];
+      const uploaded: WorkspaceFileEntry[] = [];
       const conflicts: File[] = [];
       const failures: string[] = [];
       for (const file of picked) {
         try {
-          await uploadWorkspaceFile(file);
-          uploaded.push(file.name);
+          uploaded.push(await uploadWorkspaceFile(file, { path: targetFor(file) }));
         } catch (err) {
           if (err instanceof ApiError && err.status === 409) conflicts.push(file);
           else if (isUnauthorized(err)) {
@@ -841,8 +856,9 @@ function RoomView({
         if (window.confirm(`文件工作区已有同名文件：\n${names}\n\n要覆盖吗？`)) {
           for (const file of conflicts) {
             try {
-              await uploadWorkspaceFile(file, { overwrite: true });
-              uploaded.push(file.name);
+              uploaded.push(
+                await uploadWorkspaceFile(file, { path: targetFor(file), overwrite: true }),
+              );
             } catch (err) {
               failures.push(`${file.name}：${messageOf(err)}`);
             }
@@ -857,9 +873,9 @@ function RoomView({
       await refreshWorkspaceFiles();
       if (uploaded.length > 0) {
         setUploadNotice(
-          `已上传 ${uploaded.length} 个文件：${uploaded.join("、")}。在群里 @成员，就能让它用 file_read 读取。`,
+          `已上传 ${uploaded.length} 个文件：${uploaded.map((entry) => entry.name).join("、")}${dir ? `（${dir}/）` : ""}。在群里 @成员，就能让它用 file_read 读取。`,
         );
-        openWorkspaceFile(uploaded[0]!);
+        openWorkspaceFile(uploaded[0]!.path);
       }
     } finally {
       setUploadingFiles(false);
@@ -1795,7 +1811,7 @@ function RoomView({
               // FileList 是实时的：清空 value 会把它一起清掉，先复制成普通数组。
               const picked = Array.from(event.target.files ?? []);
               event.target.value = "";
-              if (picked.length > 0) void handleUploadFiles(picked);
+              if (picked.length > 0) void handleUploadFiles(picked, workspaceDir);
             }}
           />
           {rightTab === "tasks" ? (
@@ -1844,6 +1860,8 @@ function RoomView({
           ) : (
             <WorkspaceFilesPanel
               files={workspaceFiles}
+              dir={workspaceDir}
+              onDirChange={setWorkspaceDir}
               truncated={workspaceFilesTruncated}
               loading={workspaceFilesLoading}
               uploading={uploadingFiles}
@@ -1855,7 +1873,7 @@ function RoomView({
               contentError={workspaceFileContentError}
               onRefresh={() => void refreshWorkspaceFiles()}
               onPickFiles={() => workspaceFileInput.current?.click()}
-              onUpload={(list) => void handleUploadFiles(list)}
+              onUpload={(list) => void handleUploadFiles(list, workspaceDir)}
               onOpenFile={openWorkspaceFile}
               onCloseFile={closeWorkspacePreview}
               onReloadFile={reloadWorkspaceFile}
@@ -1888,8 +1906,25 @@ function RoomView({
   );
 }
 
+/** 清单是整棵树的递归结果，这里只取某个目录的直接子项。 */
+function childEntries(files: WorkspaceFileEntry[], dir: string): WorkspaceFileEntry[] {
+  const prefix = dir ? `${dir}/` : "";
+  return files
+    .filter((entry) => {
+      if (!entry.path.startsWith(prefix)) return false;
+      const rest = entry.path.slice(prefix.length);
+      return rest.length > 0 && !rest.includes("/");
+    })
+    .sort((left, right) => {
+      if (left.kind !== right.kind) return left.kind === "dir" ? -1 : 1;
+      return left.name.localeCompare(right.name);
+    });
+}
+
 function WorkspaceFilesPanel({
   files,
+  dir,
+  onDirChange,
   truncated,
   loading,
   uploading,
@@ -1909,6 +1944,8 @@ function WorkspaceFilesPanel({
   onCreateFolder,
 }: {
   files: WorkspaceFileEntry[] | null;
+  dir: string;
+  onDirChange: (dir: string) => void;
   truncated: boolean;
   loading: boolean;
   uploading: boolean;
@@ -1931,6 +1968,19 @@ function WorkspaceFilesPanel({
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [folderDraft, setFolderDraft] = useState("");
   const [creatingBusy, setCreatingBusy] = useState(false);
+
+  const entries = useMemo(() => (files ? childEntries(files, dir) : null), [files, dir]);
+  const segments = dir ? dir.split("/") : [];
+  const childCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const entry of files ?? []) {
+      const slash = entry.path.lastIndexOf("/");
+      if (slash < 0) continue;
+      const parent = entry.path.slice(0, slash);
+      counts.set(parent, (counts.get(parent) ?? 0) + 1);
+    }
+    return counts;
+  }, [files]);
 
   function cancelFolder() {
     setCreatingFolder(false);
@@ -2078,18 +2128,47 @@ function WorkspaceFilesPanel({
             <Icon name="refresh" />
           </button>
           <span className="workspace-count">
-            {loading && files === null ? "读取中" : `${files?.length ?? 0} 项`}
+            {loading && files === null ? "读取中" : `${entries?.length ?? 0} 项`}
           </span>
         </div>
+        <nav className="workspace-breadcrumb" aria-label="目录路径">
+          <button
+            type="button"
+            className={`workspace-crumb${dir ? "" : " current"}`}
+            onClick={() => onDirChange("")}
+            disabled={!dir}
+          >
+            <Icon name="folder" size={13} />
+            <span>全部文件</span>
+          </button>
+          {segments.map((segment, index) => {
+            const path = segments.slice(0, index + 1).join("/");
+            const current = path === dir;
+            return (
+              <span className="workspace-crumb-group" key={path}>
+                <Icon name="chevronRight" size={11} />
+                <button
+                  type="button"
+                  className={`workspace-crumb${current ? " current" : ""}`}
+                  onClick={() => onDirChange(path)}
+                  aria-current={current ? "page" : undefined}
+                >
+                  {segment}
+                </button>
+              </span>
+            );
+          })}
+        </nav>
         {creatingFolder && (
           <form
             className="workspace-folder-form"
             onSubmit={(event) => {
               event.preventDefault();
-              const name = folderDraft.trim();
+              const name = folderDraft.trim().replace(/^\/+|\/+$/g, "");
               if (!name || creatingBusy) return;
+              const path = dir ? `${dir}/${name}` : name;
               setCreatingBusy(true);
-              void onCreateFolder(name).then((ok) => {
+              void onCreateFolder(path).then((ok) => {
                 setCreatingBusy(false);
                 if (ok) cancelFolder();
               });
@@ -2099,7 +2178,7 @@ function WorkspaceFilesPanel({
             <input
               autoFocus
               value={folderDraft}
-              placeholder="目录名，可多级如 reports/2026"
+              placeholder={dir ? `在 ${dir}/ 下新建目录` : "目录名，可多级如 reports/2026"}
               onChange={(event) => setFolderDraft(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Escape") cancelFolder();
@@ -2118,27 +2197,37 @@ function WorkspaceFilesPanel({
           </form>
         )}
         <p className="workspace-hint">
-          支持拖拽上传，单文件不超过 25 MB；右上角可新建目录归类。智能体通过 file_list / file_read / file_write
-          使用同一目录。
+          点击目录可进入查看；上传文件与新建目录都会放进当前目录。支持拖拽上传，单文件不超过 25 MB。
+          智能体通过 file_list / file_read / file_write 使用同一目录。
         </p>
         {notice && <p className="workspace-notice">{notice}</p>}
         {error && <p className="files-error">{error}</p>}
         {files === null && loading && <p className="empty small">正在读取文件…</p>}
-        {files?.length === 0 && (
-          <p className="empty small">还没有文件。上传资料给智能体，或等它写出成果。</p>
+        {entries?.length === 0 && (
+          <p className="empty small">
+            {dir ? "这个目录还是空的，上传文件或新建子目录来整理。" : "还没有文件。上传资料给智能体，或等它写出成果。"}
+          </p>
         )}
-        {files?.map((entry) =>
+        {entries?.map((entry) =>
           entry.kind === "dir" ? (
             <div key={entry.path} className="workspace-file-row is-dir">
-              <span className="workspace-file-icon">
-                <Icon name="folder" />
-              </span>
-              <span className="workspace-file-main">
-                <span className="workspace-file-name">{entry.name}/</span>
-                {entry.path !== entry.name && (
-                  <span className="workspace-file-meta">{entry.path}</span>
-                )}
-              </span>
+              <button
+                type="button"
+                className="workspace-file-open"
+                title={`打开目录 ${entry.name}`}
+                onClick={() => onDirChange(entry.path)}
+              >
+                <span className="workspace-file-icon">
+                  <Icon name="folder" />
+                </span>
+                <span className="workspace-file-main">
+                  <span className="workspace-file-name">{entry.name}/</span>
+                  <span className="workspace-file-meta">{childCounts.get(entry.path) ?? 0} 项</span>
+                </span>
+                <span className="workspace-dir-arrow">
+                  <Icon name="chevronRight" size={14} />
+                </span>
+              </button>
               <button
                 type="button"
                 className="btn icon ghost workspace-delete"
@@ -2167,7 +2256,6 @@ function WorkspaceFilesPanel({
                 <span className="workspace-file-main">
                   <span className="workspace-file-name">{entry.name}</span>
                   <span className="workspace-file-meta">
-                    {entry.path !== entry.name ? `${entry.path} · ` : ""}
                     {formatBytes(entry.sizeBytes)} · {clock(entry.updatedAt)}
                   </span>
                 </span>

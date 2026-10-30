@@ -40,10 +40,10 @@ export const DEFAULT_LIMITS: Limits = {
   maxConcurrent: 8,
   maxChildrenPerAgent: 5,
   maxSpawnDepth: 5,
-  maxStepsPerRun: 12,
+  maxStepsPerRun: 24,
   maxRoomWindowChars: 12000,
   maxTurnsPerUserMessage: 12,
-  runTimeoutMs: 120000,
+  runTimeoutMs: 180000,
   contextWindowTokens: 64000,
   maxActiveTranscriptBytes: "2mb",
 };

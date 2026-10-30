@@ -163,8 +163,8 @@ export function buildContextReport(data: CommandData): string {
   const maxChars = numberOr(limits.maxRoomWindowChars, 12_000);
   const window = estimateWindow(data.messages, maxChars);
   const contextTokens = numberOr(limits.contextWindowTokens, 0);
-  const stepLimit = numberOr(limits.maxStepsPerRun, 12);
-  const timeout = numberOr(limits.runTimeoutMs, 120_000);
+  const stepLimit = numberOr(limits.maxStepsPerRun, 24);
+  const timeout = numberOr(limits.runTimeoutMs, 180_000);
   const concurrency = numberOr(limits.maxConcurrent, 8);
   const transcriptBytes =
     typeof limits.maxActiveTranscriptBytes === "string" ||

@@ -6,7 +6,7 @@ import { RoomBus } from "../src/room/bus";
 import { Workboard } from "../src/workboard/board";
 import { Orchestrator, ensureMainMember } from "../src/agent/orchestrator";
 import { DEFAULT_LIMITS, type Limits, type PublicUser } from "../src/core/types";
-import type { Settings } from "../src/core/settings";
+import { SETTINGS_VERSION, type Settings } from "../src/core/settings";
 import type { MockHandler } from "../src/provider/mock";
 import { SkillLibrary } from "../src/skills/library";
 
@@ -33,6 +33,7 @@ async function makeRig(handler: MockHandler, overrides: Partial<Limits> = {}) {
   const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
   await skills.init();
   const settings: Settings = {
+    settingsVersion: SETTINGS_VERSION,
     providers: [{ id: "demo", kind: "mock", model: "mock" }],
     activeProviderId: "demo",
     limits: { ...DEFAULT_LIMITS, maxStepsPerRun: 6, runTimeoutMs: 5000, ...overrides },
@@ -114,6 +115,25 @@ describe("group-chat collaboration", () => {
 
     expect(bus.listMessages().some((message) => message.text.includes("停止后不应出现"))).toBe(false);
     expect(bus.listMessages().filter((message) => message.senderKind === "user")).toHaveLength(2);
+  });
+
+  it("达到步数上限时收尾总结并保持空闲，不标记运行失败", async () => {
+    let index = 0;
+    const handler: MockHandler = (request) => {
+      if (request.tools.length === 0) return { text: "已完成梳理；未完成压测。" };
+      index += 1;
+      return { toolCalls: [{ name: "task_create", args: { title: `步骤 ${index}` } }] };
+    };
+    const { bus, orchestrator } = await makeRig(handler, { maxStepsPerRun: 3 });
+    orchestrator.sendUserMessage("做一个需要多步的任务");
+    await waitFor(() => orchestrator.activeRuns === 0);
+    await waitFor(() => bus.listMessages().some((message) => message.text.includes("已完成梳理")));
+
+    const texts = bus.listMessages().map((message) => message.text);
+    expect(texts.some((text) => text.includes("运行中止") || text.includes("运行失败"))).toBe(false);
+    expect(texts.some((text) => text.includes("3 步工具调用已用尽"))).toBe(true);
+    const main = bus.listMembers().find((member) => member.role === "main");
+    expect(main?.status).toBe("idle");
   });
 
   it("主智能体没有创建成员的通道，被要求建成员时只能直接回答", async () => {

@@ -170,7 +170,7 @@ describe("SkillLibrary", () => {
       members: [mainMember],
       parentName: null,
       taskTitles: new Map(),
-      limits: { maxChildrenPerAgent: 3, maxSpawnDepth: 3, maxConcurrent: 4 },
+      limits: { maxChildrenPerAgent: 3, maxSpawnDepth: 3, maxConcurrent: 4, maxStepsPerRun: 12 },
       skills: library.listForAgent(alice.id).map(({ name, description, scope }) => ({
         name,
         description,
@@ -776,7 +776,7 @@ describe("成员级技能白名单", () => {
       members: [restricted],
       parentName: null,
       taskTitles: new Map(),
-      limits: { maxChildrenPerAgent: 3, maxSpawnDepth: 3, maxConcurrent: 4 },
+      limits: { maxChildrenPerAgent: 3, maxSpawnDepth: 3, maxConcurrent: 4, maxStepsPerRun: 12 },
       skills: selectSkillsForMember(library.listForAgent(alice.id), restricted.skillNames).map(
         ({ name, description, scope }) => ({ name, description, scope }),
       ),

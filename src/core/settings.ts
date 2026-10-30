@@ -13,12 +13,17 @@ export interface ProviderConfig {
 }
 
 export interface Settings {
+  /** 配置结构版本：用于把旧默认值迁移到新默认值，用户显式改过的值保持不动。 */
+  settingsVersion: number;
   providers: ProviderConfig[];
   activeProviderId: string;
   limits: Limits;
 }
 
+export const SETTINGS_VERSION = 2;
+
 export const DEFAULT_SETTINGS: Settings = {
+  settingsVersion: SETTINGS_VERSION,
   providers: [
     { id: "demo", kind: "mock", model: "mock" },
     {
@@ -63,11 +68,24 @@ export function maskSettings(settings: Settings): MaskedSettings {
 export async function loadSettings(file: string): Promise<Settings> {
   try {
     const raw = JSON.parse(await readFile(file, "utf8")) as Partial<Settings>;
-    return mergeSettings(DEFAULT_SETTINGS, raw);
+    const migrated = migrateSettings(raw);
+    const settings = mergeSettings(DEFAULT_SETTINGS, migrated);
+    if (migrated !== raw) await saveSettings(file, settings);
+    return settings;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return structuredClone(DEFAULT_SETTINGS);
     throw err;
   }
+}
+
+/** v1 没有版本号；当时的默认预算是 12 步 / 120 秒，只迁移这两个旧默认值。 */
+function migrateSettings(raw: Partial<Settings>): Partial<Settings> {
+  const version = typeof raw.settingsVersion === "number" ? raw.settingsVersion : 1;
+  if (version >= SETTINGS_VERSION) return raw;
+  const limits: Limits = { ...DEFAULT_LIMITS, ...(raw.limits ?? {}) };
+  if (raw.limits?.maxStepsPerRun === 12) limits.maxStepsPerRun = DEFAULT_LIMITS.maxStepsPerRun;
+  if (raw.limits?.runTimeoutMs === 120_000) limits.runTimeoutMs = DEFAULT_LIMITS.runTimeoutMs;
+  return { ...raw, settingsVersion: SETTINGS_VERSION, limits };
 }
 
 export async function saveSettings(file: string, settings: Settings): Promise<void> {
@@ -98,6 +116,7 @@ export function mergeSettings(base: Settings, patch: SettingsPatch): Settings {
       ? patch.activeProviderId
       : base.activeProviderId;
   return {
+    settingsVersion: base.settingsVersion,
     providers,
     activeProviderId,
     limits: { ...base.limits, ...(patch.limits ?? {}) },

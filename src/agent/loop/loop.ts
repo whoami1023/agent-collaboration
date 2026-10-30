@@ -76,6 +76,8 @@ export interface LoopResult {
   cancelled: boolean;
   error?: string;
   errorCode?: LoopErrorCode;
+  /** 工具步数用尽，但已切换到无工具收尾并生成了总结；不算运行失败。 */
+  maxStepsReached?: boolean;
 }
 
 type StopReason = "stop" | "toolUse" | "error";
@@ -255,18 +257,43 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     await executeToolBatch(options, messages, calls, retryOptions);
   }
 
-  return {
-    text: text.trim(),
-    steps: options.maxSteps,
-    cancelled: false,
-    error: `达到最大步数 ${options.maxSteps}，已中止`,
-    errorCode: "max_steps_reached",
-  };
+  return finalizeMaxSteps(options, messages, text, options.maxSteps);
+}
+
+const MAX_STEPS_WRAP_UP_PROMPT =
+  "本次运行的工具调用步数已用尽，接下来不能再调用工具。请立即基于目前的进展给出最终答复：" +
+  "已完成什么、关键产出（任务状态 / 文件路径）、未完成项与建议的下一步；不要再要求调用工具。";
+
+/**
+ * 步数用尽时不再直接报错丢弃整轮：补一次不带工具的模型调用，把已有进展收尾成总结。
+ * 收尾调用本身不会循环（没有工具），失败时保留已经流式输出的部分文本。
+ */
+async function finalizeMaxSteps(
+  options: LoopOptions,
+  messages: LlmMessage[],
+  accumulated: string,
+  steps: number,
+): Promise<LoopResult> {
+  throwIfAborted(options.signal);
+  messages.push({ role: "user", content: MAX_STEPS_WRAP_UP_PROMPT });
+  const streamed = await streamAgentResponse(options, messages, false);
+  const text = streamed.text.trim() || accumulated.trim();
+  if (!text) {
+    return {
+      text: "",
+      steps: steps + 1,
+      cancelled: false,
+      error: `达到最大步数 ${steps}，且未能生成收尾总结`,
+      errorCode: "max_steps_reached",
+    };
+  }
+  return { text, steps: steps + 1, cancelled: false, maxStepsReached: true };
 }
 
 async function streamAgentResponse(
   options: LoopOptions,
   messages: LlmMessage[],
+  useTools = true,
 ): Promise<StreamedResponse> {
   const watch = new RepetitionWatch();
   const streamController = new AbortController();
@@ -283,7 +310,7 @@ async function streamAgentResponse(
       for await (const event of options.provider.stream({
         model: options.model,
         messages,
-        tools: options.tools.map((tool) => tool.schema),
+        tools: useTools ? options.tools.map((tool) => tool.schema) : [],
         signal: streamController.signal,
       })) {
         if (event.type === "text") {

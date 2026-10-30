@@ -45,7 +45,12 @@ export interface PromptContext {
   members: Member[];
   parentName: string | null;
   taskTitles: Map<string, string>;
-  limits: { maxChildrenPerAgent: number; maxSpawnDepth: number; maxConcurrent: number };
+  limits: {
+    maxChildrenPerAgent: number;
+    maxSpawnDepth: number;
+    maxConcurrent: number;
+    maxStepsPerRun: number;
+  };
   skills: SkillSummary[];
   /** 本轮实际注册的工具名；记忆指引只描述可用工具（对应 OpenClaw availableTools）。 */
   availableTools?: Set<string>;
@@ -97,12 +102,13 @@ ${formatSkills(context.skills)}
 - 分派后不要轮询、不要反复催问，等它的报告。
 - 一次回复只做一件事：要么分派，要么综合汇报；不要刷屏。
 - 用 task_create 建任务卡，进展用 task_update 更新，结果用 task_attach_artifact 登记。
+- 单次运行最多 ${limits.maxStepsPerRun} 步工具调用：相互独立的调用放在同一轮发起（例如改任务状态与登记产出），接近上限时先收尾汇报，不要一步只做一个工具调用。
 
 约束：总并发 ${limits.maxConcurrent}；成员创建由用户操作，你只做任务分派与汇总。`;
 }
 
 function subPrompt(context: PromptContext): string {
-  const { member, roomName, members, parentName, taskTitles } = context;
+  const { member, roomName, members, parentName, taskTitles, limits } = context;
   const brief = member.brief?.trim();
   const roleSection = brief ? `\n\n你的角色（创建时用户写下的职责描述）：\n${brief}` : "";
   const base = `你是群聊「${roomName}」里的成员 @${member.name}，由 ${parentName ? `@${parentName}` : "主智能体"} 创建，只对分配给你的任务负责。${roleSection}
@@ -119,7 +125,8 @@ ${formatSkills(context.skills)}
 - 汇报必须包含：结论、证据（路径/链接/关键输出）、未解决项与不确定点。不要只给承诺。
 - 你没有创建成员的能力：不要尝试新建或下派子成员，只做分给你的任务。
 - 不要 @ 其他同级成员互相派活；跨线协调必须经过创建你的那一级。
-- 用 task_update 更新任务卡状态，用 task_attach_artifact 登记产出。`;
+- 用 task_update 更新任务卡状态，用 task_attach_artifact 登记产出。
+- 单次运行最多 ${limits.maxStepsPerRun} 步工具调用；能合并的独立调用同轮发起，接近上限时先交付当前结论与未完成项。`;
   const standing = buildSubagentStandingInstructions({ spawnMode: "session" });
   return `${base}\n${standing}`;
 }

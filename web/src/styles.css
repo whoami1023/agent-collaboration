@@ -2003,6 +2003,53 @@ body.pane-dragging * {
   white-space: nowrap;
 }
 
+.workspace-breadcrumb {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  flex: none;
+  margin: 0 0 2px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.workspace-crumb-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--muted);
+}
+
+.workspace-crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 14rem;
+  padding: 2px 6px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-crumb:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text-strong);
+}
+
+.workspace-crumb.current,
+.workspace-crumb:disabled {
+  color: var(--text-strong);
+  font-weight: 600;
+  cursor: default;
+}
+
 .workspace-hint {
   margin: 0 0 2px;
   color: var(--muted);
@@ -2045,7 +2092,28 @@ body.pane-dragging * {
 .workspace-file-row.is-dir {
   border-style: dashed;
   background: transparent;
-  padding: 7px 8px;
+  padding: 0;
+}
+
+.workspace-file-row.is-dir:hover {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  background: var(--accent-subtle);
+}
+
+.workspace-file-row.is-dir:hover .workspace-file-icon,
+.workspace-file-row.is-dir:hover .workspace-dir-arrow {
+  color: var(--accent);
+}
+
+.workspace-file-row.is-dir .workspace-file-open {
+  padding: 7px 2px 7px 8px;
+}
+
+.workspace-dir-arrow {
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: var(--muted);
 }
 
 .workspace-file-open {

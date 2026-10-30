@@ -239,6 +239,11 @@ export class MemberRuntime {
       } else {
         this.emit({ type: "run-final", runId, memberId: this.member.id, text: "" });
       }
+      if (result.maxStepsReached) {
+        this.notice(
+          `@${this.member.name} 单次运行 ${limits.maxStepsPerRun} 步工具调用已用尽，已停止调用工具并基于当前进展收尾；未完成的任务可以再发一条消息继续。`,
+        );
+      }
       this.setStatus("idle");
     } catch (err) {
       if (isAbort(err)) {
