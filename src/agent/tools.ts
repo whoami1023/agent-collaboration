@@ -1,33 +1,23 @@
-import type { ContextMode, Limits, Member, TaskStatus } from "../core/types";
+import type { Member, TaskStatus } from "../core/types";
 import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
 import type { SkillLibrary } from "../skills/library";
+import { selectSkillsForMember, isSkillSelected } from "../skills/selection";
+import { formatSkillFileSize } from "../skills/skill-files";
 import type { MemorySearchManager } from "../memory/manager";
 import { buildMemoryTools } from "../memory/tools";
 import type { ToolImpl } from "./loop";
 import { formatRoomWindow } from "./prompts";
-import {
-  isSpawnDepthAllowed,
-  spawnDepthRejectError,
-  LEAF_SPAWN_REJECT_ERROR,
-} from "./spawn/child-admission";
-
-export interface SpawnInput {
-  name: string;
-  task: string;
-  systemPrompt?: string;
-  contextMode?: ContextMode;
-  providerId?: string;
-}
+import { buildWebTools, type WebToolOptions } from "../web/tools";
 
 export interface ToolDeps {
   bus: RoomBus;
   board: Workboard;
-  limits: Limits;
   skills: SkillLibrary;
   userId: string;
-  spawn(input: SpawnInput): Promise<string>;
   memory?: MemorySearchManager;
+  /** 联网工具注入点：单测可替换 fetch/DNS，生产环境留空走真实网络。 */
+  web?: WebToolOptions;
 }
 
 const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done", "failed"];
@@ -46,56 +36,19 @@ function readStringArray(args: Record<string, unknown>, key: string): string[] |
 
 export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   const tools: ToolImpl[] = [];
+  // 成员级技能白名单（智能体文件 → 技能）：提示词只列勾选项，工具也要拦。
+  const enabledSkills = () =>
+    selectSkillsForMember(deps.skills.listForAgent(deps.userId), member.skillNames);
+  const denialFor = (skillName: string): string => {
+    const available = enabledSkills().map((item) => item.name);
+    return `错误：技能 ${skillName} 未对 @${member.name} 启用${
+      available.length > 0
+        ? `。可用技能：${available.join("、")}`
+        : "，该智能体当前没有启用任何技能（可在右侧「智能体文件 → 技能」中勾选）"
+    }`;
+  };
 
-  // Ported capability gate：spawn_member 始终注册但受双重护栏——
-  // controlScope（leaf 直接拒绝）与嵌套深度；与 OpenClaw「声明与准入分离」一致。
-  tools.push({
-      schema: {
-        name: "spawn_member",
-        description:
-          "创建一个子成员并把任务派给它。会生成任务卡并自动 @ 该成员；不要再用回复重复 @。只在任务多步、耗时且可独立完成时使用。",
-        parameters: {
-          type: "object",
-          properties: {
-            name: { type: "string", description: "成员名（2-12 个字），之后用 @名字 引用" },
-            task: {
-              type: "string",
-              description: "任务简报，必须包含：目标、交付物、写入范围、验收方式",
-            },
-            system_prompt: { type: "string", description: "可选：该成员长期遵循的额外要求" },
-            context_mode: {
-              type: "string",
-              enum: ["isolated", "fork"],
-              description: "isolated=只看最近群聊窗口（默认）；fork=带更完整历史",
-            },
-            provider_id: { type: "string", description: "可选：指定模型 provider id" },
-          },
-          required: ["name", "task"],
-          additionalProperties: false,
-        },
-      },
-      execute: async (args) => {
-        if (member.controlScope !== "children") return LEAF_SPAWN_REJECT_ERROR;
-        if (!isSpawnDepthAllowed(member.depth, deps.limits.maxSpawnDepth)) {
-          return `错误：${spawnDepthRejectError(member.depth, deps.limits.maxSpawnDepth)}`;
-        }
-        const name = readString(args, "name");
-        const task = readString(args, "task");
-        if (!name) return "错误：name 不能为空";
-        if (!task) return "错误：task 不能为空，请给出任务简报";
-        const contextMode = args["context_mode"] === "fork" ? "fork" : "isolated";
-        const systemPrompt = readString(args, "system_prompt");
-        const providerId = readString(args, "provider_id");
-        return deps.spawn({
-          name,
-          task,
-          contextMode,
-          ...(systemPrompt ? { systemPrompt } : {}),
-          ...(providerId ? { providerId } : {}),
-        });
-      },
-  });
-
+  // 成员只能由用户在左侧「新建成员」创建；运行中的智能体不再拥有创建子成员的通道。
   tools.push({
     schema: {
       name: "use_skill",
@@ -115,12 +68,61 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
       if (!raw) return "错误：name 不能为空";
       const skill = deps.skills.readForAgent(deps.userId, raw);
       if (!skill) {
-        const available = deps.skills.listForAgent(deps.userId).map((item) => item.name);
+        const available = enabledSkills().map((item) => item.name);
         return `错误：没有可用的技能 ${raw}${
           available.length > 0 ? `。可用技能：${available.join("、")}` : ""
         }`;
       }
-      return `技能 ${skill.name}（${skill.scope === "shared" ? "共享" : "个人"}）\n描述：${skill.description}\n\n${skill.instructions}`;
+      if (!isSkillSelected(member.skillNames, skill.name)) return denialFor(skill.name);
+      const files = skill.files ?? [];
+      const filesSection =
+        files.length > 0
+          ? `\n\n附带文件（用 read_skill_file 读取正文，参数 skill=${skill.name}）：\n${files
+              .map((file) => `- ${file.path}（${formatSkillFileSize(file.size)}）`)
+              .join("\n")}`
+          : "";
+      return `技能 ${skill.name}（${skill.scope === "shared" ? "共享" : "个人"}）\n描述：${
+        skill.description
+      }\n\n${skill.instructions}${filesSection}`;
+    },
+  });
+
+  tools.push({
+    schema: {
+      name: "read_skill_file",
+      description:
+        "读取技能目录里的附带文件（脚本、参考资料、模板等）。use_skill 返回的附带文件清单中路径才能读；二进制文件只返回大小。",
+      parameters: {
+        type: "object",
+        properties: {
+          skill: { type: "string", description: "技能名称" },
+          path: { type: "string", description: "附带文件相对路径，如 scripts/build.js" },
+        },
+        required: ["skill", "path"],
+        additionalProperties: false,
+      },
+    },
+    execute: async (args) => {
+      const skillName = readString(args, "skill");
+      const path = readString(args, "path");
+      if (!skillName) return "错误：skill 不能为空";
+      if (!path) return "错误：path 不能为空";
+      const skill = deps.skills.readForAgent(deps.userId, skillName);
+      if (!skill) return `错误：没有可用的技能 ${skillName}`;
+      if (!isSkillSelected(member.skillNames, skill.name)) return denialFor(skill.name);
+      const hit = deps.skills.readSkillFile(deps.userId, skillName, path);
+      if (!hit) {
+        const list = (skill.files ?? []).map((file) => file.path);
+        return list.length > 0
+          ? `错误：技能 ${skillName} 里没有文件 ${path}。可选路径：${list.join("、")}`
+          : `错误：技能 ${skillName} 没有附带文件`;
+      }
+      if (hit.file.encoding === "base64") {
+        return `文件 ${hit.file.path} 是二进制内容（${formatSkillFileSize(
+          hit.file.size,
+        )}），作战室内无法直接查看正文。`;
+      }
+      return `技能 ${skillName} 的文件 ${hit.file.path}：\n\n${hit.file.content}`;
     },
   });
 
@@ -253,8 +255,11 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   // P5：记忆三件套（memory_search / memory_get / memory_append），
   // 对应 OpenClaw memory-core 插件按 agent 注册工具通道的形态。
   if (deps.memory) {
-    tools.push(...buildMemoryTools(deps.memory));
+    tools.push(...buildMemoryTools(deps.memory, member.role === "sub" ? { agentId: member.id } : {}));
   }
+
+  // 联网检索与正文抓取：内置共享技能 web-search / web-fetch / web-browse 的执行底座。
+  tools.push(...buildWebTools(deps.web));
 
   return tools;
 }

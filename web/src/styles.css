@@ -186,6 +186,16 @@ button {
   color: var(--text-strong);
 }
 
+.btn.ghost.active {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.btn.ghost.active:hover:not(:disabled) {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
 .btn.danger {
   border-color: color-mix(in srgb, var(--danger) 42%, var(--border-strong));
   color: var(--danger);
@@ -842,6 +852,29 @@ body.pane-dragging * {
 
 .member-row .btn {
   align-self: center;
+}
+
+/* 移除按钮平时藏起来，悬停/聚焦才出现，避免和「打开智能体文件」抢点击。 */
+.member-remove {
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s var(--ease), background 0.18s var(--ease), color 0.18s var(--ease);
+}
+
+.member-row:hover .member-remove,
+.member-remove:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: none) {
+  .member-remove {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 .sidebar-foot {
@@ -1852,6 +1885,179 @@ body.pane-dragging * {
   line-height: 1.6;
 }
 
+.files-editor {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  padding: 10px 12px;
+  resize: none;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--text);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+  line-height: 1.55;
+  tab-size: 2;
+}
+
+.files-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.files-edit-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.files-save-error {
+  margin: 0;
+  color: var(--danger, var(--accent));
+  font-size: var(--text-xs);
+}
+
+.agent-skills-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.agent-skills-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-skill-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  cursor: pointer;
+  transition: border-color 0.16s var(--ease), background 0.16s var(--ease);
+}
+
+.agent-skill-row:hover {
+  border-color: var(--border-strong);
+}
+
+.agent-skill-row.master {
+  flex: none;
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: var(--accent-subtle);
+}
+
+.agent-skill-row input[type="checkbox"] {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  accent-color: var(--accent);
+}
+
+.agent-skill-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.agent-skill-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.agent-skill-name .chip {
+  flex: none;
+  height: 18px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+
+.agent-skill-desc {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.agent-skill-scope {
+  flex: none;
+  padding-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agent-skills-view .files-edit-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  justify-content: flex-end;
+  padding: 8px 0;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.agent-skills-view .files-edit-actions .files-note {
+  flex: 1;
+}
+
+.new-member-sheet .board-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: auto;
+}
+
+.new-member-hint {
+  max-width: 680px;
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-sm);
+  line-height: 1.65;
+}
+
+.new-member-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+  max-width: 680px;
+}
+
+.new-member-form textarea {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+}
+
+.new-member-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .task-add {
   display: flex;
   gap: 6px;
@@ -2399,12 +2605,19 @@ body.pane-dragging * {
 }
 
 .skill-list {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  align-items: stretch;
   gap: 8px;
   margin: 0;
   padding: 0;
   list-style: none;
+}
+
+@media (max-width: 720px) {
+  .skill-list {
+    grid-template-columns: 1fr;
+  }
 }
 
 .skill-card {
@@ -2614,6 +2827,105 @@ body.pane-dragging * {
   flex: none;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+.skill-import-file-name.entry {
+  font-weight: 600;
+}
+
+.skill-file-tag {
+  flex: none;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.skill-files-editor,
+.skill-files-view {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+}
+
+.skill-files-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.skill-files-head .field-label em {
+  margin-left: 6px;
+}
+
+.skill-files-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.skill-files-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.skill-file-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  font-size: 12.5px;
+}
+
+.skill-file-row:not(.open) {
+  align-items: center;
+}
+
+.skill-file-row.new {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+
+.skill-file-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.skill-file-hint {
+  flex: none;
+  color: var(--accent);
+}
+
+.skill-file-body {
+  min-width: 0;
+}
+
+.skill-file-body .skill-read {
+  max-height: 280px;
+  overflow: auto;
 }
 
 .skill-import-results li {

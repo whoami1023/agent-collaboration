@@ -17,12 +17,7 @@ import {
   clearPendingChildAdmissions,
 } from "../src/agent/spawn/child-admission";
 import { normalizeMemberName } from "../src/agent/spawn/task-name";
-import {
-  buildSubagentSpawnEnvelope,
-  buildSubagentStandingInstructions,
-  resolveSpawnMode,
-  INTERNAL_RUNTIME_CONTEXT_BEGIN,
-} from "../src/agent/spawn/system-prompt";
+import { buildSubagentStandingInstructions } from "../src/agent/spawn/system-prompt";
 import { resolveSpawnAdmission } from "../src/agent/spawn/spawn-plan";
 import { RoomBus } from "../src/room/bus";
 import { Workboard } from "../src/workboard/board";
@@ -187,35 +182,14 @@ describe("task name（移植自 subagent-task-name.ts）", () => {
   });
 });
 
-describe("spawn envelope（移植自 subagent-system-prompt.ts）", () => {
-  it("常设指令按深度区分协调者与末端执行者", () => {
-    const orchestrator = buildSubagentStandingInstructions({ spawnMode: "session", childDepth: 1, maxSpawnDepth: 5 });
-    expect(orchestrator).toContain("下派子成员");
-    expect(orchestrator).toContain("可以为并行/复杂工作下派后代成员");
-    const leaf = buildSubagentStandingInstructions({ spawnMode: "session", childDepth: 5, maxSpawnDepth: 5 });
-    expect(leaf).toContain("末端执行者：不能再下派");
-  });
-
-  it("任务消息把 [子成员任务] 包在内部运行时上下文标记内", () => {
-    const envelope = buildSubagentSpawnEnvelope({
-      completionMode: "announce",
-      spawnMode: "session",
-      task: "调研调度方式",
-      requesterName: "主智能体",
-      childName: "研究员",
-      childDepth: 1,
-      maxSpawnDepth: 5,
-    });
-    expect(envelope.message).toContain(INTERNAL_RUNTIME_CONTEXT_BEGIN);
-    expect(envelope.message).toContain("[子成员任务]");
-    expect(envelope.message).toContain("调研调度方式");
-    expect(envelope.acceptedNote).toContain("交回派发方");
-  });
-
-  it("resolveSpawnMode 与 OpenClaw 一致：显式优先，thread 请求转 session", () => {
-    expect(resolveSpawnMode({ requestedMode: "run", threadRequested: true })).toBe("run");
-    expect(resolveSpawnMode({ threadRequested: true })).toBe("session");
-    expect(resolveSpawnMode({ threadRequested: false })).toBe("run");
+describe("常设子成员指令（移植自 subagent-system-prompt.ts）", () => {
+  it("不再提供下派指引，任何深度都写明不能创建成员", () => {
+    const session = buildSubagentStandingInstructions({ spawnMode: "session" });
+    expect(session).toContain("不能创建或下派子成员");
+    expect(session).not.toContain("spawn_member");
+    expect(session).not.toContain("可以为并行/复杂工作下派后代成员");
+    const run = buildSubagentStandingInstructions({ spawnMode: "run" });
+    expect(run).toContain("临时性");
   });
 });
 
@@ -238,56 +212,26 @@ function makeMember(overrides: Partial<Member>): Member {
   };
 }
 
-describe("能力门控的工具面", () => {
-  it("spawn_member 始终注册，但 leaf 调用被执行侧护栏拒绝", async () => {
+describe("工具面不含创建成员通道", () => {
+  it("主智能体与子成员的工具列表都没有 spawn_member", async () => {
     const dir = await mkdtemp(join(tmpdir(), "ac-spawn-"));
     tempDirs.push(dir);
     const bus = new RoomBus("room_test", "测试群");
     const board = new Workboard("room_test");
     const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
     await skills.init();
-    const deps = {
-      bus,
-      board,
-      limits: DEFAULT_LIMITS,
-      skills,
-      userId: "u_test",
-      spawn: async () => "unused",
-    };
-    const leaf = makeMember({ controlScope: "none" });
-    const leafTools = buildTools(leaf, deps);
-    expect(leafTools.map((tool) => tool.schema.name)).toContain("spawn_member");
-    const leafSpawn = leafTools.find((tool) => tool.schema.name === "spawn_member");
-    const rejected = await leafSpawn?.execute({ name: "乙", task: "不该成功" }, new AbortController().signal);
-    expect(String(rejected)).toContain("末端执行者不能再下派");
+    const deps = { bus, board, skills, userId: "u_test" };
 
-    const orchestratorMember = makeMember({ controlScope: "children" });
-    const orchTools = buildTools(orchestratorMember, deps);
-    expect(orchTools.map((tool) => tool.schema.name)).toContain("spawn_member");
-    const orchSpawn = orchTools.find((tool) => tool.schema.name === "spawn_member");
-    const allowed = await orchSpawn?.execute({ name: "乙", task: "任务" }, new AbortController().signal);
-    expect(String(allowed)).toBe("unused");
-  });
-
-  it("深度达上限的协调成员调用 spawn_member 时得到嵌套深度拒绝文案", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "ac-spawn-"));
-    tempDirs.push(dir);
-    const bus = new RoomBus("room_test", "测试群");
-    const board = new Workboard("room_test");
-    const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
-    await skills.init();
-    const deps = {
-      bus,
-      board,
-      limits: { ...DEFAULT_LIMITS, maxSpawnDepth: 2 },
-      skills,
-      userId: "u_test",
-      spawn: async () => "unused",
-    };
-    const atCap = makeMember({ controlScope: "children", depth: 2 });
-    const spawnTool = buildTools(atCap, deps).find((tool) => tool.schema.name === "spawn_member");
-    const result = await spawnTool?.execute({ name: "丙", task: "任务" }, new AbortController().signal);
-    expect(String(result)).toContain("嵌套深度已达上限");
+    for (const member of [
+      makeMember({ id: "m_main", role: "main", depth: 0, spawnedBy: null, controlScope: "children" }),
+      makeMember({ controlScope: "children" }),
+      makeMember({ controlScope: "none" }),
+    ]) {
+      const names = buildTools(member, deps).map((tool) => tool.schema.name);
+      expect(names).not.toContain("spawn_member");
+      expect(names).toContain("use_skill");
+      expect(names).toContain("task_update");
+    }
   });
 });
 
@@ -323,91 +267,142 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
   }
 }
 
-describe("orchestrator spawn 管线端到端", () => {
-  it("主→协调成员→末端子成员两级下派，信封与回执符合移植语义", async () => {
+describe("运行时禁止动态创建成员", () => {
+  it("模型试图调用 spawn_member 时得到未知工具错误，且不会生成成员", async () => {
+    const results: string[] = [];
+    let phase = 0;
     const handler: MockHandler = (request) => {
       const system = request.messages[0]?.content ?? "";
-      const steps = request.messages.filter((message) => message.role === "assistant").length;
-      const userText = request.messages
-        .filter((message) => message.role === "user")
-        .map((message) => message.content)
-        .join("\n");
-      if (system.includes("里的主智能体")) {
-        if (userText.includes("交回了结果")) return { text: "综合结论完成。" };
-        if (steps === 0) {
-          return { toolCalls: [{ name: "spawn_member", args: { name: "协调员", task: "拆分并完成调研" } }] };
-        }
-        return { text: "已派给协调员。" };
+      if (!system.includes("里的主智能体")) return { text: "收到" };
+      if (phase === 0) {
+        phase = 1;
+        return { toolCalls: [{ name: "spawn_member", args: { name: "甲", task: "任务甲" } }] };
       }
-      if (system.includes("协调者（orchestrator")) {
-        if (steps === 0) {
-          return { toolCalls: [{ name: "spawn_member", args: { name: "调研员", task: "收集资料" } }] };
-        }
-        return { text: "协调员结论：资料已齐。" };
-      }
-      return { text: "末端结论：只做了分派任务。" };
+      return { text: "我不能自己创建成员。" };
     };
 
-    const { bus, orchestrator } = await makeRig(handler, { maxSpawnDepth: 2 });
+    const { bus, orchestrator } = await makeRig(handler);
+    bus.subscribe((event) => {
+      if (event.type === "run" && event.event.type === "tool-result") {
+        results.push(event.event.content);
+      }
+    });
 
-    orchestrator.sendUserMessage("两级下派试试");
-
-    await waitFor(() => Boolean(bus.findMemberByName("协调员")));
-    const coordinator = bus.findMemberByName("协调员");
-    expect(coordinator?.depth).toBe(1);
-    expect(coordinator?.controlScope).toBe("children");
-
-    const dispatch = bus
-      .listMessages()
-      .find((message) => message.text.startsWith("@协调员"));
-    expect(dispatch?.text).toContain("[子成员任务]");
-    expect(dispatch?.mentions).toContain(coordinator?.id);
-
-    await waitFor(() => Boolean(bus.findMemberByName("调研员")));
-    const leaf = bus.findMemberByName("调研员");
-    expect(leaf?.depth).toBe(2);
-    expect(leaf?.controlScope).toBe("none");
-
-    await waitFor(() =>
-      bus.listMessages().some((message) => message.senderId === leaf?.id && message.kind === "announce"),
-    );
-    await waitFor(() =>
-      bus.listMessages().some((message) => message.senderId === coordinator?.id && message.kind === "announce"),
-    );
+    orchestrator.sendUserMessage("新建一个研究员");
+    await waitFor(() => results.length > 0);
+    expect(results[0]).toContain("没有名为 spawn_member 的工具");
+    expect(bus.findMemberByName("甲")).toBeUndefined();
+    expect(bus.listMembers().filter((member) => member.role === "sub")).toHaveLength(0);
     await waitFor(() => orchestrator.activeRuns === 0);
   });
+});
 
-  it("达深度上限的成员是 leaf：提示词写明不能再下派，且派发被准入拒绝", async () => {
+describe("orchestrator.createMember（用户直接新建成员）", () => {
+  it("按名字与描述创建 idle 子成员：记下 brief、广播系统消息、不派发任务", async () => {
+    const { bus, board, orchestrator } = await makeRig(() => ({ text: "不该被调用" }));
+
+    const member = await orchestrator.createMember({
+      name: "调研员",
+      description: "负责检索资料并给出带出处的结论",
+    });
+
+    expect(member).toMatchObject({
+      name: "调研员",
+      role: "sub",
+      status: "idle",
+      depth: 1,
+      spawnedBy: "m_main",
+      controlScope: "children",
+      brief: "负责检索资料并给出带出处的结论",
+    });
+    expect(bus.findMemberByName("调研员")?.id).toBe(member.id);
+    expect(board.list()).toHaveLength(0);
+    expect(orchestrator.activeRuns).toBe(0);
+
+    const last = bus.listMessages().at(-1);
+    expect(last).toMatchObject({ senderKind: "system", kind: "system" });
+    expect(last?.text).toContain("@调研员");
+    expect(last?.text).toContain("负责检索资料并给出带出处的结论");
+  });
+
+  it("重名、保留名、空描述与成员数上限都会被拒绝，且不会留下半成品成员", async () => {
+    const { bus, orchestrator } = await makeRig(() => ({ text: "不该被调用" }), {
+      maxChildrenPerAgent: 1,
+    });
+
+    await orchestrator.createMember({ name: "甲", description: "第一个成员" });
+    await expect(
+      orchestrator.createMember({ name: "甲", description: "重名" }),
+    ).rejects.toThrow(/已存在/);
+    await expect(
+      orchestrator.createMember({ name: "系统", description: "保留名" }),
+    ).rejects.toThrow(/保留/);
+    await expect(
+      orchestrator.createMember({ name: "乙", description: "   " }),
+    ).rejects.toThrow(/功能描述/);
+    await expect(
+      orchestrator.createMember({ name: "丙", description: "成员数已满" }),
+    ).rejects.toThrow(/上限/);
+
+    expect(bus.listMembers().filter((item) => item.role === "sub")).toHaveLength(1);
+  });
+});
+
+describe("orchestrator.removeMember（用户移除成员）", () => {
+  it("移除子成员：摘出花名册、任务改未指派、广播系统消息，迟到的状态更新不得复活", async () => {
+    const events: string[] = [];
+    const { bus, board, orchestrator } = await makeRig(() => ({ text: "不该被调用" }));
+    bus.subscribe((event) => {
+      if (event.type === "member-removed") events.push(event.memberId);
+    });
+    const member = await orchestrator.createMember({ name: "资料员", description: "整理资料并归档" });
+    const task = board.create({ title: "整理季度资料", createdBy: "m_main", ownerId: member.id });
+
+    const removed = await orchestrator.removeMember(member.id);
+
+    expect(removed.id).toBe(member.id);
+    expect(events).toEqual([member.id]);
+    expect(bus.getMember(member.id)).toBeUndefined();
+    expect(bus.findMemberByName("资料员")).toBeUndefined();
+    expect(board.get(task.id)?.ownerId).toBeNull();
+    const last = bus.listMessages().at(-1);
+    expect(last).toMatchObject({ senderKind: "system", kind: "system" });
+    expect(last?.text).toContain("@资料员");
+    expect(last?.text).toContain("未指派");
+
+    // 运行中迟到的状态更新不能把已移除成员写回花名册。
+    bus.updateMember({ ...member, status: "idle" });
+    expect(bus.getMember(member.id)).toBeUndefined();
+  });
+
+  it("主智能体与不存在的成员不能移除", async () => {
+    const { orchestrator } = await makeRig(() => ({ text: "ok" }));
+    await expect(orchestrator.removeMember("m_main")).rejects.toThrow(/主智能体/);
+    await expect(orchestrator.removeMember("m_missing")).rejects.toThrow(/不存在/);
+  });
+
+  it("运行中的成员被移除时取消运行，迟到的结果不会发到群里", async () => {
+    const gate: { release: (() => void) | null } = { release: null };
     const handler: MockHandler = (request) => {
       const system = request.messages[0]?.content ?? "";
-      const steps = request.messages.filter((message) => message.role === "assistant").length;
-      if (system.includes("里的主智能体")) {
-        if (steps === 0) {
-          return { toolCalls: [{ name: "spawn_member", args: { name: "一层", task: "继续派" } }] };
-        }
-        return { text: "等待报告。" };
+      if (system.includes("里的成员")) {
+        return new Promise((resolve) => {
+          gate.release = () => resolve({ text: "迟到的结论" });
+        });
       }
-      if (system.includes("末端执行者（leaf") && steps === 0) {
-        return { toolCalls: [{ name: "spawn_member", args: { name: "二层", task: "不该成功" } }] };
-      }
-      return { text: "收到" };
+      return { text: "已派发。" };
     };
+    const { bus, orchestrator } = await makeRig(handler);
+    const member = await orchestrator.createMember({ name: "调研员", description: "调研" });
 
-    const { bus, orchestrator } = await makeRig(handler, { maxSpawnDepth: 1 });
-
-    orchestrator.sendUserMessage("深度封顶测试");
-    await waitFor(() => Boolean(bus.findMemberByName("一层")));
-    const first = bus.findMemberByName("一层");
-    expect(first?.controlScope).toBe("none");
-    expect(bus.findMemberByName("二层")).toBeUndefined();
-
-    // 准入层验证：depth=1 的成员在 max=1 下再派会命中嵌套深度上限。
-    const admission = resolveSpawnAdmission({
-      callerDepth: 1,
-      limits: { maxSpawnDepth: 1 },
-      activeChildren: 0,
-    });
-    expect(admission.ok).toBe(false);
+    orchestrator.sendUserMessage("@调研员 开始调研");
+    await waitFor(() => bus.getMember(member.id)?.status === "running");
+    await orchestrator.removeMember(member.id);
+    await waitFor(() => gate.release !== null);
+    gate.release?.();
     await waitFor(() => orchestrator.activeRuns === 0);
+
+    expect(bus.listMessages().some((message) => message.senderId === member.id)).toBe(false);
+    expect(bus.getMember(member.id)).toBeUndefined();
   });
 });

@@ -59,6 +59,13 @@ export interface Member {
   controlScope: ControlScope;
   contextMode: ContextMode;
   systemPrompt: string;
+  /** 用户的角色描述（新建成员时填写）：生成成员档案、写进子成员提示词。 */
+  brief?: string;
+  /**
+   * 该成员可用的技能白名单（对应 OpenClaw 的 agents.entries.*.skills）；
+   * undefined = 跟随技能库全部可用技能，[] = 全部禁用。
+   */
+  skillNames?: string[];
   providerId: string;
   createdAt: number;
   lastActiveAt: number;
@@ -118,6 +125,7 @@ export type AgentEvent =
 export type RoomEvent =
   | { type: "message"; message: RoomMessage }
   | { type: "member"; member: Member }
+  | { type: "member-removed"; memberId: string }
   | { type: "task"; task: TaskCard }
   | { type: "run"; event: AgentEvent }
   | { type: "notice"; text: string };

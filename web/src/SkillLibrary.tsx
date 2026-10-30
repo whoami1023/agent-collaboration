@@ -3,9 +3,12 @@ import type { ChangeEvent, FormEvent } from "react";
 import {
   createSkill,
   deleteSkill,
+  fetchSkillFile,
   fetchSkills,
   importSkills,
   updateSkill,
+  type SkillFileInput,
+  type SkillFileView,
   type SkillImportResult,
   type SkillScope,
   type SkillSnapshot,
@@ -28,6 +31,83 @@ function messageOf(err: unknown): string {
 
 function scopeLabel(scope: SkillScope): string {
   return scope === "shared" ? "共享" : "个人";
+}
+
+const MAX_SKILL_MD_BYTES = 256 * 1024;
+const MAX_IMPORT_ENTRIES = 200;
+const MAX_SKILL_FILES = 40;
+const SKILL_ENTRY_RE = /(?:^|\/)SKILL\.md$/i;
+/** macOS/Windows 压缩与目录遍历产生的噪音文件，与服务端一致地丢弃。 */
+const IGNORED_PATH_RE = /(^|\/)(?:__MACOSX\/|\.DS_Store$|Thumbs\.db$|desktop\.ini$|\/\.)/i;
+
+function formatBytes(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+/** 浏览器里的一个待上传文件：文本按 utf8 存，图片等二进制转 base64。 */
+interface PendingFile {
+  path: string;
+  content: string;
+  encoding: "utf8" | "base64";
+  size: number;
+}
+
+async function readPendingFile(file: File, path: string): Promise<PendingFile> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  try {
+    return {
+      path,
+      content: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      encoding: "utf8",
+      size: bytes.byteLength,
+    };
+  } catch {
+    return { path, content: toBase64(bytes), encoding: "base64", size: bytes.byteLength };
+  }
+}
+
+function pendingToInput(file: PendingFile): SkillFileInput {
+  return { path: file.path, content: file.content, encoding: file.encoding };
+}
+
+/** 待导入清单按 SKILL.md 所在目录分组，与服务端一致地给出"几个技能、几个附带文件"。 */
+function pendingSummary(entries: PendingFile[]): string {
+  const roots = entries.filter((file) => SKILL_ENTRY_RE.test(file.path)).length;
+  if (roots === 0) return `${entries.length} 个文件，缺少 SKILL.md`;
+  const extras = entries.length - roots;
+  return `${roots} 个技能${extras ? ` · ${extras} 个附带文件` : ""}`;
+}
+
+function pendingBytes(entries: { size: number }[]): number {
+  return entries.reduce((sum, file) => sum + file.size, 0);
+}
+
+function viewedToInput(file: SkillFileView, content: string): SkillFileInput {
+  return { path: file.path, content, encoding: file.encoding };
+}
+
+/** 打包成一个技能的目录里，SKILL.md 之外还能有脚本、参考资料、模板。 */
+function fileCountLabel(skill: SkillView): string | null {
+  const count = skill.files?.length ?? 0;
+  if (count === 0) return null;
+  const total = (skill.files ?? []).reduce((sum, file) => sum + file.size, 0);
+  return `${count} 个附带文件 · ${formatBytes(total)}`;
+}
+
+/** 附带文件按目录分组展示，顺序和存储里一致（按路径排序）。 */
+function filesOf(skill: SkillView): SkillFileView[] {
+  return skill.files ?? [];
 }
 
 export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) {
@@ -198,6 +278,7 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
                       </span>
                       {skill.builtin && <span className="chip">内置</span>}
                       {skill.imported && <span className="chip">导入</span>}
+                      {fileCountLabel(skill) && <span className="chip">{fileCountLabel(skill)}</span>}
                       <span className="skill-owner">
                         {skill.builtin
                           ? "随系统预装"
@@ -300,6 +381,7 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
             <p className="skill-desc">{mode.skill.description}</p>
             {mode.skill.source && <p className="hint">来源：{mode.skill.source}</p>}
             <pre className="skill-read">{mode.skill.instructions}</pre>
+            <SkillFilesView key={mode.skill.id} skill={mode.skill} />
           </div>
         )}
 
@@ -346,14 +428,7 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
   );
 }
 
-interface PendingFile {
-  filename: string;
-  content: string;
-}
-
-const MAX_SKILL_MD_BYTES = 256 * 1024;
-const MAX_IMPORT_FILES = 20;
-/** React 的类型里没有这两个非标准的「选整个目录」属性。 */
+/** React 的类型里没有这个非标准的「选整个目录」属性。 */
 const FOLDER_PICK_ATTRS = { webkitdirectory: "", directory: "" } as unknown as Record<string, string>;
 
 /** 导入面板：SKILL.md 文件（可多选）或直接粘贴内容，逐条给出结果。 */
@@ -385,10 +460,9 @@ function SkillImportView({
     const skipped: string[] = [];
     for (const file of picked) {
       const path = file.webkitRelativePath || file.name;
-      // 目录导入时一个目录就是一个技能：只收 SKILL.md，忽略 references/、scripts/ 等附属文件。
-      if (fromFolder && !/(?:^|\/)SKILL\.md$/i.test(path)) continue;
-      if (loaded.length + files.length >= MAX_IMPORT_FILES) {
-        skipped.push("超出单次 20 份的上限");
+      if (IGNORED_PATH_RE.test(path)) continue;
+      if (loaded.length + files.length >= MAX_IMPORT_ENTRIES) {
+        skipped.push(`单次最多 ${MAX_IMPORT_ENTRIES} 个文件，其余请分批发起导入`);
         break;
       }
       if (file.size > MAX_SKILL_MD_BYTES) {
@@ -396,16 +470,24 @@ function SkillImportView({
         continue;
       }
       try {
-        loaded.push({ filename: path, content: await file.text() });
+        loaded.push(await readPendingFile(file, path));
       } catch (err) {
         skipped.push(`${path} 读取失败：${messageOf(err)}`);
       }
     }
-    if (loaded.length) setFiles((current) => [...current, ...loaded]);
+    const merged = new Map(files.map((file) => [file.path.toLowerCase(), file]));
+    for (const file of loaded) merged.set(file.path.toLowerCase(), file);
+    const combined = [...merged.values()];
+    if (loaded.length) setFiles(combined);
     setResults(null);
     if (skipped.length) setError(`部分文件未加入：${skipped.join("；")}。`);
-    else if (!loaded.length && fromFolder)
-      setError("这个目录里没有 SKILL.md。OpenClaw 技能是一个装有 SKILL.md 的文件夹。");
+    else if (!combined.some((file) => SKILL_ENTRY_RE.test(file.path))) {
+      setError(
+        fromFolder
+          ? "这个目录里没有 SKILL.md。技能是一个装有 SKILL.md 的文件夹，脚本与资料会随它一起导入。"
+          : "没找到 SKILL.md：请直接选 SKILL.md，或改用「选择技能文件夹」。",
+      );
+    }
   }
 
   function handlePick(event: ChangeEvent<HTMLInputElement>) {
@@ -420,8 +502,8 @@ function SkillImportView({
     void addPicked(picked, true);
   }
 
-  function removeFile(index: number) {
-    setFiles((current) => current.filter((_, position) => position !== index));
+  function removeFile(path: string) {
+    setFiles((current) => current.filter((file) => file.path !== path));
     setResults(null);
   }
 
@@ -429,13 +511,24 @@ function SkillImportView({
     event.preventDefault();
     if (busy) return;
     const payload: PendingFile[] = [...files];
-    if (pasted.trim()) payload.push({ filename: "pasted-SKILL.md", content: pasted });
+    if (pasted.trim()) {
+      payload.push({
+        path: "pasted/SKILL.md",
+        content: pasted,
+        encoding: "utf8",
+        size: new TextEncoder().encode(pasted).length,
+      });
+    }
     if (!payload.length) {
-      setError("请选择至少一个 SKILL.md 文件，或把内容粘贴到文本框。");
+      setError("请选择技能文件夹或 SKILL.md，也可以把 SKILL.md 内容粘贴到文本框。");
       return;
     }
-    if (payload.length > MAX_IMPORT_FILES) {
-      setError(`单次最多导入 ${MAX_IMPORT_FILES} 份技能，请减少文件数量。`);
+    if (payload.length > MAX_IMPORT_ENTRIES) {
+      setError(`单次最多 ${MAX_IMPORT_ENTRIES} 个文件（含附带文件），请减少数量或分批发起导入。`);
+      return;
+    }
+    if (!payload.some((file) => SKILL_ENTRY_RE.test(file.path))) {
+      setError("待导入内容里没有 SKILL.md，无法识别技能。");
       return;
     }
     setBusy(true);
@@ -445,7 +538,11 @@ function SkillImportView({
       const response = await importSkills({
         scope,
         overwrite,
-        files: payload.map((item) => ({ filename: item.filename, content: item.content })),
+        files: payload.map((item) => ({
+          filename: item.path,
+          content: item.content,
+          encoding: item.encoding,
+        })),
       });
       setResults(response.results);
       setPasted("");
@@ -471,8 +568,9 @@ function SkillImportView({
       </div>
 
       <p className="hint">
-        支持 OpenClaw 风格的 SKILL.md：YAML frontmatter 里的 name / description 作为技能名与描述，
-        正文作为完整说明。可以一次选多个文件，也可以直接粘贴内容。
+        一个技能是一个文件夹：SKILL.md 是入口（frontmatter 的 name / description 作为技能名与描述，
+        正文作为完整说明），scripts/、references/ 等附带文件会一起导入，智能体用 read_skill_file 读取。
+        可以直接选整个技能文件夹、多选 SKILL.md，或粘贴内容。
       </p>
 
       <div className="skill-import-scope">
@@ -523,19 +621,32 @@ function SkillImportView({
           选择技能文件夹
         </button>
         <span className="hint">
-          {files.length ? `已选 ${files.length} 个文件` : "单个文件，或整个技能文件夹"}
+          {files.length
+            ? `${pendingSummary(files)} · ${formatBytes(pendingBytes(files))}`
+            : "整个技能文件夹（含脚本、资料），或单个 SKILL.md"}
         </span>
       </div>
 
       {files.length > 0 && (
         <ul className="skill-import-files">
-          {files.map((file, index) => (
-            <li key={`${file.filename}-${index}`}>
-              <span className="skill-import-file-name" title={`${file.content.length} 字符`}>
-                {file.filename}
+          {files.map((file) => (
+            <li key={file.path}>
+              <span
+                className={`skill-import-file-name${
+                  SKILL_ENTRY_RE.test(file.path) ? " entry" : ""
+                }`}
+                title={file.path}
+              >
+                {file.path}
+                {SKILL_ENTRY_RE.test(file.path) && <em className="skill-file-tag">入口</em>}
+                {file.encoding === "base64" && <em className="skill-file-tag">二进制</em>}
               </span>
-              <span className="skill-import-file-size">{Math.round(file.content.length / 1024)} KB</span>
-              <button type="button" className="btn ghost sm" onClick={() => removeFile(index)}>
+              <span className="skill-import-file-size">{formatBytes(file.size)}</span>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => removeFile(file.path)}
+              >
                 移除
               </button>
             </li>
@@ -561,7 +672,7 @@ function SkillImportView({
           checked={overwrite}
           onChange={(event) => setOverwrite(event.target.checked)}
         />
-        同名技能直接覆盖（更新描述与说明）
+        同名技能直接覆盖（更新描述、说明与附带文件）
       </label>
 
       {error && <p className="form-error">{error}</p>}
@@ -602,6 +713,80 @@ function SkillImportView({
   );
 }
 
+/** 详情里的附带文件清单：点开才按需拉正文，二进制只说明大小。 */
+function SkillFilesView({ skill }: { skill: SkillView }) {
+  const [openPath, setOpenPath] = useState<string | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const files = filesOf(skill);
+  if (files.length === 0) return null;
+
+  async function toggle(file: SkillFileView) {
+    setError(null);
+    if (openPath === file.path) {
+      setOpenPath(null);
+      setPreview(null);
+      return;
+    }
+    setOpenPath(file.path);
+    setPreview(null);
+    setNote(null);
+    if (file.encoding === "base64") {
+      setNote(`二进制文件（${formatBytes(file.size)}），作战室内不预览正文。智能体可读取路径与大小。`);
+      return;
+    }
+    setBusy(true);
+    try {
+      const content = await fetchSkillFile(skill.id, file.path);
+      const text = content.content;
+      const limit = 20000;
+      setPreview(text.length > limit ? `${text.slice(0, limit)}\n…（共 ${text.length} 字符，已截断）` : text);
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="skill-files-view">
+      <div className="skill-files-head">
+        <span className="field-label">
+          附带文件
+          <em>{files.length} 个 · {formatBytes(pendingBytes(files))}</em>
+        </span>
+        <span className="hint">智能体用 read_skill_file 按路径读取</span>
+      </div>
+      <ul className="skill-files-list">
+        {files.map((file) => (
+          <li key={file.path} className={`skill-file-row${openPath === file.path ? " open" : ""}`}>
+            <button type="button" className="skill-file-toggle" onClick={() => void toggle(file)}>
+              <span className="skill-import-file-name" title={file.path}>
+                {file.path}
+              </span>
+              <span className="skill-import-file-size">
+                {formatBytes(file.size)}
+                {file.encoding === "base64" && <em className="skill-file-tag">二进制</em>}
+              </span>
+              <span className="skill-file-hint">{openPath === file.path ? "收起" : "查看"}</span>
+            </button>
+            {openPath === file.path && (
+              <div className="skill-file-body">
+                {error && <p className="form-error">{error}</p>}
+                {busy && <p className="hint">正在读取…</p>}
+                {note && <p className="hint">{note}</p>}
+                {preview !== null && <pre className="skill-read">{preview}</pre>}
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function SkillForm({
   scope,
   skill,
@@ -616,8 +801,68 @@ function SkillForm({
   const [name, setName] = useState(skill?.name ?? "");
   const [description, setDescription] = useState(skill?.description ?? "");
   const [instructions, setInstructions] = useState(skill?.instructions ?? "");
+  /** 库里已有且本次继续保留的附带文件：只带元信息，正文在保存时按需取回。 */
+  const [kept, setKept] = useState<SkillFileView[]>(skill?.files ?? []);
+  const [added, setAdded] = useState<PendingFile[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const attachInput = useRef<HTMLInputElement>(null);
+  const attachFolderInput = useRef<HTMLInputElement>(null);
+
+  async function addAttachments(picked: File[], fromFolder: boolean) {
+    if (!picked.length) return;
+    setError(null);
+    const loaded: PendingFile[] = [];
+    const skipped: string[] = [];
+    let skippedEntryFiles = 0;
+    for (const file of picked) {
+      let path = file.webkitRelativePath || file.name;
+      // 文件夹选择器给的路径带技能目录名，技能内部按目录根来存。
+      if (fromFolder) path = path.split("/").slice(1).join("/") || path;
+      if (IGNORED_PATH_RE.test(path)) continue;
+      if (SKILL_ENTRY_RE.test(path)) {
+        skippedEntryFiles += 1;
+        continue;
+      }
+      if (loaded.length + kept.length + added.length >= MAX_SKILL_FILES) {
+        skipped.push(`单个技能最多 ${MAX_SKILL_FILES} 个附带文件`);
+        break;
+      }
+      if (file.size > MAX_SKILL_MD_BYTES) {
+        skipped.push(`${path} 超过 256 KB`);
+        continue;
+      }
+      try {
+        loaded.push(await readPendingFile(file, path));
+      } catch (err) {
+        skipped.push(`${path} 读取失败：${messageOf(err)}`);
+      }
+    }
+    if (loaded.length) {
+      const byPath = new Map(added.map((file) => [file.path.toLowerCase(), file]));
+      for (const file of loaded) byPath.set(file.path.toLowerCase(), file);
+      setAdded([...byPath.values()]);
+      setKept((current) =>
+        current.filter((file) => !byPath.has(file.path.toLowerCase())),
+      );
+    }
+    const notes: string[] = [];
+    if (skippedEntryFiles) notes.push("SKILL.md 是技能说明本身，请写在下面的「完整说明」里，已自动跳过");
+    if (skipped.length) notes.push(`部分文件未加入：${skipped.join("；")}`);
+    setError(notes.length ? `${notes.join("；")}。` : null);
+  }
+
+  function handlePickFiles(event: ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    void addAttachments(picked, false);
+  }
+
+  function handlePickFolder(event: ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    void addAttachments(picked, true);
+  }
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
@@ -626,12 +871,21 @@ function SkillForm({
     setError(null);
     try {
       const payload = { name, description, instructions };
+      let files: SkillFileInput[] | undefined;
       if (skill) {
-        const saved = await updateSkill(skill.id, payload);
-        onSaved(saved, false);
+        const retained = await Promise.all(
+          kept.map(async (file) =>
+            viewedToInput(file, (await fetchSkillFile(skill.id, file.path)).content),
+          ),
+        );
+        files = [...retained, ...added.map(pendingToInput)];
+      } else if (added.length) {
+        files = added.map(pendingToInput);
+      }
+      if (skill) {
+        onSaved(await updateSkill(skill.id, { ...payload, ...(files ? { files } : {}) }), false);
       } else {
-        const saved = await createSkill({ scope, ...payload });
-        onSaved(saved, true);
+        onSaved(await createSkill({ scope, ...payload, ...(files ? { files } : {}) }), true);
       }
     } catch (err) {
       setError(messageOf(err));
@@ -639,6 +893,8 @@ function SkillForm({
       setBusy(false);
     }
   }
+
+  const attachmentCount = kept.length + added.length;
 
   return (
     <form className="skill-form" onSubmit={(event) => void handleSubmit(event)}>
@@ -697,6 +953,89 @@ function SkillForm({
       <p className="hint">
         智能体只在描述匹配时才调用 use_skill 读取这里的完整说明，所以描述要具体、说明要可执行。
       </p>
+
+      <div className="skill-files-editor">
+        <div className="skill-files-head">
+          <span className="field-label">
+            附带文件
+            <em>{attachmentCount ? `已选 ${attachmentCount} 个` : "可选"}</em>
+          </span>
+          <input
+            ref={attachInput}
+            type="file"
+            multiple
+            hidden
+            onChange={handlePickFiles}
+          />
+          <input
+            ref={attachFolderInput}
+            type="file"
+            multiple
+            hidden
+            onChange={handlePickFolder}
+            {...FOLDER_PICK_ATTRS}
+          />
+          <span className="skill-files-actions">
+            <button type="button" className="btn ghost sm" onClick={() => attachInput.current?.click()}>
+              <Icon name="import" />
+              添加文件
+            </button>
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() => attachFolderInput.current?.click()}
+            >
+              <Icon name="folder" />
+              添加文件夹
+            </button>
+          </span>
+        </div>
+        {(kept.length > 0 || added.length > 0) && (
+          <ul className="skill-files-list">
+            {kept.map((file) => (
+              <li key={file.path} className="skill-file-row">
+                <span className="skill-import-file-name" title={file.path}>
+                  {file.path}
+                </span>
+                <span className="skill-import-file-size">
+                  {formatBytes(file.size)}
+                  {file.encoding === "base64" && <em className="skill-file-tag">二进制</em>}
+                </span>
+                <button
+                  type="button"
+                  className="btn ghost sm danger"
+                  onClick={() => setKept((current) => current.filter((item) => item.path !== file.path))}
+                >
+                  删除
+                </button>
+              </li>
+            ))}
+            {added.map((file) => (
+              <li key={`${file.path}-new`} className="skill-file-row new">
+                <span className="skill-import-file-name" title={file.path}>
+                  {file.path}
+                  <em className="skill-file-tag">新添加</em>
+                </span>
+                <span className="skill-import-file-size">
+                  {formatBytes(file.size)}
+                  {file.encoding === "base64" && <em className="skill-file-tag">二进制</em>}
+                </span>
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => setAdded((current) => current.filter((item) => item.path !== file.path))}
+                >
+                  移除
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="hint">
+          脚本、参考资料、模板会随技能一起保存，智能体用 read_skill_file 按路径读取。
+          单个文件不超过 256 KB，一个技能最多 {MAX_SKILL_FILES} 个、合计 2 MB。
+        </p>
+      </div>
 
       {error && <p className="form-error">{error}</p>}
 

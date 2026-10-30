@@ -113,18 +113,6 @@ type ChildAdmissionReservationParams<TAdmission extends ReservableChildAdmission
   ) => TAdmission;
 };
 
-/** 与 resolveChildAdmission 深度拒绝分支同文案：执行侧护栏复用。 */
-export function spawnDepthRejectError(callerDepth: number, maxSpawnDepth: number): string {
-  return `当前层级不允许再创建成员（嵌套深度已达上限：当前深度 ${callerDepth}，上限 ${maxSpawnDepth}）。`;
-}
-
-/** 末端执行者工具面护栏文案：orchestrator 与 tools 层共用，保证报错一致。 */
-export const LEAF_SPAWN_REJECT_ERROR = "错误：末端执行者不能再下派成员，请只做分给你的任务并把结果交回";
-
-export function isSpawnDepthAllowed(callerDepth: number, maxSpawnDepth: number): boolean {
-  return isSubagentSpawnDepthAllowed(callerDepth, maxSpawnDepth);
-}
-
 /** 测试与进程内复位用。 */
 export function clearPendingChildAdmissions(): void {
   pendingChildAdmissions.clear();

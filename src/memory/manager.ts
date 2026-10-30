@@ -21,14 +21,16 @@
  * - 多模态、extraPaths、provenance、PostgreSQL 通道、跨进程 worker 不在移植范围。
  */
 
+import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { Member } from "../core/types";
 import type { RoomBus } from "../room/bus";
 import {
   extractCuratedEntryRecallMetadata,
   stripMemoryAnnotationCarriers,
 } from "./annotations";
-import { AGENT_FILE_ORDER } from "./bootstrap-files";
+import { AGENT_FILE_ORDER, ensureMemberAgentFiles } from "./bootstrap-files";
 import { chunkMarkdown, hashText, remapChunkLines, type MemoryChunk } from "./chunking";
 import type { MemoryEmbeddingProvider } from "./embedding";
 import { cosineSimilarity, HashProjectionEmbeddingProvider } from "./embedding";
@@ -56,6 +58,8 @@ const SNIPPET_MAX_CHARS = 700;
 const BM25_K1 = 1.2;
 const BM25_B = 0.75;
 const SESSION_MAX_MESSAGES = 500;
+/** 「智能体文件」面板的保存上限（256 KB，与技能文件的单文件口径一致）。 */
+const MAX_AGENT_FILE_BYTES = 256 * 1024;
 
 export interface MemorySearchSettings {
   chunking: { tokens: number; overlap: number };
@@ -326,7 +330,7 @@ export class MemorySearchManager {
 
   private async syncOnce(): Promise<void> {
     const entries: IndexedChunk[] = [];
-    const memoryFiles = await this.listMemoryFiles();
+    const memoryFiles = await this.listIndexMemoryFiles();
     const nextStates = new Map<string, FileState>();
     const nextMtimes = new Map<string, number>();
     for (const absPath of memoryFiles) {
@@ -521,12 +525,14 @@ export class MemorySearchManager {
     limit: number,
     sources: readonly MemorySource[],
     matchAny: boolean,
+    agentId?: string,
   ): BodyKeywordHit[] {
     if (queryTokens.length === 0) return [];
-    const totalDocs = this.chunks.length;
+    const visibleChunks = this.chunks.filter((chunk) => this.chunkVisibleTo(chunk.path, agentId));
+    const totalDocs = visibleChunks.length;
     const sourceSet = new Set(sources);
     const hits: BodyKeywordHit[] = [];
-    for (const chunk of this.chunks) {
+    for (const chunk of visibleChunks) {
       if (!sourceSet.has(chunk.source)) continue;
       const matched = queryTokens.filter((token) => this.tokenHitsDocument(token, chunk));
       if (matched.length === 0) continue;
@@ -558,13 +564,15 @@ export class MemorySearchManager {
     limit: number,
     sources: readonly MemorySource[],
     query: string,
+    agentId?: string,
   ): ExactPathHit[] {
     const matchExactPath = prepareExactPathMatcher(query);
     const sourceSet = new Set(sources);
-    const totalPaths = new Set(this.chunks.map((chunk) => `${chunk.source}:${chunk.path}`)).size || 1;
+    const visibleChunks = this.chunks.filter((chunk) => this.chunkVisibleTo(chunk.path, agentId));
+    const totalPaths = new Set(visibleChunks.map((chunk) => `${chunk.source}:${chunk.path}`)).size || 1;
     const results = new Map<string, ExactPathHit>();
     const firstChunks = new Map<string, IndexedChunk>();
-    for (const chunk of this.chunks) {
+    for (const chunk of visibleChunks) {
       const key = `${chunk.source}:${chunk.path}`;
       if (!firstChunks.has(key)) firstChunks.set(key, chunk);
     }
@@ -630,6 +638,8 @@ export class MemorySearchManager {
       lexicalOnly?: boolean;
       signal?: AbortSignal;
       nowMs?: number;
+      /** 子成员 ID：只让该成员检索到自己的 agents/<id>/ 记忆文件。 */
+      agentId?: string;
     },
   ): Promise<MemorySearchResult[]> {
     const normalizedQuery = query.trim();
@@ -654,10 +664,10 @@ export class MemorySearchManager {
       substring: literalSearchMatcher(token),
     }));
 
-    let bodyHits = this.searchBodyKeyword(queryTokens, candidates, sources, false);
-    const pathHits = this.searchPathKeyword(queryTokens, candidates, sources, normalizedQuery);
+    let bodyHits = this.searchBodyKeyword(queryTokens, candidates, sources, false, opts?.agentId);
+    const pathHits = this.searchPathKeyword(queryTokens, candidates, sources, normalizedQuery, opts?.agentId);
     if (bodyHits.length === 0 && pathHits.length === 0) {
-      bodyHits = this.searchBodyKeyword(queryTokens, candidates, sources, true);
+      bodyHits = this.searchBodyKeyword(queryTokens, candidates, sources, true, opts?.agentId);
     }
     const boosted = bodyHits.map((hit) => ({
       ...hit,
@@ -746,6 +756,7 @@ export class MemorySearchManager {
     const scoredVector: Array<{ hit: KeywordHit; vectorScore: number; exactPathSpecificity: 0 | 1 | 2 | 3 }> = [];
     for (const chunk of this.chunks) {
       if (!sourceSet.has(chunk.source) || chunk.embedding.length === 0) continue;
+      if (!this.chunkVisibleTo(chunk.path, opts?.agentId)) continue;
       const cosine = cosineSimilarity(queryVec, chunk.embedding);
       if (cosine <= 0) continue;
       scoredVector.push({
@@ -883,6 +894,32 @@ export class MemorySearchManager {
     return result;
   }
 
+  /** 检索语料 = 共享记忆 + 每个子成员自己的 MEMORY.md / USER.md（按成员作用域过滤）。 */
+  private async listIndexMemoryFiles(): Promise<string[]> {
+    const result = await this.listMemoryFiles();
+    const agentsDir = path.join(this.options.workspaceDir, "agents");
+    let entries: Dirent[] = [];
+    try {
+      entries = await fs.readdir(agentsDir, { withFileTypes: true });
+    } catch {
+      return result;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      for (const name of MEMBER_MEMORY_FILES) {
+        const abs = path.join(agentsDir, entry.name, name);
+        if (await isRegularMarkdown(abs)) result.push(abs);
+      }
+    }
+    return result;
+  }
+
+  /** 子成员记忆只对它自己可见；共享语料（根部记忆、群聊转录）对所有成员可见。 */
+  private chunkVisibleTo(relPath: string, agentId: string | undefined): boolean {
+    if (!relPath.startsWith("agents/")) return true;
+    return agentId !== undefined && relPath.startsWith(`agents/${agentId}/`);
+  }
+
   private async buildFileEntry(absPath: string): Promise<FileState | null> {
     try {
       const stat = await fs.stat(absPath);
@@ -897,8 +934,18 @@ export class MemorySearchManager {
     }
   }
 
-  /** Web 端「智能体文件」面板清单：记忆语料 + 身份/性格文件，按 bootstrap 顺序排列。 */
-  async listAgentFiles(): Promise<Array<{ path: string; sizeBytes: number; updatedAt: number }>> {
+  /**
+   * Web 端「智能体文件」面板清单：记忆语料 + 身份/性格文件，按 bootstrap 顺序排列。
+   * 选中子成员时改列它自己的档案（agents/<id>/），主智能体维持工作区根部的文件。
+   */
+  async listAgentFiles(
+    memberId?: string,
+  ): Promise<Array<{ path: string; sizeBytes: number; updatedAt: number }>> {
+    const member = memberId ? this.options.bus.getMember(memberId) : undefined;
+    if (member && member.role !== "main") {
+      await this.ensureMemberFiles(member);
+      return this.listMemberAgentFiles(member.id);
+    }
     const { workspaceDir } = this.options;
     const files = await this.listMemoryFiles();
     for (const name of NON_MEMORY_AGENT_FILES) {
@@ -921,27 +968,116 @@ export class MemorySearchManager {
     );
   }
 
-  /** 「智能体文件」面板的读取口径：记忆根之外还允许工作区根部的身份文件。 */
-  async readAgentFile(
-    relPath: string,
-  ): Promise<{ content: string; truncated: boolean; totalLines: number; more: boolean }> {
-    return this.readWithin(
-      relPath,
-      (abs, root) => isMemoryRootPath(abs, root) || NON_MEMORY_AGENT_FILES.some((name) => abs === path.join(root, name)),
-      `只允许读取 MEMORY.md、USER.md、SOUL.md、IDENTITY.md 或 memory/ 下的文件：${relPath}`,
+  /** 子成员的档案目录第一次被打开时按其角色描述生成默认文件（只补缺失项）。 */
+  private async ensureMemberFiles(member: Member): Promise<void> {
+    const created = await this.ensureMemberProfile(member);
+    if (created.length > 0) this.markDirty();
+  }
+
+  /** 生成子成员的默认档案（SOUL.md / IDENTITY.md），返回本次新建的文件名。 */
+  async ensureMemberProfile(member: Member, parentName?: string): Promise<string[]> {
+    const parent = parentName ?? (member.spawnedBy ? this.options.bus.getMember(member.spawnedBy)?.name : undefined);
+    const brief = member.brief?.trim();
+    return ensureMemberAgentFiles(this.options.workspaceDir, member.id, {
+      memberName: member.name,
+      brief: brief ? brief.slice(0, 800) : "由用户创建的成员，等待分配任务；职责写在给你的简报里。",
+      roomName: this.options.bus.roomName,
+      parentName: parent ?? "主智能体",
+    });
+  }
+
+  /** 移除成员时删除它的档案目录 agents/<id>/；目录不存在视为已清理。 */
+  async removeMemberProfile(memberId: string): Promise<void> {
+    const agentsRoot = path.resolve(this.options.workspaceDir, "agents");
+    const dir = path.resolve(agentsRoot, memberId);
+    if (!dir.startsWith(`${agentsRoot}${path.sep}`)) throw new Error("成员 ID 不合法");
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+
+  private async listMemberAgentFiles(
+    memberId: string,
+  ): Promise<Array<{ path: string; sizeBytes: number; updatedAt: number }>> {
+    const dir = path.join(this.options.workspaceDir, "agents", memberId);
+    let entries: Dirent[] = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      entries = [];
+    }
+    const listed: Array<{ path: string; sizeBytes: number; updatedAt: number }> = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+      const abs = path.join(dir, entry.name);
+      const file = await this.buildFileEntry(abs);
+      if (!file) continue;
+      const stat = await fs.stat(abs).catch(() => null);
+      if (!stat) continue;
+      listed.push({ path: file.path, sizeBytes: stat.size, updatedAt: stat.mtimeMs });
+    }
+    return listed.sort(
+      (left, right) => agentFileRank(left.path) - agentFileRank(right.path) || left.path.localeCompare(right.path),
     );
   }
 
-  /** memory_get 的安全读取：路径必须解析回工作区内且属于记忆根。 */
-  async readFile(
+  /**
+   * 「智能体文件」面板的读取口径：记忆根、工作区根部的身份文件，以及子成员档案。
+   * 默认按预览行数截断；编辑时传 full 取全文，避免保存时覆盖掉预览之外的内容。
+   */
+  async readAgentFile(
     relPath: string,
-    params?: { from?: number; lines?: number },
+    options?: { full?: boolean },
   ): Promise<{ content: string; truncated: boolean; totalLines: number; more: boolean }> {
     return this.readWithin(
       relPath,
-      (abs, root) => isMemoryRootPath(abs, root),
-      `只允许读取 MEMORY.md、USER.md 或 memory/ 下的文件：${relPath}`,
-      params,
+      isAgentFileAllowed,
+      `只允许读写 MEMORY.md、USER.md、SOUL.md、IDENTITY.md、memory/ 或 agents/<id>/ 下的文件：${relPath}`,
+      options?.full ? { from: 1, lines: Number.MAX_SAFE_INTEGER, full: true } : undefined,
+    );
+  }
+
+  /** 面板里的就地编辑：同一个白名单，落盘后重建记忆索引。 */
+  async writeAgentFile(
+    relPath: string,
+    content: unknown,
+  ): Promise<{ path: string; sizeBytes: number; totalLines: number }> {
+    if (typeof content !== "string") throw new Error("文件内容必须是文本");
+    if (content.includes("\0")) throw new Error("文件内容必须是文本，不能包含二进制字符");
+    const sizeBytes = Buffer.byteLength(content, "utf8");
+    if (sizeBytes > MAX_AGENT_FILE_BYTES) {
+      throw new Error(`文件不能超过 ${MAX_AGENT_FILE_BYTES / 1024} KB`);
+    }
+    const normalized = String(relPath).trim().replaceAll("\\", "/").replace(/^\.\//, "");
+    if (!normalized || path.isAbsolute(normalized)) throw new Error(`路径不合法：${relPath}`);
+    const workspaceRoot = path.resolve(this.options.workspaceDir);
+    const absPath = path.resolve(workspaceRoot, normalized);
+    if (!isAgentFileAllowed(absPath, workspaceRoot)) {
+      throw new Error(`只允许读写 MEMORY.md、USER.md、SOUL.md、IDENTITY.md、memory/ 或 agents/<id>/ 下的文件：${relPath}`);
+    }
+    const rel = path.relative(workspaceRoot, absPath).replaceAll("\\", "/");
+    // 白名单已确认在可写范围内，父目录缺失（如新建 memory/ 文件）时补建。
+    await fs.mkdir(path.dirname(absPath), { recursive: true });
+    const realRoot = await fs.realpath(workspaceRoot).catch(() => workspaceRoot);
+    const parentReal = await fs.realpath(path.dirname(absPath)).catch(() => undefined);
+    if (!parentReal || (parentReal !== realRoot && !isPathInsideDir(realRoot, parentReal))) {
+      throw new Error(`路径越出工作区：${relPath}`);
+    }
+    await fs.writeFile(absPath, content, "utf8");
+    this.markDirty();
+    return { path: rel, sizeBytes, totalLines: content.split("\n").length };
+  }
+
+  /** memory_get 的安全读取：路径必须解析回工作区内且属于记忆根（含该成员自己的记忆文件）。 */
+  async readFile(
+    relPath: string,
+    params?: { from?: number; lines?: number; agentId?: string },
+  ): Promise<{ content: string; truncated: boolean; totalLines: number; more: boolean }> {
+    return this.readWithin(
+      relPath,
+      (abs, root) => isMemoryRootPath(abs, root) || isMemberMemoryPath(abs, root, params?.agentId),
+      params?.agentId
+        ? `只允许读取 MEMORY.md、USER.md、memory/ 或自己的 agents/<成员ID>/MEMORY.md、USER.md：${relPath}`
+        : `只允许读取 MEMORY.md、USER.md 或 memory/ 下的文件：${relPath}`,
+      params ? { from: params.from, lines: params.lines } : undefined,
     );
   }
 
@@ -949,7 +1085,7 @@ export class MemorySearchManager {
     relPath: string,
     isAllowed: (absPath: string, workspaceRoot: string) => boolean,
     refusal: string,
-    params?: { from?: number; lines?: number },
+    params?: { from?: number; lines?: number; full?: boolean },
   ): Promise<{ content: string; truncated: boolean; totalLines: number; more: boolean }> {
     const { workspaceDir } = this.options;
     const normalized = relPath.trim().replaceAll("\\", "/").replace(/^\.\//, "");
@@ -968,6 +1104,9 @@ export class MemorySearchManager {
     }
     const content = await fs.readFile(realPath, "utf8");
     const lines = content.split("\n");
+    if (params?.full) {
+      return { content, truncated: false, totalLines: lines.length, more: false };
+    }
     const from = Math.max(1, Math.floor(params?.from ?? 1));
     const count = Math.min(400, Math.max(1, Math.floor(params?.lines ?? 200)));
     const slice = lines.slice(from - 1, from - 1 + count);
@@ -975,8 +1114,15 @@ export class MemorySearchManager {
     return { content: slice.join("\n"), truncated: slice.length < lines.length, totalLines: lines.length, more };
   }
 
-  /** 适配：本项目没有文件写工具，记忆写回走受控追加（策展条目格式与 OpenClaw 注释语法一致）。 */
-  async appendEntry(text: string, annotations?: { triggers?: string[]; importance?: number }): Promise<string> {
+  /**
+   * 适配：本项目没有文件写工具，记忆写回走受控追加（策展条目格式与 OpenClaw 注释语法一致）。
+   * 子成员传入 agentId 时写到它自己的 agents/<id>/MEMORY.md。
+   */
+  async appendEntry(
+    text: string,
+    annotations?: { triggers?: string[]; importance?: number },
+    options?: { agentId?: string },
+  ): Promise<string> {
     const clean = text.trim().replace(/\s+/gu, " ");
     if (!clean) throw new Error("记忆内容不能为空");
     const parts = [`- ${clean}`];
@@ -987,7 +1133,9 @@ export class MemorySearchManager {
       const value = Math.max(1, Math.min(10, Math.floor(annotations.importance)));
       parts.push(`<!-- importance: ${value} -->`);
     }
-    const file = path.join(this.options.workspaceDir, "MEMORY.md");
+    const relPath = options?.agentId ? `agents/${options.agentId}/MEMORY.md` : "MEMORY.md";
+    const file = path.join(this.options.workspaceDir, relPath);
+    if (options?.agentId) await fs.mkdir(path.dirname(file), { recursive: true });
     let prefix = "";
     try {
       const existing = await fs.readFile(file, "utf8");
@@ -997,7 +1145,7 @@ export class MemorySearchManager {
     }
     await fs.appendFile(file, `${prefix}${parts.join(" ")}\n`, "utf8");
     this.markDirty();
-    return "MEMORY.md";
+    return relPath;
   }
 }
 
@@ -1022,8 +1170,37 @@ function isMemoryRootPath(absPath: string, workspaceRoot: string): boolean {
 /** 不属于检索语料、但属于智能体档案的工作区文件（性格与身份）。 */
 const NON_MEMORY_AGENT_FILES: readonly string[] = ["SOUL.md", "IDENTITY.md"];
 
+/** 子成员私有的记忆文件：检索语料随 agents/<id>/ 收录，只对该成员可见。 */
+const MEMBER_MEMORY_FILES: readonly string[] = ["MEMORY.md", "USER.md"];
+
+function isMemberMemoryPath(absPath: string, workspaceRoot: string, agentId: string | undefined): boolean {
+  if (!agentId) return false;
+  const relative = path.relative(path.join(workspaceRoot, "agents", agentId), absPath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false;
+  return MEMBER_MEMORY_FILES.includes(relative.split(path.sep).join("/"));
+}
+
+/** 子成员自己的档案目录：agents/<memberId>/<name>.md（只允许一层，且不越出工作区）。 */
+function isMemberAgentPath(absPath: string, workspaceRoot: string): boolean {
+  const relative = path.relative(path.join(workspaceRoot, "agents"), absPath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false;
+  const segments = relative.split(path.sep);
+  return segments.length === 2 && segments.every(Boolean) && segments[1].toLowerCase().endsWith(".md");
+}
+
+/** 「智能体文件」面板的读写白名单：记忆根 + 工作区根部身份文件 + 子成员档案。 */
+function isAgentFileAllowed(absPath: string, workspaceRoot: string): boolean {
+  return (
+    isMemoryRootPath(absPath, workspaceRoot) ||
+    NON_MEMORY_AGENT_FILES.some((name) => absPath === path.join(workspaceRoot, name)) ||
+    isMemberAgentPath(absPath, workspaceRoot)
+  );
+}
+
 function agentFileRank(relPath: string): number {
-  const index = (AGENT_FILE_ORDER as readonly string[]).indexOf(relPath);
+  // 子成员档案的路径带 agents/<id>/ 前缀，按文件名排序保持统一顺序。
+  const base = relPath.slice(relPath.lastIndexOf("/") + 1);
+  const index = (AGENT_FILE_ORDER as readonly string[]).indexOf(base);
   return index === -1 ? AGENT_FILE_ORDER.length : index;
 }
 

@@ -405,6 +405,109 @@ describe("多用户 API", () => {
     ).toBe(1);
   });
 
+  it("技能附带文件：列表只给元信息，正文按需读取且只对属主可见", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const adminCookie = setup.cookie as string;
+    await call("/api/users", {
+      method: "POST",
+      cookie: adminCookie,
+      body: { username: "alice", displayName: "Alice", password: "alicepass1" },
+    });
+    await call("/api/users", {
+      method: "POST",
+      cookie: adminCookie,
+      body: { username: "bob", displayName: "Bob", password: "bobpass123" },
+    });
+    const aliceCookie = (
+      await call("/api/auth/login", {
+        method: "POST",
+        body: { username: "alice", password: "alicepass1" },
+      })
+    ).cookie as string;
+    const bobCookie = (
+      await call("/api/auth/login", {
+        method: "POST",
+        body: { username: "bob", password: "bobpass123" },
+      })
+    ).cookie as string;
+
+    const created = await call("/api/skills", {
+      method: "POST",
+      cookie: aliceCookie,
+      body: {
+        name: "pdf-forms",
+        description: "填写 PDF 表单",
+        instructions: "# 步骤\n运行 scripts/fill.py",
+        files: [
+          { path: "scripts/fill.py", content: "print('ok')" },
+          { path: "assets/logo.png", content: "aGk=", encoding: "base64" },
+        ],
+      },
+    });
+    expect(created.status).toBe(201);
+    const skill = created.body["skill"] as Record<string, unknown>;
+    const files = skill["files"] as Record<string, unknown>[];
+    expect(files.map((file) => file["path"])).toEqual(["assets/logo.png", "scripts/fill.py"]);
+    expect(files[1]).not.toHaveProperty("content");
+    const skillId = skill["id"] as string;
+
+    const listed = await call("/api/skills", { cookie: aliceCookie });
+    const personal = listed.body["personal"] as Record<string, unknown>[];
+    expect(personal[0]).toMatchObject({ name: "pdf-forms" });
+    expect(
+      ((personal[0]?.["files"] as Record<string, unknown>[]) ?? []).map((file) => file["path"]),
+    ).toEqual(["assets/logo.png", "scripts/fill.py"]);
+
+    const text = await call(`/api/skills/${skillId}/file?path=scripts%2Ffill.py`, {
+      cookie: aliceCookie,
+    });
+    expect(text.status).toBe(200);
+    expect((text.body["file"] as Record<string, unknown>)["content"]).toBe("print('ok')");
+
+    const foreign = await call(`/api/skills/${skillId}/file?path=scripts%2Ffill.py`, {
+      cookie: bobCookie,
+    });
+    expect(foreign.status).toBe(403);
+    expect((await call(`/api/skills/${skillId}/file?path=..%2Fx`, { cookie: aliceCookie })).status).toBe(
+      400,
+    );
+    expect((await call(`/api/skills/${skillId}/file?path=nope.txt`, { cookie: aliceCookie })).status).toBe(
+      404,
+    );
+
+    const imported = await call("/api/skills/import", {
+      method: "POST",
+      cookie: aliceCookie,
+      body: {
+        files: [
+          {
+            filename: "ocr/SKILL.md",
+            content: "---\nname: ocr\ndescription: 识别扫描件\n---\n\n跑 scripts/run.py",
+          },
+          { filename: "ocr/scripts/run.py", content: "print(1)" },
+        ],
+      },
+    });
+    expect(imported.status).toBe(200);
+    const result = (imported.body["results"] as Record<string, unknown>[])[0];
+    expect(result).toMatchObject({ ok: true });
+    const importedSkill = result?.["skill"] as Record<string, unknown>;
+    expect((importedSkill["files"] as Record<string, unknown>[])?.map((file) => file["path"])).toEqual([
+      "scripts/run.py",
+    ]);
+
+    const cleared = await call(`/api/skills/${skillId}`, {
+      method: "PATCH",
+      cookie: aliceCookie,
+      body: { files: [] },
+    });
+    expect(cleared.status).toBe(200);
+    expect((cleared.body["skill"] as Record<string, unknown>)["files"]).toBeUndefined();
+  });
+
   it("登录失败限流、退出后会话失效，SSE 也需要登录", async () => {
     const setup = await call("/api/auth/setup", {
       method: "POST",
@@ -431,5 +534,289 @@ describe("多用户 API", () => {
     const logout = await call("/api/auth/logout", { method: "POST", cookie });
     expect(logout.status).toBe(200);
     expect((await call("/api/auth/me", { cookie })).status).toBe(401);
+  });
+});
+
+describe("成员 API：新建成员与智能体文件编辑", () => {
+  async function login(): Promise<string> {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    return setup.cookie as string;
+  }
+
+  it("新建成员按描述生成档案，随后可读取并保存修改", async () => {
+    const cookie = await login();
+
+    const created = await call("/api/members", {
+      method: "POST",
+      cookie,
+      body: { name: "调研员", description: "负责检索资料并给出带出处的结论" },
+    });
+    expect(created.status).toBe(201);
+    const member = created.body["member"] as Record<string, unknown>;
+    expect(member["name"]).toBe("调研员");
+    expect(member["role"]).toBe("sub");
+    expect(member["brief"]).toBe("负责检索资料并给出带出处的结论");
+
+    const memberId = String(member["id"]);
+    const listed = await call(`/api/members/${memberId}/files`, { cookie });
+    expect(listed.status).toBe(200);
+    const paths = (listed.body["files"] as Array<Record<string, unknown>>).map((file) => file["path"]);
+    // 子成员有自己的 MEMORY.md / USER.md / SOUL.md / IDENTITY.md。
+    expect(paths).toEqual([
+      `agents/${memberId}/MEMORY.md`,
+      `agents/${memberId}/USER.md`,
+      `agents/${memberId}/SOUL.md`,
+      `agents/${memberId}/IDENTITY.md`,
+    ]);
+
+    const soulPath = `agents/${memberId}/SOUL.md`;
+    const detail = await call(
+      `/api/members/${memberId}/files/content?path=${encodeURIComponent(soulPath)}`,
+      { cookie },
+    );
+    expect(detail.status).toBe(200);
+    expect(String(detail.body["content"])).toContain("负责检索资料并给出带出处的结论");
+
+    const saved = await call(`/api/members/${memberId}/files/content`, {
+      method: "PUT",
+      cookie,
+      body: { path: soulPath, content: "# 改过的性格\n\n- 先查证再开口\n" },
+    });
+    expect(saved.status).toBe(200);
+    expect(saved.body["totalLines"]).toBe(4);
+
+    const reread = await call(
+      `/api/members/${memberId}/files/content?path=${encodeURIComponent(soulPath)}`,
+      { cookie },
+    );
+    expect(reread.body["content"]).toBe("# 改过的性格\n\n- 先查证再开口\n");
+
+    // 白名单外的路径不能通过「智能体文件」写接口落盘。
+    const rejected = await call(`/api/members/${memberId}/files/content`, {
+      method: "PUT",
+      cookie,
+      body: { path: "settings.json", content: "{}" },
+    });
+    expect(rejected.status).toBe(400);
+  });
+
+  it("新建成员的入参校验与权限：未登录拒绝，坏名字/空描述 400", async () => {
+    expect((await call("/api/members", { method: "POST", body: { name: "x", description: "y" } })).status).toBe(401);
+
+    const cookie = await login();
+    expect(
+      (await call("/api/members", { method: "POST", cookie, body: { name: "系统", description: "保留名" } })).status,
+    ).toBe(400);
+    expect(
+      (await call("/api/members", { method: "POST", cookie, body: { name: "助手", description: "  " } })).status,
+    ).toBe(400);
+  });
+});
+
+describe("成员文件长文本：预览截断与全文读取", () => {
+  it("默认返回前 200 行，full=1 返回全部行", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const cookie = setup.cookie as string;
+    const created = await call("/api/members", {
+      method: "POST",
+      cookie,
+      body: { name: "长文员", description: "负责长文档" },
+    });
+    const memberId = String((created.body["member"] as Record<string, unknown>)["id"]);
+    const path = `agents/${memberId}/SOUL.md`;
+    const long = ["# SOUL.md", ...Array.from({ length: 299 }, (_, index) => `- 条目 ${index + 1}`)].join("\n");
+
+    const saved = await call(`/api/members/${memberId}/files/content`, {
+      method: "PUT",
+      cookie,
+      body: { path, content: long },
+    });
+    expect(saved.status).toBe(200);
+    expect(saved.body["totalLines"]).toBe(300);
+
+    const preview = await call(
+      `/api/members/${memberId}/files/content?path=${encodeURIComponent(path)}`,
+      { cookie },
+    );
+    expect(preview.body["truncated"]).toBe(true);
+    expect(String(preview.body["content"]).split("\n")).toHaveLength(200);
+
+    const full = await call(
+      `/api/members/${memberId}/files/content?path=${encodeURIComponent(path)}&full=1`,
+      { cookie },
+    );
+    expect(full.body["truncated"]).toBe(false);
+    expect(full.body["totalLines"]).toBe(300);
+    expect(full.body["content"]).toBe(long);
+  });
+});
+
+describe("成员技能授权 API", () => {
+  it("按成员读写技能白名单，null=全部，非法输入被拒，跨账号不可见", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const cookie = setup.cookie as string;
+    const shared = await call("/api/skills", {
+      method: "POST",
+      cookie,
+      body: {
+        scope: "shared",
+        name: "research-brief",
+        description: "三段式简报",
+        instructions: "# 调研\n先给结论。",
+      },
+    });
+    expect(shared.status).toBe(201);
+
+    const created = await call("/api/members", {
+      method: "POST",
+      cookie,
+      body: { name: "调研员", description: "负责检索资料并给出带出处的结论" },
+    });
+    const member = created.body["member"] as Record<string, unknown>;
+    const memberId = String(member["id"]);
+    expect(member).not.toHaveProperty("skillNames");
+
+    const initial = await call(`/api/members/${memberId}/skills`, { cookie });
+    expect(initial.status).toBe(200);
+    expect(initial.body["enabled"]).toBeNull();
+    expect(initial.body["skills"]).toMatchObject([
+      { name: "research-brief", scope: "shared", builtin: false },
+    ]);
+
+    const saved = await call(`/api/members/${memberId}/skills`, {
+      method: "PUT",
+      cookie,
+      body: { names: ["research-brief"] },
+    });
+    expect(saved.status).toBe(200);
+    expect(saved.body["enabled"]).toEqual(["research-brief"]);
+
+    const state = await call("/api/state", { cookie });
+    const updated = (state.body["members"] as Array<Record<string, unknown>>).find(
+      (candidate) => candidate["id"] === memberId,
+    );
+    expect(updated?.["skillNames"]).toEqual(["research-brief"]);
+
+    expect(
+      (
+        await call(`/api/members/${memberId}/skills`, {
+          method: "PUT",
+          cookie,
+          body: { names: ["no-such-skill"] },
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (await call(`/api/members/${memberId}/skills`, { method: "PUT", cookie, body: {} })).status,
+    ).toBe(400);
+    expect(
+      (
+        await call(`/api/members/${memberId}/skills`, {
+          method: "PUT",
+          cookie,
+          body: { names: "research-brief" },
+        })
+      ).status,
+    ).toBe(400);
+
+    const cleared = await call(`/api/members/${memberId}/skills`, {
+      method: "PUT",
+      cookie,
+      body: { names: [] },
+    });
+    expect(cleared.body["enabled"]).toEqual([]);
+
+    const reset = await call(`/api/members/${memberId}/skills`, {
+      method: "PUT",
+      cookie,
+      body: { names: null },
+    });
+    expect(reset.body["enabled"]).toBeNull();
+    const stateAgain = await call("/api/state", { cookie });
+    const resetMember = (stateAgain.body["members"] as Array<Record<string, unknown>>).find(
+      (candidate) => candidate["id"] === memberId,
+    );
+    expect(resetMember).not.toHaveProperty("skillNames");
+
+    expect(
+      (await call("/api/members/m_missing/skills", { cookie })).status,
+    ).toBe(404);
+    expect(
+      (await call(`/api/members/${memberId}/skills`, { method: "PUT", body: { names: null } }))
+        .status,
+    ).toBe(401);
+
+    await call("/api/users", {
+      method: "POST",
+      cookie,
+      body: { username: "alice", displayName: "Alice", password: "alicepass1" },
+    });
+    const aliceLogin = await call("/api/auth/login", {
+      method: "POST",
+      body: { username: "alice", password: "alicepass1" },
+    });
+    const aliceCookie = aliceLogin.cookie as string;
+    expect(
+      (await call(`/api/members/${memberId}/skills`, { cookie: aliceCookie })).status,
+    ).toBe(404);
+  });
+});
+
+describe("成员 API：移除成员", () => {
+  async function login(): Promise<string> {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    return setup.cookie as string;
+  }
+
+  it("移除子成员：花名册消失、任务改为未指派、文件接口返回 404", async () => {
+    const cookie = await login();
+    const created = await call("/api/members", {
+      method: "POST",
+      cookie,
+      body: { name: "资料员", description: "整理资料并归档" },
+    });
+    const memberId = String((created.body["member"] as Record<string, unknown>)["id"]);
+    // 先让档案落盘，移除后应当不可再读。
+    expect((await call(`/api/members/${memberId}/files`, { cookie })).status).toBe(200);
+    const task = await call("/api/tasks", {
+      method: "POST",
+      cookie,
+      body: { title: "整理季度资料", ownerId: memberId },
+    });
+    const taskId = String((task.body["task"] as Record<string, unknown>)["id"]);
+
+    const removed = await call(`/api/members/${memberId}`, { method: "DELETE", cookie });
+    expect(removed.status).toBe(200);
+    expect(removed.body["removed"]).toBe(memberId);
+
+    const state = await call("/api/state", { cookie });
+    const members = state.body["members"] as Array<Record<string, unknown>>;
+    expect(members.some((member) => member["id"] === memberId)).toBe(false);
+    const tasks = state.body["tasks"] as Array<Record<string, unknown>>;
+    expect(tasks.find((item) => item["id"] === taskId)?.["ownerId"]).toBeNull();
+    const messages = state.body["messages"] as Array<Record<string, unknown>>;
+    expect(String(messages.at(-1)?.["text"])).toContain("@资料员");
+
+    expect((await call(`/api/members/${memberId}/files`, { cookie })).status).toBe(404);
+  });
+
+  it("主智能体不能移除，未知成员 404，未登录 401", async () => {
+    expect((await call("/api/members/m_main", { method: "DELETE" })).status).toBe(401);
+
+    const cookie = await login();
+    expect((await call("/api/members/m_main", { method: "DELETE", cookie })).status).toBe(400);
+    expect((await call("/api/members/m_missing", { method: "DELETE", cookie })).status).toBe(404);
   });
 });

@@ -138,6 +138,17 @@ export async function resetUserPassword(
 
 export type SkillScope = "shared" | "personal";
 
+/** 技能附带文件的元信息：正文要单独调 /api/skills/:id/file 取。 */
+export interface SkillFileView {
+  path: string;
+  encoding: "utf8" | "base64";
+  size: number;
+}
+
+export interface SkillFileContent extends SkillFileView {
+  content: string;
+}
+
 export interface SkillView {
   id: string;
   scope: SkillScope;
@@ -146,6 +157,7 @@ export interface SkillView {
   name: string;
   description: string;
   instructions: string;
+  files?: SkillFileView[];
   builtin?: boolean;
   imported?: boolean;
   source?: string;
@@ -168,6 +180,12 @@ export interface SkillSnapshot {
   canManageShared: boolean;
 }
 
+export interface SkillFileInput {
+  path: string;
+  content: string;
+  encoding: "utf8" | "base64";
+}
+
 export async function fetchSkills(): Promise<SkillSnapshot> {
   return request<SkillSnapshot>("/api/skills");
 }
@@ -177,6 +195,7 @@ export async function createSkill(input: {
   name: string;
   description: string;
   instructions: string;
+  files?: SkillFileInput[];
 }): Promise<SkillView> {
   const body = await request<{ skill: SkillView }>("/api/skills", {
     method: "POST",
@@ -188,7 +207,7 @@ export async function createSkill(input: {
 export async function importSkills(input: {
   scope: SkillScope;
   overwrite: boolean;
-  files: { filename: string; content: string }[];
+  files: { filename: string; content: string; encoding?: "utf8" | "base64" }[];
 }): Promise<{ results: SkillImportResult[] }> {
   return request<{ results: SkillImportResult[] }>("/api/skills/import", {
     method: "POST",
@@ -198,13 +217,28 @@ export async function importSkills(input: {
 
 export async function updateSkill(
   skillId: string,
-  patch: { name?: string; description?: string; instructions?: string },
+  patch: {
+    name?: string;
+    description?: string;
+    instructions?: string;
+    files?: SkillFileInput[];
+  },
 ): Promise<SkillView> {
   const body = await request<{ skill: SkillView }>(`/api/skills/${encodeURIComponent(skillId)}`, {
     method: "PATCH",
     body: JSON.stringify(patch),
   });
   return body.skill;
+}
+
+export async function fetchSkillFile(
+  skillId: string,
+  path: string,
+): Promise<SkillFileContent> {
+  const body = await request<{ file: SkillFileContent }>(
+    `/api/skills/${encodeURIComponent(skillId)}/file?path=${encodeURIComponent(path)}`,
+  );
+  return body.file;
 }
 
 export async function deleteSkill(skillId: string): Promise<void> {
@@ -232,6 +266,17 @@ export async function cancelMember(memberId: string): Promise<boolean> {
   return body.cancelled;
 }
 
+export async function createMember(input: {
+  name: string;
+  description: string;
+}): Promise<Member> {
+  const body = await request<{ member: Member }>("/api/members", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return body.member;
+}
+
 export interface AgentFileEntry {
   path: string;
   sizeBytes: number;
@@ -245,6 +290,12 @@ export interface AgentFileContent {
   truncated: boolean;
 }
 
+export async function removeMember(memberId: string): Promise<void> {
+  await request<{ removed: string }>(`/api/members/${encodeURIComponent(memberId)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function fetchMemberFiles(memberId: string): Promise<AgentFileEntry[]> {
   const body = await request<{ files: AgentFileEntry[] }>(
     `/api/members/${encodeURIComponent(memberId)}/files`,
@@ -255,10 +306,51 @@ export async function fetchMemberFiles(memberId: string): Promise<AgentFileEntry
 export async function fetchMemberFileContent(
   memberId: string,
   path: string,
+  options: { full?: boolean } = {},
 ): Promise<AgentFileContent> {
+  const query = `path=${encodeURIComponent(path)}${options.full ? "&full=1" : ""}`;
   return request<AgentFileContent>(
-    `/api/members/${encodeURIComponent(memberId)}/files/content?path=${encodeURIComponent(path)}`,
+    `/api/members/${encodeURIComponent(memberId)}/files/content?${query}`,
   );
+}
+
+export async function saveMemberFile(
+  memberId: string,
+  path: string,
+  content: string,
+): Promise<{ path: string; sizeBytes: number; totalLines: number }> {
+  return request<{ path: string; sizeBytes: number; totalLines: number }>(
+    `/api/members/${encodeURIComponent(memberId)}/files/content`,
+    { method: "PUT", body: JSON.stringify({ path, content }) },
+  );
+}
+
+export interface MemberSkillEntry {
+  name: string;
+  description: string;
+  scope: SkillScope;
+  builtin: boolean;
+}
+
+export interface MemberSkillsView {
+  memberId: string;
+  /** null = 未限制：跟随技能库的全部技能（以后新增的也自动启用）。 */
+  enabled: string[] | null;
+  skills: MemberSkillEntry[];
+}
+
+export async function fetchMemberSkills(memberId: string): Promise<MemberSkillsView> {
+  return request<MemberSkillsView>(`/api/members/${encodeURIComponent(memberId)}/skills`);
+}
+
+export async function saveMemberSkills(
+  memberId: string,
+  names: string[] | null,
+): Promise<MemberSkillsView> {
+  return request<MemberSkillsView>(`/api/members/${encodeURIComponent(memberId)}/skills`, {
+    method: "PUT",
+    body: JSON.stringify({ names }),
+  });
 }
 
 export async function createTask(title: string): Promise<TaskCard> {

@@ -189,7 +189,7 @@ describe("MemorySearchManager 检索", () => {
     const soul = await m.readAgentFile("SOUL.md");
     expect(soul.content).toContain("我是谁");
     // 身份文件可读，但工作区状态/设置依旧拒绝。
-    await expect(m.readAgentFile("../state.json")).rejects.toThrow(/只允许读取/);
+    await expect(m.readAgentFile("../state.json")).rejects.toThrow(/只允许读写/);
     await expect(m.readFile("SOUL.md")).rejects.toThrow(/只允许读取 MEMORY.md、USER.md 或 memory\//);
 
     // 二次补齐不得覆盖用户已改写的内容。
@@ -200,6 +200,149 @@ describe("MemorySearchManager 检索", () => {
     // SOUL.md 不属于检索语料（对应 OpenClaw：身份文件走提示词注入，不进 memory 索引）。
     const hits = await m.search("我是谁", { lexicalOnly: true, sources: ["memory"] });
     expect(hits.every((hit) => hit.path !== "SOUL.md")).toBe(true);
+  });
+
+  it("writeAgentFile 保存白名单内的文件，越界路径与超限内容被拒绝", async () => {
+    const bus = await seedWorkspace();
+    const m = manager(bus);
+    const saved = await m.writeAgentFile("MEMORY.md", "# 长期记忆\n\n- 新条目\n");
+    expect(saved).toMatchObject({ path: "MEMORY.md", totalLines: 4 });
+    expect(await readFile(join(dir, "MEMORY.md"), "utf8")).toContain("新条目");
+    expect((await m.readAgentFile("MEMORY.md")).content).toContain("新条目");
+
+    // 新建 memory/ 子文件时自动补目录。
+    await m.writeAgentFile("memory/curated/new.md", "- 草稿\n");
+    expect((await m.readAgentFile("memory/curated/new.md")).content).toContain("草稿");
+
+    await expect(m.writeAgentFile("../escape.md", "x")).rejects.toThrow(/只允许读写/);
+    await expect(m.writeAgentFile("state.json", "{}")).rejects.toThrow(/只允许读写/);
+    await expect(m.writeAgentFile("MEMORY.md", 42)).rejects.toThrow(/文本/);
+    await expect(m.writeAgentFile("MEMORY.md", "x".repeat(256 * 1024 + 1))).rejects.toThrow(/256 KB/);
+  });
+
+  it("长文件默认按 200 行预览，full 读取返回全文供编辑", async () => {
+    const bus = await seedWorkspace();
+    const m = manager(bus);
+    const long = ["# 长期记忆", ...Array.from({ length: 500 }, (_, index) => `- 条目 ${index + 1}`)].join("\n");
+    await writeFile(join(dir, "MEMORY.md"), long, "utf8");
+
+    const preview = await m.readAgentFile("MEMORY.md");
+    expect(preview.truncated).toBe(true);
+    expect(preview.totalLines).toBe(501);
+    expect(preview.content.split("\n")).toHaveLength(200);
+
+    const full = await m.readAgentFile("MEMORY.md", { full: true });
+    expect(full.truncated).toBe(false);
+    expect(full.totalLines).toBe(501);
+    expect(full.content).toBe(long);
+  });
+
+  it("子成员首次打开时生成自己的四个档案文件，之后可继续编辑", async () => {
+    const bus = await seedWorkspace();
+    ensureMainMember(bus);
+    bus.addMember({
+      id: "m_research",
+      roomId: bus.roomId,
+      name: "调研员",
+      role: "sub",
+      status: "idle",
+      depth: 1,
+      spawnedBy: "m_main",
+      controlScope: "children",
+      contextMode: "isolated",
+      systemPrompt: "",
+      brief: "负责检索资料并给出带出处的结论",
+      providerId: "demo",
+      createdAt: Date.now(),
+      lastActiveAt: Date.now(),
+    });
+    const m = manager(bus);
+
+    const files = await m.listAgentFiles("m_research");
+    expect(files.map((file) => file.path)).toEqual([
+      "agents/m_research/MEMORY.md",
+      "agents/m_research/USER.md",
+      "agents/m_research/SOUL.md",
+      "agents/m_research/IDENTITY.md",
+    ]);
+    const soul = await m.readAgentFile("agents/m_research/SOUL.md");
+    expect(soul.content).toContain("@调研员");
+    expect(soul.content).toContain("负责检索资料并给出带出处的结论");
+    expect((await m.readAgentFile("agents/m_research/IDENTITY.md")).content).toContain("调研员");
+    // 记忆基线文件是子成员自己的，不借用工作区根部的 USER.md。
+    expect((await m.readAgentFile("agents/m_research/USER.md")).content).toContain("我给用户的画像");
+    expect((await m.readAgentFile("agents/m_research/MEMORY.md")).content).toContain("我的长期记忆");
+
+    await m.writeAgentFile("agents/m_research/SOUL.md", "# 修改后的性格\n");
+    // 再次打开只补缺失项，不覆盖用户改写。
+    await m.listAgentFiles("m_research");
+    expect((await m.readAgentFile("agents/m_research/SOUL.md")).content).toBe("# 修改后的性格\n");
+    // 主智能体清单仍然只有工作区根部的文件。
+    expect((await m.listAgentFiles()).every((file) => !file.path.startsWith("agents/"))).toBe(true);
+  });
+
+  it("子成员记忆按成员作用域检索：只看得到自己的记忆文件", async () => {
+    const bus = await seedWorkspace();
+    ensureMainMember(bus);
+    const addSub = (id: string, name: string) =>
+      bus.addMember({
+        id,
+        roomId: bus.roomId,
+        name,
+        role: "sub",
+        status: "idle",
+        depth: 1,
+        spawnedBy: "m_main",
+        controlScope: "children",
+        contextMode: "isolated",
+        systemPrompt: "",
+        brief: `${name}的职责`,
+        providerId: "demo",
+        createdAt: Date.now(),
+        lastActiveAt: Date.now(),
+      });
+    addSub("m_a", "成员甲");
+    addSub("m_b", "成员乙");
+    const m = manager(bus);
+    await m.listAgentFiles("m_a");
+    await m.listAgentFiles("m_b");
+    await m.writeAgentFile(
+      "agents/m_a/MEMORY.md",
+      "# 甲的长期记忆\n\n- 甲独占事实：星舰代号是蓝鲸\n",
+    );
+    await m.writeAgentFile(
+      "agents/m_b/MEMORY.md",
+      "# 乙的长期记忆\n\n- 乙独占事实：星舰代号是信天翁\n",
+    );
+
+    const hitsA = await m.search("星舰代号", { agentId: "m_a", sources: ["memory"] });
+    expect(hitsA.map((hit) => hit.path)).toContain("agents/m_a/MEMORY.md");
+    expect(hitsA.every((hit) => !hit.path.startsWith("agents/m_b/"))).toBe(true);
+    // 主智能体与其它成员检索不到子成员私有记忆。
+    const sharedHits = await m.search("星舰代号", { sources: ["memory"] });
+    expect(sharedHits.every((hit) => !hit.path.startsWith("agents/"))).toBe(true);
+
+    // memory_append 写到成员自己的 MEMORY.md，而不是根目录那份。
+    await m.appendEntry("甲追加的事实", undefined, { agentId: "m_a" });
+    expect(await readFile(join(dir, "agents", "m_a", "MEMORY.md"), "utf8")).toContain("甲追加的事实");
+    expect((await readFile(join(dir, "MEMORY.md"), "utf8")).includes("甲追加的事实")).toBe(false);
+
+    // memory_get 同样只放行自己的记忆文件。
+    await expect(m.readFile("agents/m_a/MEMORY.md", { agentId: "m_a" })).resolves.toMatchObject({});
+    await expect(m.readFile("agents/m_b/MEMORY.md", { agentId: "m_a" })).rejects.toThrow(/只允许读取/);
+  });
+
+  it("移除成员会删除它的档案目录，且拒绝越界的成员 ID", async () => {
+    const bus = await seedWorkspace();
+    const m = manager(bus);
+    await mkdir(join(dir, "agents", "m_gone"), { recursive: true });
+    await writeFile(join(dir, "agents", "m_gone", "SOUL.md"), "# 将被删除\n", "utf8");
+
+    await m.removeMemberProfile("m_gone");
+    await expect(readFile(join(dir, "agents", "m_gone", "SOUL.md"), "utf8")).rejects.toThrow();
+    // 目录已不存在时重复移除视为成功。
+    await expect(m.removeMemberProfile("m_gone")).resolves.toBeUndefined();
+    await expect(m.removeMemberProfile("../escape")).rejects.toThrow(/不合法/);
   });
 });
 

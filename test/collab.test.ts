@@ -5,10 +5,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { RoomBus } from "../src/room/bus";
 import { Workboard } from "../src/workboard/board";
 import { Orchestrator, ensureMainMember } from "../src/agent/orchestrator";
-import { DEFAULT_LIMITS, type Limits } from "../src/core/types";
+import { DEFAULT_LIMITS, type Limits, type PublicUser } from "../src/core/types";
 import type { Settings } from "../src/core/settings";
 import type { MockHandler } from "../src/provider/mock";
-import { buildTools } from "../src/agent/tools";
 import { SkillLibrary } from "../src/skills/library";
 
 const tempDirs: string[] = [];
@@ -49,149 +48,104 @@ async function makeRig(handler: MockHandler, overrides: Partial<Limits> = {}) {
   return { bus, board, orchestrator, settings, skills };
 }
 
-function collaborativeHandler(): MockHandler {
-  return (request) => {
-    const system = request.messages[0]?.content ?? "";
-    const steps = request.messages.filter((message) => message.role === "assistant").length;
-    const userText = request.messages
-      .filter((message) => message.role === "user")
-      .map((message) => message.content)
-      .join("\n");
-    if (system.includes("里的主智能体")) {
-      if (userText.includes("交回了结果")) {
-        return { text: "综合结论：中心编排 + 事件总线更稳。" };
-      }
-      if (steps === 0) {
-        return {
-          toolCalls: [
-            { name: "spawn_member", args: { name: "研究员", task: "调研调度方式并给出结论" } },
-          ],
-        };
-      }
-      return { text: "已派给研究员，等它的报告。" };
-    }
-    return {
-      text: "调研结论：中心编排最稳。\n证据：对比了 3 个框架。\n未解决：长任务压测缺失。",
-    };
-  };
-}
-
 describe("group-chat collaboration", () => {
-  it("用户提问 → 主智能体创建成员并 @ 派发 → 子报告 → 主综合", async () => {
-    const { bus, board, orchestrator } = await makeRig(collaborativeHandler());
+  it("主智能体没有创建成员的通道，被要求建成员时只能直接回答", async () => {
+    let toolNames: string[] = [];
+    let system = "";
+    const handler: MockHandler = (request) => {
+      toolNames = request.tools.map((tool) => tool.name);
+      system = request.messages[0]?.content ?? "";
+      return { text: "我不能自己创建成员，请在左侧「新建成员」中创建。" };
+    };
 
-    orchestrator.sendUserMessage("帮我调研多智能体协同的调度方式");
+    const { bus, orchestrator } = await makeRig(handler);
+    orchestrator.sendUserMessage("帮我新建一个研究员");
 
-    await waitFor(() => Boolean(bus.findMemberByName("研究员")));
-    const researcher = bus.findMemberByName("研究员");
-    expect(researcher?.role).toBe("sub");
-    expect(researcher?.spawnedBy).toBe("m_main");
+    await waitFor(() => bus.listMessages().some((message) => message.senderKind === "member"));
+    expect(toolNames).not.toContain("spawn_member");
+    expect(toolNames).toContain("task_create");
+    expect(system).not.toContain("spawn_member");
+    expect(system).toContain("新建成员");
+    expect(bus.listMembers().filter((member) => member.role === "sub")).toHaveLength(0);
+    await waitFor(() => orchestrator.activeRuns === 0);
+  });
+
+  it("用户新建的成员被 @ 后执行任务，报告唤醒主智能体汇总", async () => {
+    const handler: MockHandler = (request) => {
+      const system = request.messages[0]?.content ?? "";
+      const userText = request.messages
+        .filter((message) => message.role === "user")
+        .map((message) => message.content)
+        .join("\n");
+      if (system.includes("里的主智能体")) {
+        if (userText.includes("交回了结果")) return { text: "综合结论：中心编排 + 事件总线更稳。" };
+        return { text: "已收到，等成员报告。" };
+      }
+      return { text: "调研结论：中心编排最稳。\n证据：对比了 3 个框架。" };
+    };
+
+    const { bus, orchestrator } = await makeRig(handler);
+    const researcher = await orchestrator.createMember({
+      name: "调研员",
+      description: "负责调研多智能体协同方案",
+    });
+
+    orchestrator.sendUserMessage("@调研员 调研多智能体协同的调度方式");
+
+    const asked = bus.listMessages().find((message) => message.senderKind === "user");
+    expect(asked?.mentions).toEqual([researcher.id]);
 
     await waitFor(() =>
-      bus.listMessages().some((message) => message.senderId === researcher?.id && message.kind === "announce"),
+      bus.listMessages().some((message) => message.senderId === researcher.id && message.kind === "announce"),
     );
     await waitFor(() =>
       bus.listMessages().some((message) => message.senderId === "m_main" && message.text.includes("综合结论")),
     );
 
-    const dispatch = bus
-      .listMessages()
-      .find((message) => message.senderId === "m_main" && message.text.startsWith("@研究员"));
-    expect(dispatch?.mentions).toEqual([researcher?.id]);
-
-    const task = board.list()[0];
-    expect(task?.ownerId).toBe(researcher?.id);
-    expect(task?.messageIds.length).toBeGreaterThan(0);
-
-    const researcherMessages = bus.listMessages().filter((message) => message.senderId === researcher?.id);
+    expect(bus.listMembers().filter((member) => member.role === "sub")).toHaveLength(1);
+    const researcherMessages = bus.listMessages().filter((message) => message.senderId === researcher.id);
     expect(researcherMessages).toHaveLength(1);
-
     await waitFor(() => orchestrator.activeRuns === 0);
   });
 
-  it("controlScope=none 的成员调用 spawn_member 会被执行侧护栏拒绝", async () => {
-    const { bus, board, settings, skills } = await makeRig(collaborativeHandler());
-    const main = bus.listMembers()[0];
-    if (!main) throw new Error("缺少主智能体");
-    const researcher = {
-      id: "m_researcher",
-      roomId: bus.roomId,
-      name: "研究员",
-      role: "sub" as const,
-      status: "idle" as const,
-      depth: 1,
-      spawnedBy: main.id,
-      controlScope: "none" as const,
-      contextMode: "isolated" as const,
-      systemPrompt: "",
-      providerId: "default",
+  it("运行前读取成员最新技能白名单：提示词只出现勾选的技能", async () => {
+    let system = "";
+    const handler: MockHandler = (request) => {
+      system = request.messages[0]?.content ?? "";
+      return { text: "收到" };
+    };
+    const { bus, orchestrator, skills } = await makeRig(handler);
+    const adminUser: PublicUser = {
+      id: "u_test",
+      username: "owner",
+      displayName: "老板",
+      role: "admin",
       createdAt: 0,
-      lastActiveAt: 0,
+      mainAgentId: "m_main",
+      roomId: "room_test",
     };
-    const spawn = async () => "不该被调用";
-    const deps = { bus, board, limits: settings.limits, skills, userId: "u_test", spawn };
-    const mainTools = buildTools(main, deps).map((tool) => tool.schema.name);
-    const subTools = buildTools(researcher, deps);
-    expect(mainTools).toContain("spawn_member");
-    expect(subTools.map((tool) => tool.schema.name)).toContain("task_update");
-    const subSpawn = subTools.find((tool) => tool.schema.name === "spawn_member");
-    const rejected = await subSpawn?.execute({ name: "乙", task: "任务" }, new AbortController().signal);
-    expect(String(rejected)).toContain("末端执行者不能再下派");
-  });
-
-  it("超过直接成员上限时会拒绝并说明原因", async () => {
-    const toolResults: string[] = [];
-    let phase = 0;
-    const handler: MockHandler = (request) => {
-      const system = request.messages[0]?.content ?? "";
-      if (system.includes("里的主智能体")) {
-        if (phase === 0) {
-          phase = 1;
-          return { toolCalls: [{ name: "spawn_member", args: { name: "甲", task: "任务甲" } }] };
-        }
-        if (phase === 1) {
-          phase = 2;
-          return { toolCalls: [{ name: "spawn_member", args: { name: "乙", task: "任务乙" } }] };
-        }
-        return { text: phase === 2 ? (phase = 3, "本轮派发结束") : "" };
-      }
-      return { text: "收到" };
-    };
-
-    const { bus, orchestrator } = await makeRig(handler, { maxChildrenPerAgent: 1 });
-    bus.subscribe((event) => {
-      if (event.type === "run" && event.event.type === "tool-result") {
-        toolResults.push(event.event.content);
-      }
+    await skills.create(adminUser, {
+      scope: "shared",
+      name: "research-brief",
+      description: "三段式简报",
+      instructions: "# 调研\n先给结论。",
     });
-
-    orchestrator.sendUserMessage("派两个任务");
-    await waitFor(() => toolResults.length >= 2);
-    expect(toolResults[0]).toContain("已创建成员");
-    expect(toolResults[1]).toContain("上限");
-  });
-
-  it("深度上限内的 leaf 成员可创建，但其再下派会被准入拒绝", async () => {
-    const toolResults: string[] = [];
-    const handler: MockHandler = (request) => {
-      const system = request.messages[0]?.content ?? "";
-      if (system.includes("里的主智能体")) {
-        return { toolCalls: [{ name: "spawn_member", args: { name: "甲", task: "任务甲" } }] };
-      }
-      if (system.includes("末端执行者（leaf")) {
-        return { toolCalls: [{ name: "spawn_member", args: { name: "乙", task: "不该成功" } }] };
-      }
-      return { text: "收到" };
-    };
-    const { bus, orchestrator } = await makeRig(handler, { maxSpawnDepth: 1 });
-    bus.subscribe((event) => {
-      if (event.type === "run" && event.event.type === "tool-result") {
-        toolResults.push(event.event.content);
-      }
+    await skills.create(adminUser, {
+      scope: "shared",
+      name: "summarize",
+      description: "摘要",
+      instructions: "# 摘要\n压缩成要点。",
     });
-    orchestrator.sendUserMessage("派个任务");
-    await waitFor(() => toolResults.length >= 2);
-    expect(toolResults.some((text) => text.includes("末端执行者不能再下派"))).toBe(true);
-    expect(bus.findMemberByName("乙")).toBeUndefined();
+    const main = bus.listMembers().find((member) => member.role === "main");
+    if (!main) throw new Error("缺少主智能体");
+    // 模拟右侧「智能体文件 → 技能」保存后的在线更新：只勾选 research-brief。
+    main.skillNames = ["research-brief"];
+    bus.updateMember(main);
+
+    orchestrator.sendUserMessage("你好");
+    await waitFor(() => system.length > 0);
+    expect(system).toContain("research-brief");
+    expect(system).not.toContain("summarize");
+    await waitFor(() => orchestrator.activeRuns === 0);
   });
 });

@@ -61,8 +61,19 @@ export class RoomBus {
   }
 
   updateMember(member: Member): void {
+    // 已移除成员的迟到状态更新不得让它复活。
+    if (!this.members.has(member.id)) return;
     this.members.set(member.id, member);
     this.emit({ type: "member", member: { ...member } });
+  }
+
+  /** 移除成员：只摘出花名册，历史消息保留；返回被移除的成员。 */
+  removeMember(memberId: string): Member | undefined {
+    const member = this.members.get(memberId);
+    if (!member) return undefined;
+    this.members.delete(memberId);
+    this.emit({ type: "member-removed", memberId });
+    return member;
   }
 
   getMember(id: string): Member | undefined {

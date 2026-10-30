@@ -18,7 +18,10 @@ export type IconName =
   | "inspect"
   | "refresh"
   | "import"
-  | "folder";
+  | "folder"
+  | "edit"
+  | "trash"
+  | "check";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
   menu: <path d="M4 6h16M4 12h16M4 18h16" />,
@@ -104,6 +107,21 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
   folder: (
     <path d="M3 8a2 2 0 0 1 2-2h4l2 2.5h6A2 2 0 0 1 19 11v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
   ),
+  edit: (
+    <>
+      <path d="M4 20h4L20 8a2.8 2.8 0 0 0-4-4L4 16Z" />
+      <path d="m14.5 5.5 4 4" />
+    </>
+  ),
+  trash: (
+    <>
+      <path d="M4 7h16" />
+      <path d="M9 7V4.5h6V7" />
+      <path d="M6.5 7l1 12.5h9L17.5 7" />
+      <path d="M10 11v5M14 11v5" />
+    </>
+  ),
+  check: <path d="m5 12.5 4.5 4.5L19 7" />,
 };
 
 export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {

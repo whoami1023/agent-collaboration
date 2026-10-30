@@ -2,10 +2,22 @@ import { readFile } from "node:fs/promises";
 import { newId } from "../core/ids";
 import type { PublicUser } from "../core/types";
 import { writeJsonAtomic } from "../store/persist";
-import { BUILTIN_SHARED_SKILLS } from "./builtin";
+import { BUILTIN_SHARED_SKILLS, BUILTIN_SKILLS_VERSION } from "./builtin";
+import {
+  formatSkillFileSize,
+  isSkillEntryPoint,
+  MAX_SKILL_BUNDLE_BYTES,
+  MAX_SKILL_FILES,
+  normalizeSkillFile,
+  normalizeSkillFilePath,
+  normalizeSkillFiles,
+  SkillFileError,
+  type SkillFileRecord,
+} from "./skill-files";
 import { parseSkillMarkdown, skillNameFromFile, SkillMarkdownError } from "./skill-md";
 
 export type SkillScope = "shared" | "personal";
+export type { SkillFileRecord } from "./skill-files";
 
 export interface SkillRecord {
   id: string;
@@ -14,6 +26,8 @@ export interface SkillRecord {
   name: string;
   description: string;
   instructions: string;
+  /** 技能目录里除 SKILL.md 之外的文件：脚本、参考资料、模板等。 */
+  files?: SkillFileRecord[];
   builtin?: boolean;
   imported?: boolean;
   source?: string;
@@ -32,11 +46,13 @@ export interface SkillInput {
   name?: unknown;
   description?: unknown;
   instructions?: unknown;
+  files?: unknown;
 }
 
 export interface SkillImportFile {
   filename?: unknown;
   content?: unknown;
+  encoding?: unknown;
 }
 
 export interface SkillImportInput {
@@ -62,14 +78,20 @@ export interface SkillLibraryOptions {
 interface SkillData {
   skills: SkillRecord[];
   removedBuiltins?: string[];
+  builtinVersion?: number;
 }
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,47}$/;
 const DESCRIPTION_MAX = 160;
 const INSTRUCTIONS_MAX = 20000;
 const MAX_SKILLS = 500;
-const MAX_IMPORT_FILES = 20;
-const MAX_FILENAME_CHARS = 120;
+/** 一次导入最多 20 个技能目录；目录里的附带文件单独计数，最多 200 项。 */
+const MAX_IMPORT_SKILLS = 20;
+const MAX_IMPORT_ENTRIES = 200;
+const MAX_FILENAME_CHARS = 240;
+/** 压缩包/系统垃圾：这些不该变成技能的附带文件。 */
+const IGNORED_IMPORT_PATHS = /(^|\/)(?:__MACOSX\/|\.DS_Store$|Thumbs\.db$|desktop\.ini$|\/\.)/i;
+
 
 export class SkillError extends Error {
   constructor(
@@ -123,10 +145,101 @@ function byName(a: SkillRecord, b: SkillRecord): number {
 }
 
 function importFilenameOf(raw: unknown): string {
-  if (typeof raw !== "string") return "SKILL.md";
-  const trimmed = raw.trim();
-  return trimmed ? trimmed.slice(-MAX_FILENAME_CHARS) : "SKILL.md";
+  if (typeof raw !== "string" || !raw.trim()) return "SKILL.md";
+  const slashed = raw.trim().replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+  if (!slashed) return "SKILL.md";
+  return slashed.length > MAX_FILENAME_CHARS ? `…/${slashed.slice(-MAX_FILENAME_CHARS)}` : slashed;
 }
+
+/** 技能目录：SKILL.md 所在的相对目录，根目录用空串表示。 */
+function importRootOf(filename: string): string {
+  const index = filename.lastIndexOf("/");
+  return index === -1 ? "" : filename.slice(0, index);
+}
+
+function stripRoot(filename: string, root: string): string {
+  if (!root) return filename;
+  return filename.startsWith(`${root}/`) ? filename.slice(root.length + 1) : filename;
+}
+
+function fitsRoot(filename: string, root: string): boolean {
+  return !root || filename.startsWith(`${root}/`);
+}
+
+function normalizeFilesInput(raw: unknown): SkillFileRecord[] {
+  try {
+    return normalizeSkillFiles(raw);
+  } catch (err) {
+    throw new SkillError(400, err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** 附带文件按路径排序后，同目录的文件相邻，列表里读起来才像一棵目录树。 */
+function sortFiles(files: SkillFileRecord[]): SkillFileRecord[] {
+  return [...files].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+interface ImportEntry {
+  filename: string;
+  content: unknown;
+  encoding?: unknown;
+}
+
+interface ImportGroup {
+  filename: string;
+  content: unknown;
+  root: string;
+  files: ImportEntry[];
+}
+
+/**
+ * 一个坏文件不该毁掉整个技能：路径非法、超预算的逐个跳过并写进警告，
+ * 剩下的照常导入（OpenClaw 的 skip-with-diagnostic 思路）。
+ */
+function collectBundleFiles(entries: ImportEntry[], warnings: string[]): SkillFileRecord[] {
+  const files: SkillFileRecord[] = [];
+  const seen = new Set<string>();
+  let total = 0;
+  for (const entry of entries) {
+    let file: SkillFileRecord;
+    try {
+      file = normalizeSkillFile({
+        path: entry.filename,
+        content: typeof entry.content === "string" ? entry.content : "",
+        encoding: entry.encoding,
+      });
+    } catch (err) {
+      warnings.push(`已跳过 ${entry.filename}：${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    const key = file.path.toLowerCase();
+    if (seen.has(key)) {
+      warnings.push(`已跳过重复的附带文件：${file.path}`);
+      continue;
+    }
+    if (files.length >= MAX_SKILL_FILES) {
+      warnings.push(`附带文件超过 ${MAX_SKILL_FILES} 个，${file.path} 及之后的文件已跳过。`);
+      break;
+    }
+    if (total + file.size > MAX_SKILL_BUNDLE_BYTES) {
+      warnings.push(
+        `附带文件合计接近 ${MAX_SKILL_BUNDLE_BYTES / 1024 / 1024} MB 上限，${file.path}（${formatSkillFileSize(file.size)}）已跳过。`,
+      );
+      continue;
+    }
+    seen.add(key);
+    total += file.size;
+    files.push(file);
+  }
+  return files;
+}
+
+function bundlePreview(files: SkillFileRecord[]): string {
+  const shown = files.slice(0, 4).map((file) => file.path).join("、");
+  return files.length > 4 ? `${shown} 等 ${files.length} 个` : shown;
+}
+
+
 
 /** 导入的 SKILL.md 常超出我们的字段上限：截断并提示，好过整条技能被拒。 */
 function fitImportedField(value: string, max: number, label: string, warnings: string[]): string {
@@ -170,11 +283,12 @@ export class SkillLibrary {
         removedBuiltins: Array.isArray(raw.removedBuiltins)
           ? raw.removedBuiltins.filter((name): name is string => typeof name === "string")
           : [],
+        ...(typeof raw.builtinVersion === "number" ? { builtinVersion: raw.builtinVersion } : {}),
       };
       if (this.installBuiltins()) await this.persist();
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      this.data = { skills: [], removedBuiltins: [] };
+      this.data = { skills: [], removedBuiltins: [], builtinVersion: 0 };
       this.installBuiltins();
       await this.persist();
     }
@@ -182,29 +296,48 @@ export class SkillLibrary {
 
   private installBuiltins(): boolean {
     if (!this.seedShared) return false;
-    const existing = new Set(
-      this.data.skills.filter((skill) => skill.scope === "shared").map((skill) => skill.name),
+    const byName = new Map(
+      this.data.skills
+        .filter((skill) => skill.scope === "shared")
+        .map((skill) => [skill.name, skill] as const),
     );
     const removed = new Set(this.data.removedBuiltins ?? []);
     const now = this.now();
-    let added = false;
+    const migrate = (this.data.builtinVersion ?? 0) < BUILTIN_SKILLS_VERSION;
+    let changed = false;
     for (const seed of BUILTIN_SHARED_SKILLS) {
-      if (existing.has(seed.name) || removed.has(seed.name)) continue;
-      this.data.skills.push({
-        id: newId("sk"),
-        scope: "shared",
-        ownerId: null,
-        name: seed.name,
-        description: seed.description,
-        instructions: seed.instructions,
-        builtin: true,
-        source: seed.source,
-        createdAt: now,
-        updatedAt: now,
-      });
-      added = true;
+      if (removed.has(seed.name)) continue;
+      const existing = byName.get(seed.name);
+      if (!existing) {
+        this.data.skills.push({
+          id: newId("sk"),
+          scope: "shared",
+          ownerId: null,
+          name: seed.name,
+          description: seed.description,
+          instructions: seed.instructions,
+          builtin: true,
+          source: seed.source,
+          createdAt: now,
+          updatedAt: now,
+        });
+        changed = true;
+        continue;
+      }
+      // 版本升级时刷新内置记录；管理员自建的同名技能保持原样。
+      if (migrate && existing.builtin) {
+        existing.description = seed.description;
+        existing.instructions = seed.instructions;
+        existing.source = seed.source;
+        existing.updatedAt = now;
+        changed = true;
+      }
     }
-    return added;
+    if (migrate) {
+      this.data.builtinVersion = BUILTIN_SKILLS_VERSION;
+      changed = true;
+    }
+    return changed;
   }
 
   listShared(): SkillRecord[] {
@@ -228,6 +361,49 @@ export class SkillLibrary {
     return this.listForAgent(userId).find((skill) => skill.name === name);
   }
 
+  /** 按路径取技能目录里的附带文件；路径大小写不敏感，与磁盘目录一致。 */
+  readSkillFile(
+    userId: string,
+    rawName: unknown,
+    rawPath: unknown,
+  ): { skill: SkillRecord; file: SkillFileRecord } | undefined {
+    const skill = this.readForAgent(userId, rawName);
+    if (!skill?.files?.length) return undefined;
+    if (typeof rawPath !== "string" || !rawPath.trim()) return undefined;
+    let path: string;
+    try {
+      path = normalizeSkillFilePath(rawPath);
+    } catch {
+      return undefined;
+    }
+    const key = path.toLowerCase();
+    const file = skill.files.find((candidate) => candidate.path.toLowerCase() === key);
+    return file ? { skill, file } : undefined;
+  }
+
+  /** 接口层按技能 id 取附带文件正文：共享技能任何登录用户可读，个人技能仅属主可读。 */
+  readFile(user: PublicUser, id: string, rawPath: unknown): SkillFileRecord {
+    const record = this.find(id);
+    if (record.scope === "personal" && record.ownerId !== user.id) {
+      throw new SkillError(403, "只能读取自己的个人技能文件");
+    }
+    const files = record.files ?? [];
+    if (files.length === 0) throw new SkillError(404, "该技能没有附带文件");
+    if (typeof rawPath !== "string" || !rawPath.trim()) {
+      throw new SkillError(400, "附带文件路径不能为空");
+    }
+    let path: string;
+    try {
+      path = normalizeSkillFilePath(rawPath);
+    } catch (err) {
+      throw new SkillError(400, err instanceof SkillFileError ? err.message : "附带文件路径无效");
+    }
+    const key = path.toLowerCase();
+    const file = files.find((candidate) => candidate.path.toLowerCase() === key);
+    if (!file) throw new SkillError(404, "技能里没有这个文件");
+    return file;
+  }
+
   async create(user: PublicUser, input: SkillInput): Promise<SkillRecord> {
     return this.mutate(async () => {
       const scope = normalizeScope(input.scope);
@@ -240,6 +416,7 @@ export class SkillLibrary {
       const name = normalizeName(input.name);
       const description = normalizeDescription(input.description);
       const instructions = normalizeInstructions(input.instructions);
+      const files = normalizeFilesInput(input.files);
       const ownerId = user.id;
       this.assertNameFree(name, scope, ownerId, null);
       const now = this.now();
@@ -250,6 +427,7 @@ export class SkillLibrary {
         name,
         description,
         instructions,
+        ...(files.length > 0 ? { files: sortFiles(files) } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -278,9 +456,12 @@ export class SkillLibrary {
       if (name !== record.name) {
         this.assertNameFree(name, record.scope, record.ownerId, record.id);
       }
+      const files = input.files === undefined ? record.files : normalizeFilesInput(input.files);
       record.name = name;
       record.description = description;
       record.instructions = instructions;
+      if (files && files.length > 0) record.files = sortFiles(files);
+      else delete record.files;
       record.updatedAt = this.now();
       await this.persist();
       return record;
@@ -308,26 +489,77 @@ export class SkillLibrary {
         throw new SkillError(403, "只有管理员可以导入共享技能");
       }
       const overwrite = input.overwrite === true;
-      const entries = Array.isArray(input.files) ? input.files : null;
-      if (!entries || entries.length === 0) {
+      const rawEntries = Array.isArray(input.files) ? input.files : null;
+      if (!rawEntries || rawEntries.length === 0) {
         throw new SkillError(400, "请选择或粘贴至少一份 SKILL.md");
       }
-      if (entries.length > MAX_IMPORT_FILES) {
-        throw new SkillError(400, `单次最多导入 ${MAX_IMPORT_FILES} 份技能`);
+      if (rawEntries.length > MAX_IMPORT_ENTRIES) {
+        throw new SkillError(
+          400,
+          `单次导入最多 ${MAX_IMPORT_ENTRIES} 个文件（含脚本等附带文件），请分批发起导入`,
+        );
       }
       const ownerId = user.id;
       const results: SkillImportResult[] = [];
-      let changed = false;
 
+      const entries: ImportEntry[] = [];
+      for (const raw of rawEntries) {
+        const entry = raw as SkillImportFile | null;
+        const filename = importFilenameOf(entry?.["filename"]);
+        if (IGNORED_IMPORT_PATHS.test(filename)) continue;
+        entries.push({
+          filename,
+          content: entry?.["content"],
+          encoding: entry?.["encoding"],
+        });
+      }
+      const entryFiles = entries.filter((entry) => isSkillEntryPoint(entry.filename));
+      if (entryFiles.length === 0 && entries.length > 1) {
+        throw new SkillError(
+          400,
+          "没找到 SKILL.md：请选择技能目录本身，或至少选中一份 SKILL.md",
+        );
+      }
+      if (entryFiles.length > MAX_IMPORT_SKILLS) {
+        throw new SkillError(400, `单次最多导入 ${MAX_IMPORT_SKILLS} 个技能`);
+      }
+
+      // 只给一份文件时不苛求文件名：它整份就是技能说明（兼容粘贴与改名后的 md）。
+      const entriesAsGroups = entries.length === 1 ? entries : entryFiles;
+      const entryPaths = new Set(entriesAsGroups.map((entry) => entry.filename));
+      const groups: ImportGroup[] = entriesAsGroups.map((entry) => ({
+        filename: entry.filename,
+        content: entry.content,
+        root: importRootOf(entry.filename),
+        files: [],
+      }));
+      // 目录越长越具体：`pdf/forms/SKILL.md` 下的脚本不该被根目录的 SKILL.md 抢走。
+      const bySpecificity = [...groups].sort((a, b) => b.root.length - a.root.length);
       for (const entry of entries) {
-        const filename = importFilenameOf((entry as SkillImportFile | null)?.["filename"]);
-        const content = (entry as SkillImportFile | null)?.["content"];
-        if (typeof content !== "string" || !content.trim()) {
-          results.push({ filename, ok: false, error: "文件内容为空" });
+        if (entryPaths.has(entry.filename)) continue;
+        const group = bySpecificity.find((candidate) => fitsRoot(entry.filename, candidate.root));
+        if (group) {
+          group.files.push({ ...entry, filename: stripRoot(entry.filename, group.root) });
+        } else if (groups.length === 1 && groups[0]) {
+          groups[0].files.push(entry);
+        } else {
+          results.push({
+            filename: entry.filename,
+            ok: false,
+            error: "附近没有 SKILL.md，无法判断它属于哪个技能",
+          });
+        }
+      }
+
+      let changed = false;
+      for (const group of groups) {
+        const filename = group.filename;
+        if (typeof group.content !== "string" || !group.content.trim()) {
+          results.push({ filename, ok: false, error: "SKILL.md 内容为空" });
           continue;
         }
         try {
-          const parsed = parseSkillMarkdown(content, { filename });
+          const parsed = parseSkillMarkdown(group.content, { filename });
           const warnings = [...parsed.warnings];
           const name = importedName(parsed.name, warnings);
           const description = fitImportedField(
@@ -342,6 +574,10 @@ export class SkillLibrary {
             "技能说明",
             warnings,
           );
+          const files = collectBundleFiles(group.files, warnings);
+          if (files.length > 0) {
+            warnings.push(`附带 ${files.length} 个文件：${bundlePreview(files)}`);
+          }
           const source = `导入自 ${filename}`;
           const existing = this.data.skills.find(
             (skill) => skill.scope === scope && skill.ownerId === ownerId && skill.name === name,
@@ -360,6 +596,12 @@ export class SkillLibrary {
             existing.instructions = instructions;
             existing.source = source;
             existing.imported = true;
+            if (files.length > 0) existing.files = sortFiles(files);
+            else if (existing.files?.length) {
+              warnings.push(
+                `本次没有附带文件，原有 ${existing.files.length} 个附带文件保持不变。`,
+              );
+            }
             existing.updatedAt = this.now();
             changed = true;
             results.push({ filename, ok: true, action: "updated", skill: existing, warnings });
@@ -377,6 +619,7 @@ export class SkillLibrary {
             name,
             description,
             instructions,
+            ...(files.length > 0 ? { files: sortFiles(files) } : {}),
             imported: true,
             source,
             createdAt: now,
@@ -390,7 +633,9 @@ export class SkillLibrary {
             filename,
             ok: false,
             error:
-              err instanceof SkillError || err instanceof SkillMarkdownError
+              err instanceof SkillError ||
+              err instanceof SkillMarkdownError ||
+              err instanceof SkillFileError
                 ? err.message
                 : `SKILL.md 解析失败：${err instanceof Error ? err.message : String(err)}`,
           });

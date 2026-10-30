@@ -115,6 +115,8 @@ function presentSearchResult(result: MemorySearchResult): Record<string, unknown
 export interface MemoryToolOptions {
   /** 检索时透传的项目键（对应 OpenClaw activeProjectKeys）。 */
   activeProjectKeys?: readonly string[];
+  /** 子成员 ID：检索/读取/追加都限定到这个成员自己的记忆文件。 */
+  agentId?: string;
 }
 
 export function buildMemoryTools(
@@ -128,7 +130,7 @@ export function buildMemoryTools(
     schema: {
       name: "memory_search",
       description:
-        "检索长期记忆（MEMORY.md、USER.md、memory/**.md）与已索引的群聊转录。答案依赖当前回合没有的既往工作、决定、日期、人物、偏好或待办时使用；上下文已够时不要重复检索。corpus=sessions 命中是转录摘录，行号是 seq。",
+        "检索长期记忆（共享 MEMORY.md、USER.md、memory/**.md；子成员另含自己的记忆文件）与已索引的群聊转录。答案依赖当前回合没有的既往工作、决定、日期、人物、偏好或待办时使用；上下文已够时不要重复检索。corpus=sessions 命中是转录摘录，行号是 seq。",
       parameters: {
         type: "object",
         properties: {
@@ -159,6 +161,7 @@ export function buildMemoryTools(
           ...(minScore !== undefined ? { minScore } : {}),
           sources: [...sources],
           ...(options.activeProjectKeys ? { activeProjectKeys: options.activeProjectKeys } : {}),
+          ...(options.agentId ? { agentId: options.agentId } : {}),
         });
         return JSON.stringify({
           results: results.map(presentSearchResult),
@@ -182,7 +185,7 @@ export function buildMemoryTools(
     schema: {
       name: "memory_get",
       description:
-        "按路径精确读取记忆文件片段（安全摘录）。只支持 MEMORY.md、USER.md、memory/**.md；群聊转录命中不支持此工具，用 room_history 扩上下文。status=ok 表示已读到请求的摘录；status=not_found 表示路径不在允许范围；status=error 表示读取失败，不代表记忆被禁用。",
+        "按路径精确读取记忆文件片段（安全摘录）。只支持 MEMORY.md、USER.md、memory/**.md；子成员还可读自己 agents/<成员ID>/ 下的 MEMORY.md 与 USER.md。群聊转录命中不支持此工具，用 room_history 扩上下文。status=ok 表示已读到请求的摘录；status=not_found 表示路径不在允许范围；status=error 表示读取失败，不代表记忆被禁用。",
       parameters: {
         type: "object",
         properties: {
@@ -204,6 +207,7 @@ export function buildMemoryTools(
         const file = await manager.readFile(relPath ?? "", {
           ...(from !== undefined ? { from } : {}),
           ...(lines !== undefined ? { lines } : {}),
+          ...(options.agentId ? { agentId: options.agentId } : {}),
         });
         return JSON.stringify({
           status: "ok",
@@ -225,7 +229,7 @@ export function buildMemoryTools(
     schema: {
       name: "memory_append",
       description:
-        "把一条值得长期保留的事实追加到 MEMORY.md 策展条目区。一条只写一个事实（用户偏好、项目决定、日期/人物、可复用做法），别塞过程性废话。写入格式：- 正文 <!-- trigger: 触发短语, 另一个说法 --> <!-- importance: 1-10 -->。",
+        "把一条值得长期保留的事实追加到 MEMORY.md 策展条目区（子成员追加到自己的 MEMORY.md）。一条只写一个事实（用户偏好、项目决定、日期/人物、可复用做法），别塞过程性废话。写入格式：- 正文 <!-- trigger: 触发短语, 另一个说法 --> <!-- importance: 1-10 -->。",
       parameters: {
         type: "object",
         properties: {
@@ -251,10 +255,14 @@ export function buildMemoryTools(
       if (importance !== undefined && importance > 10) {
         throw new ToolInputError("importance must be between 1 and 10");
       }
-      const written = await manager.appendEntry(text ?? "", {
-        ...(triggers?.length ? { triggers } : {}),
-        ...(importance !== undefined ? { importance } : {}),
-      });
+      const written = await manager.appendEntry(
+        text ?? "",
+        {
+          ...(triggers?.length ? { triggers } : {}),
+          ...(importance !== undefined ? { importance } : {}),
+        },
+        options.agentId ? { agentId: options.agentId } : undefined,
+      );
       return JSON.stringify({ status: "ok", path: written });
     },
   });

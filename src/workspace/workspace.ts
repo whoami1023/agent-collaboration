@@ -79,7 +79,9 @@ export class Workspace {
 
     const workspace = new Workspace(owner.id, dir, bus, board, orchestrator, settingsRef, memory);
     bus.subscribe((event) => {
-      if (event.type === "message" || event.type === "member") workspace.scheduleSave();
+      if (event.type === "message" || event.type === "member" || event.type === "member-removed") {
+        workspace.scheduleSave();
+      }
       if (event.type === "message") memory.markDirty();
     });
     board.subscribe(() => workspace.scheduleSave());

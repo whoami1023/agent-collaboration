@@ -1,9 +1,9 @@
 {
   "name": "agent-collaboration",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Group-chat multi-agent collaboration: a main agent spawns members and dispatches work by @mention.",
+  "description": "Group-chat multi-agent collaboration: users create members, agents dispatch work by @mention.",
   "scripts": {
     "dev": "tsx watch src/server/index.ts",
     "start": "tsx src/server/index.ts",

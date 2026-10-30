@@ -166,6 +166,8 @@ export async function resolveTriggerRecall(params: {
   message: string;
   activeProjectKeys?: string[];
   signal?: AbortSignal;
+  /** 子成员 ID：只召回共享记忆与该成员自己的记忆文件。 */
+  agentId?: string;
 }): Promise<{ context?: string; hasStrongHit: boolean; injectedCount: number }> {
   params.signal?.throwIfAborted();
   // Lane-1 runs on every eligible inbound message; it must stay
@@ -178,6 +180,7 @@ export async function resolveTriggerRecall(params: {
       lexicalOnly: true,
       activeProjectKeys: [...(params.activeProjectKeys ?? [])],
       signal: params.signal,
+      ...(params.agentId ? { agentId: params.agentId } : {}),
     })
     .catch(() => []);
   const candidates = toTriggerRecallHits(retrieved);

@@ -6,13 +6,14 @@ import type { Workboard } from "../workboard/board";
 import type { LlmMessage } from "../provider/types";
 import { resolveProvider, type ProviderDeps } from "../provider/registry";
 import type { SkillLibrary } from "../skills/library";
+import { selectSkillsForMember } from "../skills/selection";
 import type { MemorySearchManager } from "../memory/manager";
 import { resolveTriggerRecall } from "../memory/recall";
 import { runAgentLoop } from "./loop";
 import { DEFAULT_COMPACTION_SETTINGS } from "./context/compaction";
 import { resolveMaxActiveTranscriptBytes, type TranscriptByteCompactionLatch } from "./context/bounded-context";
 import type { ContextBudgetConfig } from "./context/budget";
-import { buildTools, type SpawnInput } from "./tools";
+import { buildTools } from "./tools";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
 
 export interface RuntimeDeps {
@@ -23,7 +24,6 @@ export interface RuntimeDeps {
   skills: SkillLibrary;
   ownerId: string;
   memory?: MemorySearchManager;
-  spawn(parent: Member, input: SpawnInput, trigger: RoomMessage): Promise<string>;
   onFinished?(memberId: string): void;
 }
 
@@ -106,20 +106,23 @@ export class MemberRuntime {
           taskTitles.set(task.ownerId, `${task.title}（${task.status}）`);
         }
       }
-      const parent = this.member.spawnedBy ? bus.getMember(this.member.spawnedBy) : undefined;
-      const skills = this.deps.skills.listForAgent(this.deps.ownerId);
-      const tools = buildTools(this.member, {
+      // 运行时缓存的成员对象可能在面板里被改过（如技能白名单），每次运行都取总线上的最新值。
+      const member = bus.getMember(this.member.id) ?? this.member;
+      const parent = member.spawnedBy ? bus.getMember(member.spawnedBy) : undefined;
+      const skills = selectSkillsForMember(
+        this.deps.skills.listForAgent(this.deps.ownerId),
+        member.skillNames,
+      );
+      const tools = buildTools(member, {
         bus,
         board,
-        limits,
         skills: this.deps.skills,
         userId: this.deps.ownerId,
         ...(this.deps.memory ? { memory: this.deps.memory } : {}),
-        spawn: (input) => this.deps.spawn(this.member, input, trigger),
       });
       const system = buildSystemPrompt({
         roomName: bus.roomName,
-        member: this.member,
+        member,
         members: bus.listMembers(),
         parentName: parent?.name ?? null,
         taskTitles,
@@ -138,6 +141,7 @@ export class MemberRuntime {
           manager: this.deps.memory,
           message: trigger.text,
           signal: controller.signal,
+          ...(member.role === "sub" ? { agentId: member.id } : {}),
         }).catch(() => undefined);
         recallContext = recall?.context;
       }
@@ -147,7 +151,7 @@ export class MemberRuntime {
           role: "user",
           content:
             `${recallContext ? `${recallContext}\n\n` : ""}` +
-            `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(this.member, trigger)}`,
+            `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(member, trigger)}`,
         },
       ];
       const { provider, model } = resolveProvider(this.member.providerId, this.deps.getProviderDeps());
@@ -195,6 +199,12 @@ export class MemberRuntime {
           this.notice(`@${this.member.name} 的文本式工具调用已被修复执行：${toolNames.join("、")}`),
         pullPending: () => this.pending.splice(0, this.pending.length),
       });
+
+      // 运行期间成员被移除：不再以已移除成员的身份往群里发言。
+      if (!bus.getMember(this.member.id)) {
+        this.emit({ type: "run-aborted", runId, memberId: this.member.id });
+        return;
+      }
 
       if (result.error) {
         this.emit({ type: "run-error", runId, memberId: this.member.id, error: result.error });

@@ -5,24 +5,29 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
 } from "react";
-import type { PublicUser, RoomEvent, RoomMessage, TaskCard } from "../../src/core/types";
+import type { Member, PublicUser, RoomEvent, RoomMessage, TaskCard } from "../../src/core/types";
 import { Icon } from "./icons";
 import SkillLibraryPanel from "./SkillLibrary";
 import {
   ApiError,
   cancelMember,
+  createMember,
   createTask,
   createUser,
   fetchBootstrap,
   fetchMe,
   fetchMemberFileContent,
   fetchMemberFiles,
+  fetchMemberSkills,
   fetchState,
   listUsers,
   loginUser,
   logoutUser,
   patchTask,
+  removeMember,
   resetUserPassword,
+  saveMemberFile,
+  saveMemberSkills,
   saveSettings,
   sendMessage,
   setupAdmin,
@@ -31,6 +36,7 @@ import {
   type AgentFileContent,
   type AgentFileEntry,
   type MaskedSettings,
+  type MemberSkillsView,
   type StateSnapshot,
 } from "./api";
 import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdown/MarkdownText";
@@ -131,6 +137,14 @@ function upsert<T extends { id: string }>(items: T[], next: T): T[] {
   const copy = items.slice();
   copy[index] = next;
   return copy;
+}
+
+/** 技能授权比较：null 表示「全部」，与显式列出的全部技能视为不同（新技能是否自动启用不同）。 */
+function sameSkillSet(a: string[] | null, b: string[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every((name) => set.has(name));
 }
 
 function clock(ts: number): string {
@@ -439,11 +453,12 @@ function RoomView({
   const panesRef = useRef<PaneWidths>(panes);
   const endDragRef = useRef<(() => void) | null>(null);
   const [selectedMemberId, setSelectedMemberId] = useState<string | null>(null);
-  const [filesRefreshSeq, setFilesRefreshSeq] = useState(0);
+  const [newMemberOpen, setNewMemberOpen] = useState(false);
   const [agentFiles, setAgentFiles] = useState<AgentFileEntry[] | null>(null);
   const [agentFileError, setAgentFileError] = useState<string | null>(null);
   const [openFilePath, setOpenFilePath] = useState<string | null>(null);
   const [openFile, setOpenFile] = useState<AgentFileContent | null>(null);
+  const [fileContentSeq, setFileContentSeq] = useState(0);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const checkingSession = useRef(false);
@@ -636,9 +651,9 @@ function RoomView({
   }, [members]);
 
   const selectedMember = members.find((member) => member.id === selectedMemberId);
-  const inWarRoom = !skillsOpen && !selectedMember;
-  /** 技能库 / 智能体文件独占右侧整块区域：此时连作战室（群聊）一起收起。 */
-  const takeover = skillsOpen || Boolean(selectedMember);
+  const inWarRoom = !skillsOpen && !newMemberOpen && !selectedMember;
+  /** 技能库 / 智能体文件 / 新建成员独占右侧整块区域：此时连作战室（群聊）一起收起。 */
+  const takeover = skillsOpen || newMemberOpen || Boolean(selectedMember);
   const panelVisible = boardOpen || takeover;
   const runningCount = members.filter((member) => member.status === "running").length;
 
@@ -657,6 +672,31 @@ function RoomView({
   async function handleCancel(memberId: string) {
     try {
       await cancelMember(memberId);
+    } catch (err) {
+      setError(messageOf(err));
+    }
+  }
+
+  async function handleRemoveMember(member: Member) {
+    const confirmed = window.confirm(
+      `移除成员 @${member.name}？\n\n它会从群聊成员中移除，名下任务改为未指派，它的智能体文件（agents 目录）会一并删除；历史消息保留。`,
+    );
+    if (!confirmed) return;
+    setError(null);
+    try {
+      await removeMember(member.id);
+      setState((current) =>
+        current
+          ? { ...current, members: current.members.filter((item) => item.id !== member.id) }
+          : current,
+      );
+      setRuns((current) => {
+        if (!(member.id in current)) return current;
+        const copy = { ...current };
+        delete copy[member.id];
+        return copy;
+      });
+      if (selectedMemberId === member.id) setSelectedMemberId(null);
     } catch (err) {
       setError(messageOf(err));
     }
@@ -684,7 +724,7 @@ function RoomView({
     return () => {
       alive = false;
     };
-  }, [selectedMemberId, filesRefreshSeq]);
+  }, [selectedMemberId]);
 
   // 房间来新消息（记忆可能被写入/转录增长）时静默刷新文件清单，保持当前打开的文件。
   useEffect(() => {
@@ -702,13 +742,21 @@ function RoomView({
     };
   }, [selectedMemberId, messages.length]);
 
+  /** 只刷新清单元信息，不动当前选中的文件。 */
+  function refreshFileList() {
+    if (!selectedMemberId) return;
+    fetchMemberFiles(selectedMemberId)
+      .then((list) => setAgentFiles(list))
+      .catch((err: unknown) => setAgentFileError(messageOf(err)));
+  }
+
   function reloadAgentFiles() {
-    setFilesRefreshSeq((seq) => seq + 1);
+    refreshFileList();
+    setFileContentSeq((seq) => seq + 1);
   }
 
   function closeAgentFiles() {
     setSelectedMemberId(null);
-    setFilesRefreshSeq((seq) => seq + 1);
   }
 
   useEffect(() => {
@@ -725,10 +773,40 @@ function RoomView({
     return () => {
       alive = false;
     };
-  }, [selectedMemberId, openFilePath]);
+  }, [selectedMemberId, openFilePath, fileContentSeq]);
+
+  async function saveOpenFile(path: string, text: string) {
+    if (!selectedMemberId) return;
+    try {
+      await saveMemberFile(selectedMemberId, path, text);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        throw new Error("服务端还没有文件保存接口（404），请重启服务后重试。");
+      }
+      throw err;
+    }
+    setFileContentSeq((seq) => seq + 1);
+    refreshFileList();
+  }
+
+  /** 编辑长文件时取全文，避免把预览截断后的内容写回覆盖后半部分。 */
+  async function loadFullFile(): Promise<string> {
+    if (!selectedMemberId || !openFilePath) throw new Error("没有打开的文件");
+    const file = await fetchMemberFileContent(selectedMemberId, openFilePath, { full: true });
+    return file.content;
+  }
 
   function openAgentFiles(memberId: string) {
     setSelectedMemberId(memberId);
+    setNewMemberOpen(false);
+    setSkillsOpen(false);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
+  function openNewMember() {
+    setNewMemberOpen(true);
+    setSelectedMemberId(null);
     setSkillsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
@@ -736,6 +814,7 @@ function RoomView({
 
   function openSkills() {
     setSkillsOpen(true);
+    setNewMemberOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -743,6 +822,7 @@ function RoomView({
   /** 作战室＝聊天本身：收起右侧的技能库/智能体文件，把焦点还给输入框。 */
   function goToWarRoom() {
     setSkillsOpen(false);
+    setNewMemberOpen(false);
     setSelectedMemberId(null);
     setNavOpen(false);
     requestAnimationFrame(() => composerRef.current?.focus());
@@ -861,6 +941,17 @@ function RoomView({
 
             <button
               type="button"
+              className={`nav-item${newMemberOpen ? " active" : ""}`}
+              aria-pressed={newMemberOpen}
+              onClick={() => (newMemberOpen ? setNewMemberOpen(false) : openNewMember())}
+            >
+              <Icon name="plus" />
+              <span className="nav-label">新建成员</span>
+              <span className="nav-hint">按描述生成档案</span>
+            </button>
+
+            <button
+              type="button"
               className="nav-item"
               aria-expanded={membersOpen}
               onClick={() => setMembersOpen((open) => !open)}
@@ -909,6 +1000,17 @@ function RoomView({
                 {member.status === "running" && (
                   <button className="btn sm" onClick={() => void handleCancel(member.id)}>
                     取消
+                  </button>
+                )}
+                {member.role === "sub" && (
+                  <button
+                    type="button"
+                    className="btn icon ghost danger member-remove"
+                    aria-label={`移除成员 @${member.name}`}
+                    title="移除成员"
+                    onClick={() => void handleRemoveMember(member)}
+                  >
+                    <Icon name="trash" />
                   </button>
                 )}
               </li>
@@ -1052,6 +1154,19 @@ function RoomView({
               <span>智能体文件</span>
               <span className="chip">@{selectedMember.name}</span>
             </button>
+          ) : newMemberOpen ? (
+            <button
+              type="button"
+              className="btn ghost board-toggle"
+              aria-pressed
+              aria-controls="new-member-panel"
+              title="收起新建成员，回到作战室"
+              onClick={() => setNewMemberOpen(false)}
+            >
+              <Icon name="plus" />
+              <span>新建成员</span>
+              <span className="chip">按描述生成档案</span>
+            </button>
           ) : (
             <button
               type="button"
@@ -1174,7 +1289,19 @@ function RoomView({
             content={openFile}
             onSelectPath={setOpenFilePath}
             onRefresh={reloadAgentFiles}
+            onSave={saveOpenFile}
+            onLoadFull={loadFullFile}
             onClose={closeAgentFiles}
+          />
+        </aside>
+      ) : newMemberOpen ? (
+        <aside id="new-member-panel" className="board-panel" aria-label="新建成员">
+          <NewMemberPanel
+            onClose={() => setNewMemberOpen(false)}
+            onCreated={(member) => {
+              setNewMemberOpen(false);
+              openAgentFiles(member.id);
+            }}
           />
         </aside>
       ) : (
@@ -1273,6 +1400,8 @@ function AgentFilesPanel({
   content,
   onSelectPath,
   onRefresh,
+  onSave,
+  onLoadFull,
   onClose,
 }: {
   member: { id: string; name: string };
@@ -1282,8 +1411,155 @@ function AgentFilesPanel({
   content: AgentFileContent | null;
   onSelectPath: (path: string) => void;
   onRefresh: () => void;
+  onSave: (path: string, text: string) => Promise<void>;
+  onLoadFull: () => Promise<string>;
   onClose: () => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [loadingFull, setLoadingFull] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [showSkills, setShowSkills] = useState(false);
+  const [skillView, setSkillView] = useState<MemberSkillsView | null>(null);
+  // null = 未限制（全部技能）；数组 = 明确勾选的技能名。
+  const [skillDraft, setSkillDraft] = useState<string[] | null>(null);
+  const [skillLoading, setSkillLoading] = useState(false);
+  const [skillSaving, setSkillSaving] = useState(false);
+  const [skillError, setSkillError] = useState<string | null>(null);
+  const [skillNotice, setSkillNotice] = useState<string | null>(null);
+  const skillRequest = useRef(0);
+
+  // 换文件就退出编辑态，免得把上一份草稿写进另一份文件。
+  useEffect(() => {
+    setEditing(false);
+    setSaveError(null);
+  }, [content?.path]);
+
+  // 换智能体时丢掉上一份技能视图，避免把 A 的勾选保存给 B。
+  useEffect(() => {
+    skillRequest.current += 1;
+    setSkillView(null);
+    setSkillDraft(null);
+    setSkillError(null);
+    setSkillNotice(null);
+    setSkillLoading(false);
+  }, [member.id]);
+
+  async function loadSkills() {
+    const seq = ++skillRequest.current;
+    setSkillLoading(true);
+    setSkillError(null);
+    try {
+      const view = await fetchMemberSkills(member.id);
+      if (seq !== skillRequest.current) return;
+      setSkillView(view);
+      setSkillDraft(view.enabled);
+      setSkillNotice(null);
+    } catch (err) {
+      if (seq !== skillRequest.current) return;
+      setSkillError(
+        err instanceof ApiError && err.status === 404
+          ? "服务端还没有技能授权接口（404），请重启服务后重试。"
+          : messageOf(err),
+      );
+    } finally {
+      if (seq === skillRequest.current) setSkillLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!showSkills) return;
+    void loadSkills();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showSkills, member.id]);
+
+  const skillDirty = skillView !== null && !sameSkillSet(skillDraft, skillView.enabled);
+  const enabledSkillCount = skillView
+    ? skillDraft === null
+      ? skillView.skills.length
+      : skillDraft.length
+    : 0;
+
+  function toggleSkill(name: string) {
+    setSkillNotice(null);
+    setSkillDraft((current) => {
+      const all = skillView?.skills.map((skill) => skill.name) ?? [];
+      if (current === null) return all.filter((item) => item !== name);
+      return current.includes(name)
+        ? current.filter((item) => item !== name)
+        : [...current, name];
+    });
+  }
+
+  async function saveSkills() {
+    if (!skillView) return;
+    setSkillSaving(true);
+    setSkillError(null);
+    setSkillNotice(null);
+    try {
+      const view = await saveMemberSkills(member.id, skillDraft);
+      setSkillView(view);
+      setSkillDraft(view.enabled);
+      setSkillNotice("已保存，从该智能体下一次运行开始生效");
+    } catch (err) {
+      setSkillError(
+        err instanceof ApiError && err.status === 404
+          ? "服务端还没有技能授权接口（404），请重启服务后重试。"
+          : messageOf(err),
+      );
+    } finally {
+      setSkillSaving(false);
+    }
+  }
+
+  const dirty = editing && content !== null && draft !== content.content;
+
+  async function startEdit() {
+    if (!content || loadingFull) return;
+    setSaveError(null);
+    if (!content.truncated) {
+      setDraft(content.content);
+      setEditing(true);
+      return;
+    }
+    setLoadingFull(true);
+    try {
+      setDraft(await onLoadFull());
+      setEditing(true);
+    } catch (err) {
+      setSaveError(messageOf(err));
+    } finally {
+      setLoadingFull(false);
+    }
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setSaveError(null);
+    setDraft("");
+  }
+
+  function pickFile(path: string) {
+    if (path === activePath) return;
+    if (dirty && !window.confirm("当前文件有未保存的修改，切换后会丢失。继续吗？")) return;
+    onSelectPath(path);
+  }
+
+  async function save() {
+    if (!content) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await onSave(content.path, draft);
+      setEditing(false);
+    } catch (err) {
+      setSaveError(messageOf(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <div className="board-sheet files-sheet">
       <div className="board-head">
@@ -1292,10 +1568,32 @@ function AgentFilesPanel({
           <span className="chip">@{member.name}</span>
           <button
             type="button"
+            className={`btn ghost sm${showSkills ? " active" : ""}`}
+            aria-pressed={showSkills}
+            title={showSkills ? "返回智能体文件" : "勾选这个智能体能使用的技能"}
+            onClick={() => setShowSkills((open) => !open)}
+          >
+            <Icon name="book" />
+            <span>技能</span>
+          </button>
+          {!showSkills && content && !editing && (
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() => void startEdit()}
+              disabled={loadingFull}
+              title={content.truncated ? "载入全文后编辑并保存" : "编辑这份文件"}
+            >
+              <Icon name="edit" />
+              <span>{loadingFull ? "载入全文…" : "编辑"}</span>
+            </button>
+          )}
+          <button
+            type="button"
             className="btn icon ghost board-close"
-            aria-label="刷新文件清单"
-            title="刷新文件清单"
-            onClick={onRefresh}
+            aria-label={showSkills ? "刷新技能清单" : "刷新文件清单"}
+            title={showSkills ? "刷新技能清单" : "刷新文件清单"}
+            onClick={showSkills ? () => void loadSkills() : onRefresh}
           >
             <Icon name="refresh" />
           </button>
@@ -1310,37 +1608,188 @@ function AgentFilesPanel({
           </button>
         </div>
       </div>
-      <div className="files-tabs" role="tablist" aria-label="文件列表">
-        {files === null && !fileError && (
-          <span className="chip" role="status">
-            载入中…
-          </span>
-        )}
-        {fileError && <span className="files-error">{fileError}</span>}
-        {files?.map((file) => (
-          <button
-            key={file.path}
-            type="button"
-            role="tab"
-            aria-selected={activePath === file.path}
-            className={`file-tab${activePath === file.path ? " active" : ""}`}
-            title={`${file.path} · ${formatBytes(file.sizeBytes)} · ${clock(file.updatedAt)}`}
-            onClick={() => onSelectPath(file.path)}
-          >
-            {file.path}
-          </button>
-        ))}
-      </div>
+      {!showSkills && (
+        <div className="files-tabs" role="tablist" aria-label="文件列表">
+          {files === null && !fileError && (
+            <span className="chip" role="status">
+              载入中…
+            </span>
+          )}
+          {fileError && <span className="files-error">{fileError}</span>}
+          {files?.map((file) => (
+            <button
+              key={file.path}
+              type="button"
+              role="tab"
+              aria-selected={activePath === file.path}
+              className={`file-tab${activePath === file.path ? " active" : ""}`}
+              title={`${file.path} · ${formatBytes(file.sizeBytes)} · ${clock(file.updatedAt)}`}
+              onClick={() => pickFile(file.path)}
+            >
+              {file.path}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="board-body files-body">
-        {content ? (
+        {showSkills ? (
+          <div className="agent-skills-view">
+            <div className="files-path-line">
+              <span className="files-path">技能授权</span>
+              <span className="files-lines">
+                {skillView ? `已启用 ${enabledSkillCount}/${skillView.skills.length}` : ""}
+              </span>
+            </div>
+            {skillLoading && !skillView ? (
+              <p className="files-note" role="status">
+                载入可用技能…
+              </p>
+            ) : null}
+            {skillError && (
+              <p className="files-save-error" role="alert">
+                {skillError}
+              </p>
+            )}
+            {skillView && (
+              <>
+                <label className="agent-skill-row master">
+                  <input
+                    type="checkbox"
+                    checked={skillDraft === null}
+                    onChange={(event) => setSkillDraft(event.target.checked ? null : [])}
+                  />
+                  <span className="agent-skill-main">
+                    <span className="agent-skill-name">全部技能</span>
+                    <span className="agent-skill-desc">
+                      不限制；以后新增的技能也会自动启用
+                    </span>
+                  </span>
+                </label>
+                {skillView.skills.length === 0 ? (
+                  <p className="files-empty">技能库还是空的，先到「技能库」创建或导入技能。</p>
+                ) : (
+                  <ul className="agent-skills-list" aria-label="可用技能">
+                    {skillView.skills.map((skill) => {
+                      const checked = skillDraft === null || skillDraft.includes(skill.name);
+                      return (
+                        <li key={skill.name}>
+                          <label className="agent-skill-row">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleSkill(skill.name)}
+                            />
+                            <span className="agent-skill-main">
+                              <span className="agent-skill-name">
+                                {skill.name}
+                                {skill.builtin ? <span className="chip">内置</span> : null}
+                              </span>
+                              <span className="agent-skill-desc">{skill.description}</span>
+                            </span>
+                            <span className="agent-skill-scope">
+                              {skill.scope === "shared" ? "共享" : "个人"}
+                            </span>
+                          </label>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+                <p className="files-note">
+                  只勾选这个智能体能看到的技能：提示词只列勾选项，use_skill / read_skill_file
+                  也会拒绝未勾选的技能。保存后从它下一次运行开始生效。
+                </p>
+                <div className="files-edit-actions">
+                  <span className="files-note">
+                    {skillNotice ?? (skillDirty ? "尚未保存" : "已与服务器一致")}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={() => {
+                      setSkillDraft(skillView.enabled);
+                      setSkillNotice(null);
+                      setSkillError(null);
+                    }}
+                    disabled={!skillDirty || skillSaving}
+                  >
+                    重置
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm primary"
+                    onClick={() => void saveSkills()}
+                    disabled={!skillDirty || skillSaving}
+                  >
+                    <Icon name="check" />
+                    <span>{skillSaving ? "保存中…" : "保存"}</span>
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        ) : content ? (
           <>
             <div className="files-path-line">
               <span className="files-path">{content.path}</span>
-              <span className="files-lines">{content.totalLines} 行</span>
+              <span className="files-lines">
+                {editing ? `${draft.split("\n").length} 行 · 未保存` : `${content.totalLines} 行`}
+              </span>
             </div>
-            <pre className="files-content">{content.content}</pre>
-            {content.truncated && (
-              <p className="files-note">较长的文件按记忆检索口径截断展示。</p>
+            {editing ? (
+              <>
+                <textarea
+                  className="files-editor"
+                  value={draft}
+                  spellCheck={false}
+                  aria-label={`编辑 ${content.path}`}
+                  onChange={(event) => setDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+                      event.preventDefault();
+                      if (!saving) void save();
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      cancelEdit();
+                    }
+                  }}
+                />
+                {saveError && (
+                  <p className="files-save-error" role="alert">
+                    {saveError}
+                  </p>
+                )}
+                <div className="files-edit-actions">
+                  <span className="files-note">Ctrl/⌘+S 保存 · Esc 取消</span>
+                  <button type="button" className="btn sm" onClick={cancelEdit} disabled={saving}>
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm primary"
+                    onClick={() => void save()}
+                    disabled={saving || !dirty}
+                  >
+                    <Icon name="check" />
+                    <span>{saving ? "保存中…" : "保存"}</span>
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <pre className="files-content">{content.content}</pre>
+                {content.truncated && (
+                  <p className="files-note">
+                    较长文件只预览前 400 行；点「编辑」会载入全文，保存不会丢内容。
+                  </p>
+                )}
+              </>
+            )}
+            {saveError && !editing && (
+              <p className="files-save-error" role="alert">
+                {saveError}
+              </p>
             )}
           </>
         ) : fileError ? (
@@ -1351,6 +1800,110 @@ function AgentFilesPanel({
             与 IDENTITY.md 模板；若被删除，重新打开房间会再次补齐。
           </p>
         )}
+      </div>
+    </div>
+  );
+}
+
+function NewMemberPanel({
+  onClose,
+  onCreated,
+}: {
+  onClose: () => void;
+  onCreated: (member: Member) => void;
+}) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const trimmedName = name.trim();
+    const trimmedDescription = description.trim();
+    if (!trimmedName) {
+      setError("请先给成员起个名字，群里用 @名字 找它。");
+      return;
+    }
+    if (!trimmedDescription) {
+      setError("请描述这个成员负责什么，创建时会据此生成它的智能体文件。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const member = await createMember({ name: trimmedName, description: trimmedDescription });
+      onCreated(member);
+    } catch (err) {
+      setError(
+        err instanceof ApiError && err.status === 404
+          ? "服务端还没有新建成员接口（404），请重启服务后重试。"
+          : messageOf(err),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="board-sheet new-member-sheet">
+      <div className="board-head">
+        <span className="section-label">新建成员</span>
+        <div className="board-head-actions">
+          <button
+            type="button"
+            className="btn icon ghost board-close"
+            aria-label="关闭新建成员面板"
+            title="关闭面板，回到作战室"
+            onClick={onClose}
+          >
+            <Icon name="close" />
+          </button>
+        </div>
+      </div>
+      <div className="board-body">
+        <p className="new-member-hint">
+          新建一个子智能体加入成员列表。名字是群里 @ 它的引用；功能描述会写进它的默认智能体文件（SOUL.md
+          与 IDENTITY.md）。每个成员还拥有自己的 MEMORY.md 与 USER.md，记忆检索只在该成员自己的范围内命中；创建后都可在「智能体文件」里继续修改。
+        </p>
+        <form className="new-member-form" onSubmit={submit}>
+          <label className="field">
+            <span>成员名</span>
+            <input
+              value={name}
+              maxLength={12}
+              placeholder="例如：调研员"
+              autoFocus
+              onChange={(event) => setName(event.target.value)}
+            />
+            <small className="form-note">1-12 个中英文、数字、下划线或短横线</small>
+          </label>
+          <label className="field">
+            <span>功能描述</span>
+            <textarea
+              value={description}
+              maxLength={800}
+              rows={7}
+              placeholder="例如：负责检索资料并给出带出处的结论；不需要写代码，遇到需要动手的活就说明清楚交给别人。"
+              onChange={(event) => setDescription(event.target.value)}
+            />
+            <small className="form-note">据此生成 SOUL.md 与 IDENTITY.md，最多 800 字</small>
+          </label>
+          {error && (
+            <p className="form-error" role="alert">
+              {error}
+            </p>
+          )}
+          <div className="new-member-actions">
+            <button
+              className="btn primary"
+              type="submit"
+              disabled={busy || !name.trim() || !description.trim()}
+            >
+              {busy ? "创建中…" : "创建成员"}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   );
@@ -1408,6 +1961,13 @@ function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnaps
   }
   if (event.type === "member") {
     return { ...current, members: upsert(current.members, event.member) };
+  }
+  if (event.type === "member-removed") {
+    if (!current.members.some((member) => member.id === event.memberId)) return current;
+    return {
+      ...current,
+      members: current.members.filter((member) => member.id !== event.memberId),
+    };
   }
   if (event.type === "task") {
     return { ...current, tasks: upsert(current.tasks, event.task) };
