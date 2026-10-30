@@ -85,3 +85,43 @@ describe("wake decisions", () => {
     expect(decision.wakes).toEqual([]);
   });
 });
+
+describe("free mode wake decisions", () => {
+  it("自由交流允许同级成员直接 @ 对方", () => {
+    const decision = decideWakes(
+      message({
+        senderId: researcher.id,
+        senderName: researcher.name,
+        senderKind: "member",
+        mentions: [writer.id],
+      }),
+      [main, researcher, writer],
+      "free",
+    );
+    expect(decision.wakes).toEqual([writer.id]);
+    expect(decision.skipped).toEqual([]);
+  });
+
+  it("自由交流下成员报告不直接唤醒父级，交给收集器统一总结", () => {
+    const decision = decideWakes(
+      message({
+        senderId: researcher.id,
+        senderName: researcher.name,
+        senderKind: "member",
+        kind: "announce",
+      }),
+      [main, researcher],
+      "free",
+    );
+    expect(decision.wakes).toEqual([]);
+  });
+
+  it("自由交流下用户消息仍唤醒主智能体与被 @ 成员", () => {
+    const decision = decideWakes(
+      message({ text: "@研究员 先说说你的思路", mentions: [researcher.id] }),
+      [main, researcher],
+      "free",
+    );
+    expect(decision.wakes).toEqual([researcher.id, main.id]);
+  });
+});

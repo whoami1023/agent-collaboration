@@ -17,6 +17,7 @@ export type IconName =
   | "book"
   | "chat"
   | "inspect"
+  | "search"
   | "refresh"
   | "import"
   | "folder"
@@ -100,6 +101,12 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
       <path d="M14 8h5" />
       <circle cx="17.5" cy="16.5" r="3" />
       <path d="M19.8 18.8 22 21" />
+    </>
+  ),
+  search: (
+    <>
+      <circle cx="11" cy="11" r="6.5" />
+      <path d="m16 16 4 4" />
     </>
   ),
   refresh: (

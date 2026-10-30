@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { ensureMainMember, Orchestrator } from "../agent/orchestrator";
 import { loadSettings, saveSettings, type Settings } from "../core/settings";
-import type { Member, RoomMessage, TaskCard } from "../core/types";
+import type { Member, RoomMessage, RoomMode, TaskCard } from "../core/types";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
 import { WorkspaceFiles } from "../files/workspace-files";
@@ -15,6 +15,7 @@ interface PersistedState {
   messages: RoomMessage[];
   seq: number;
   tasks: TaskCard[];
+  mode?: RoomMode;
 }
 
 export interface WorkspaceOwner {
@@ -51,7 +52,7 @@ export class Workspace {
     const bus = new RoomBus("room_main", roomNameFor(owner.displayName));
     const board = new Workboard("room_main");
     if (state) {
-      bus.hydrate({ seq: state.seq, messages: state.messages });
+      bus.hydrate({ seq: state.seq, messages: state.messages, mode: state.mode });
       for (const member of state.members) {
         bus.addMember({ ...member, status: member.status === "running" ? "idle" : member.status });
       }
@@ -87,6 +88,7 @@ export class Workspace {
       if (
         event.type === "message" ||
         event.type === "messages-cleared" ||
+        event.type === "mode" ||
         event.type === "member" ||
         event.type === "member-removed"
       ) {
@@ -105,6 +107,10 @@ export class Workspace {
 
   renameRoom(ownerDisplayName: string): void {
     this.bus.rename(roomNameFor(ownerDisplayName));
+  }
+
+  setRoomMode(mode: RoomMode): RoomMode {
+    return this.orchestrator.setRoomMode(mode);
   }
 
   async setSettings(next: Settings): Promise<void> {
@@ -128,6 +134,7 @@ export class Workspace {
       messages: snapshot.messages,
       seq: snapshot.seq,
       tasks: this.board.snapshot(),
+      mode: snapshot.mode,
     } satisfies PersistedState);
   }
 

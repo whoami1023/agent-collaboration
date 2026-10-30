@@ -1,11 +1,15 @@
-import type { Member, RoomMessage } from "../core/types";
+import type { Member, RoomMessage, RoomMode } from "../core/types";
 
 export interface WakeDecision {
   wakes: string[];
   skipped: Array<{ memberId: string; reason: string }>;
 }
 
-export function decideWakes(message: RoomMessage, members: Member[]): WakeDecision {
+export function decideWakes(
+  message: RoomMessage,
+  members: Member[],
+  mode: RoomMode = "delegate",
+): WakeDecision {
   const wakes = new Set<string>();
   const skipped: Array<{ memberId: string; reason: string }> = [];
   const sender = members.find((m) => m.id === message.senderId);
@@ -36,6 +40,11 @@ export function decideWakes(message: RoomMessage, members: Member[]): WakeDecisi
       wakes.add(memberId);
       continue;
     }
+    // 自由交流模式下同级成员可以直接 @ 对方讨论；委派模式仍要求协调经过主智能体。
+    if (mode === "free") {
+      wakes.add(memberId);
+      continue;
+    }
     skipped.push({ memberId, reason: "成员之间不能互相派活，协调必须经过主智能体" });
   }
 
@@ -43,7 +52,8 @@ export function decideWakes(message: RoomMessage, members: Member[]): WakeDecisi
     wakes.add(main.id);
   }
 
-  if (message.kind === "announce" && sender?.spawnedBy) {
+  // 自由交流不逐条唤醒父级：由 Orchestrator 在讨论安静后统一收集，避免主智能体打断讨论。
+  if (mode === "delegate" && message.kind === "announce" && sender?.spawnedBy) {
     const parent = members.find((m) => m.id === sender.spawnedBy);
     if (parent && parent.status !== "cancelled") wakes.add(parent.id);
   }

@@ -4,6 +4,7 @@ import type {
   PublicUser,
   RoomEvent,
   RoomMessage,
+  RoomMode,
   TaskCard,
 } from "../../src/core/types";
 
@@ -22,7 +23,7 @@ export interface MaskedSettings {
 }
 
 export interface StateSnapshot {
-  room: { id: string; name: string };
+  room: { id: string; name: string; mode: RoomMode };
   members: Member[];
   messages: RoomMessage[];
   tasks: TaskCard[];
@@ -150,6 +151,23 @@ export interface SkillFileContent extends SkillFileView {
   content: string;
 }
 
+export type SkillCategory =
+  | "planning"
+  | "research"
+  | "data"
+  | "engineering"
+  | "product"
+  | "design"
+  | "web"
+  | "agent"
+  | "other";
+
+export interface SkillCategoryView {
+  id: SkillCategory;
+  label: string;
+  hint: string;
+}
+
 export interface SkillView {
   id: string;
   scope: SkillScope;
@@ -158,6 +176,7 @@ export interface SkillView {
   name: string;
   description: string;
   instructions: string;
+  category: SkillCategory;
   files?: SkillFileView[];
   builtin?: boolean;
   imported?: boolean;
@@ -178,6 +197,7 @@ export interface SkillImportResult {
 export interface SkillSnapshot {
   shared: SkillView[];
   personal: SkillView[];
+  categories: SkillCategoryView[];
   canManageShared: boolean;
 }
 
@@ -196,6 +216,7 @@ export async function createSkill(input: {
   name: string;
   description: string;
   instructions: string;
+  category?: SkillCategory;
   files?: SkillFileInput[];
 }): Promise<SkillView> {
   const body = await request<{ skill: SkillView }>("/api/skills", {
@@ -222,6 +243,7 @@ export async function updateSkill(
     name?: string;
     description?: string;
     instructions?: string;
+    category?: SkillCategory;
     files?: SkillFileInput[];
   },
 ): Promise<SkillView> {
@@ -250,6 +272,16 @@ export async function deleteSkill(skillId: string): Promise<void> {
 
 export function fetchState(): Promise<StateSnapshot> {
   return request<StateSnapshot>("/api/state");
+}
+
+export async function setRoomMode(
+  mode: RoomMode,
+): Promise<{ id: string; name: string; mode: RoomMode }> {
+  const body = await request<{ room: { id: string; name: string; mode: RoomMode } }>("/api/room", {
+    method: "PATCH",
+    body: JSON.stringify({ mode }),
+  });
+  return body.room;
 }
 
 export async function sendMessage(text: string): Promise<RoomMessage> {
@@ -378,12 +410,39 @@ export interface WorkspaceFileContent {
   truncated: boolean;
 }
 
+export interface WorkspaceSheetPreview {
+  name: string;
+  rows: string[][];
+  rowCount: number;
+  columnCount: number;
+  truncated: boolean;
+}
+
+export type WorkspaceRichPreview =
+  | { kind: "sheet"; sheets: WorkspaceSheetPreview[]; truncated: boolean }
+  | { kind: "docx"; html: string; truncated: boolean }
+  | { kind: "unavailable"; message: string };
+
+export interface WorkspaceRichPreviewResponse {
+  path: string;
+  name: string;
+  sizeBytes: number;
+  updatedAt: number;
+  preview: WorkspaceRichPreview;
+}
+
 export function fetchWorkspaceFiles(): Promise<WorkspaceFileListing> {
   return request<WorkspaceFileListing>("/api/files");
 }
 
 export function fetchWorkspaceFile(path: string): Promise<WorkspaceFileContent> {
   return request<WorkspaceFileContent>(`/api/files/content?path=${encodeURIComponent(path)}`);
+}
+
+export function fetchWorkspaceRichPreview(path: string): Promise<WorkspaceRichPreviewResponse> {
+  return request<WorkspaceRichPreviewResponse>(
+    `/api/files/rich-preview?path=${encodeURIComponent(path)}`,
+  );
 }
 
 export function workspaceFileDownloadUrl(path: string, options: { inline?: boolean } = {}): string {

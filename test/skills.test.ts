@@ -7,7 +7,17 @@ import { buildTools } from "../src/agent/tools";
 import type { Member, PublicUser } from "../src/core/types";
 import { RoomBus } from "../src/room/bus";
 import { BUILTIN_SHARED_SKILLS, BUILTIN_SKILLS_VERSION } from "../src/skills/builtin";
+import { CATALOG_SKILLS } from "../src/skills/builtin-catalog";
+import { DATA_SKILLS } from "../src/skills/builtin-data-skills";
+import { HERMES_SKILLS } from "../src/skills/builtin-hermes-skills";
 import { SkillLibrary } from "../src/skills/library";
+import {
+  BUILTIN_SKILL_CATEGORIES,
+  SKILL_CATEGORY_IDS,
+  builtinCategoryOf,
+  inferSkillCategory,
+  normalizeSkillCategory,
+} from "../src/skills/categories";
 import {
   isSkillSelected,
   normalizeSkillFilter,
@@ -170,6 +180,7 @@ describe("SkillLibrary", () => {
       members: [mainMember],
       parentName: null,
       taskTitles: new Map(),
+      mode: "delegate",
       limits: { maxChildrenPerAgent: 3, maxSpawnDepth: 3, maxConcurrent: 4, maxStepsPerRun: 12 },
       skills: library.listForAgent(alice.id).map(({ name, description, scope }) => ({
         name,
@@ -776,6 +787,7 @@ describe("成员级技能白名单", () => {
       members: [restricted],
       parentName: null,
       taskTitles: new Map(),
+      mode: "delegate",
       limits: { maxChildrenPerAgent: 3, maxSpawnDepth: 3, maxConcurrent: 4, maxStepsPerRun: 12 },
       skills: selectSkillsForMember(library.listForAgent(alice.id), restricted.skillNames).map(
         ({ name, description, scope }) => ({ name, description, scope }),
@@ -793,6 +805,225 @@ describe("成员级技能白名单", () => {
     }).find((tool) => tool.schema.name === "use_skill");
     expect(String(await noneTool?.execute({ name: "research-brief" }, signal))).toContain(
       "没有启用任何技能",
+    );
+  });
+});
+
+describe("GitHub 开源技能目录", () => {
+  it("内置技能名称唯一、符合命名规范、描述不超限", () => {
+    const names = BUILTIN_SHARED_SKILLS.map((seed) => seed.name);
+    expect(new Set(names).size).toBe(names.length);
+    for (const seed of BUILTIN_SHARED_SKILLS) {
+      expect(seed.name).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/);
+      expect(seed.description.trim().length).toBeGreaterThan(0);
+      expect(seed.description.length).toBeLessThanOrEqual(160);
+      expect(seed.instructions.length).toBeGreaterThan(50);
+    }
+  });
+
+  it("扩展目录均标注 GitHub 来源与 MIT 许可，并预装进共享技能", async () => {
+    expect(CATALOG_SKILLS.length).toBeGreaterThanOrEqual(15);
+    for (const seed of CATALOG_SKILLS) {
+      expect(seed.source).toMatch(/^GitHub · /);
+      expect(seed.source).toContain("MIT");
+      expect(seed.instructions.length).toBeGreaterThan(150);
+      expect(seed.instructions).toContain("##");
+    }
+    const seeded = new SkillLibrary(join(dir, "seeded-skills.json"));
+    await seeded.init();
+    for (const seed of CATALOG_SKILLS) {
+      expect(seeded.listShared().some((skill) => skill.name === seed.name)).toBe(true);
+    }
+  });
+});
+
+describe("数据分析内置技能", () => {
+  it("覆盖核心分析场景且来源均为 MIT", () => {
+    expect(DATA_SKILLS.length).toBeGreaterThanOrEqual(10);
+    const names = DATA_SKILLS.map((seed) => seed.name);
+    expect(new Set(names).size).toBe(names.length);
+    for (const seed of DATA_SKILLS) {
+      expect(seed.name).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/);
+      expect(seed.description.length).toBeLessThanOrEqual(160);
+      expect(seed.source).toMatch(/^GitHub · /);
+      expect(seed.source).toContain("MIT");
+      expect(seed.instructions.length).toBeGreaterThan(300);
+      expect(seed.instructions).toContain("##");
+    }
+    for (const name of ["data-analysis", "eda", "statistical-analysis", "product-analytics"]) {
+      expect(names).toContain(name);
+    }
+  });
+
+  it("启动时预装进共享技能，且版本号已升级", async () => {
+    expect(BUILTIN_SKILLS_VERSION).toBeGreaterThanOrEqual(4);
+    const seeded = new SkillLibrary(join(dir, "data-skills.json"));
+    await seeded.init();
+    const shared = new Set(seeded.listShared().map((skill) => skill.name));
+    for (const seed of DATA_SKILLS) {
+      expect(shared.has(seed.name)).toBe(true);
+    }
+  });
+});
+
+describe("Hermes Agent 内置技能迁移", () => {
+  it("迁移的技能符合命名规范、描述上限与 MIT 来源标注", () => {
+    expect(HERMES_SKILLS.length).toBeGreaterThanOrEqual(9);
+    const names = HERMES_SKILLS.map((seed) => seed.name);
+    expect(new Set(names).size).toBe(names.length);
+    const existing = new Set(BUILTIN_SHARED_SKILLS.map((seed) => seed.name));
+    expect(existing.size).toBe(BUILTIN_SHARED_SKILLS.length);
+    for (const seed of HERMES_SKILLS) {
+      expect(seed.name).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/);
+      expect(seed.description.length).toBeLessThanOrEqual(160);
+      expect(seed.source).toMatch(/^GitHub · NousResearch\/hermes-agent · /);
+      expect(seed.source).toContain("MIT");
+      expect(seed.instructions.length).toBeGreaterThan(300);
+      expect(seed.instructions).toContain("##");
+    }
+    for (const name of ["grounded-citations", "blocked-page-recovery", "humanizer", "claude-design"]) {
+      expect(names).toContain(name);
+    }
+  });
+
+  it("版本号升到 5，且启动后预装进共享技能", async () => {
+    expect(BUILTIN_SKILLS_VERSION).toBeGreaterThanOrEqual(5);
+    const seeded = new SkillLibrary(join(dir, "hermes-skills.json"));
+    await seeded.init();
+    const shared = new Set(seeded.listShared().map((skill) => skill.name));
+    for (const seed of HERMES_SKILLS) {
+      expect(shared.has(seed.name)).toBe(true);
+    }
+  });
+});
+
+describe("技能分类", () => {
+  it("内置技能全部分类、分类 id 合法且归类稳定", () => {
+    expect(BUILTIN_SKILLS_VERSION).toBeGreaterThanOrEqual(7);
+    for (const seed of BUILTIN_SHARED_SKILLS) {
+      const category = BUILTIN_SKILL_CATEGORIES[seed.name];
+      expect(category, `${seed.name} 缺少分类`).toBeTruthy();
+      expect(SKILL_CATEGORY_IDS).toContain(category);
+    }
+    expect(builtinCategoryOf("data-analysis")).toBe("data");
+    expect(builtinCategoryOf("web-search")).toBe("web");
+    expect(builtinCategoryOf("unknown-skill")).toBe("other");
+  });
+
+  it("分类别名与关键词推断都有明确回退", () => {
+    expect(normalizeSkillCategory("数据分析")).toBe("data");
+    expect(normalizeSkillCategory("engineering")).toBe("engineering");
+    expect(normalizeSkillCategory("nonsense")).toBeUndefined();
+    expect(inferSkillCategory("sql-helper", "写 SQL 查询并核对数据")).toBe("data");
+    expect(inferSkillCategory("web-scraper", "抓取网页正文")).toBe("web");
+    expect(inferSkillCategory("whatever", "没有明显关键词")).toBe("other");
+  });
+
+  it("新建与编辑技能都会持久化分类，非法分类被拒绝", async () => {
+    const created = await library.create(admin, {
+      scope: "shared",
+      name: "cat-demo",
+      description: "分类测试",
+      instructions: "# 说明",
+      category: "data",
+    });
+    expect(created.category).toBe("data");
+    const updated = await library.update(admin, created.id, { category: "engineering" });
+    expect(updated.category).toBe("engineering");
+    await expect(
+      library.create(admin, {
+        scope: "shared",
+        name: "bad-cat",
+        description: "x",
+        instructions: "x",
+        category: "not-a-category",
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    const reloaded = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await reloaded.init();
+    expect(reloaded.listShared().find((skill) => skill.name === "cat-demo")?.category).toBe(
+      "engineering",
+    );
+  });
+
+  it("启动时给内置技能补齐分类，并保留版本迁移", async () => {
+    const seeded = new SkillLibrary(join(dir, "categorized.json"));
+    await seeded.init();
+    const shared = seeded.listShared();
+    expect(shared.length).toBe(BUILTIN_SHARED_SKILLS.length);
+    expect(shared.find((skill) => skill.name === "data-analysis")?.category).toBe("data");
+    expect(shared.every((skill) => Boolean(skill.category))).toBe(true);
+  });
+
+  it("导入优先使用 frontmatter 分类，缺失时按关键词归类并提示无效值", async () => {
+    const declared = await library.importMany(admin, {
+      scope: "shared",
+      files: [
+        {
+          filename: "declared/SKILL.md",
+          content:
+            "---\nname: declared-skill\ndescription: 测试用技能\ncategory: 数据分析\n---\n\n# 步骤\n\n1. 处理数据。",
+        },
+      ],
+    });
+    expect(declared[0]?.ok).toBe(true);
+    expect(declared[0]?.skill?.category).toBe("data");
+
+    const inferred = await library.importMany(admin, {
+      scope: "shared",
+      files: [
+        {
+          filename: "inferred/SKILL.md",
+          content:
+            "---\nname: sql-helper\ndescription: 写 SQL 查询并核对数据\n---\n\n# 步骤\n\n1. 查询。",
+        },
+      ],
+    });
+    expect(inferred[0]?.skill?.category).toBe("data");
+
+    const invalid = await library.importMany(admin, {
+      scope: "shared",
+      files: [
+        {
+          filename: "invalid/SKILL.md",
+          content:
+            "---\nname: invalid-cat\ndescription: 抓取网页正文\ncategory: 奇怪分类\n---\n\n# 步骤\n\n1. 抓取。",
+        },
+      ],
+    });
+    expect(invalid[0]?.ok).toBe(true);
+    expect(invalid[0]?.skill?.category).toBe("web");
+    expect(invalid[0]?.warnings?.some((warning) => warning.includes("无法识别分类"))).toBe(true);
+  });
+
+  it("老数据里缺失分类的内置技能在启动时自动补齐", async () => {
+    const file = join(dir, "legacy-skills.json");
+    await writeFile(
+      file,
+      JSON.stringify({
+        builtinVersion: BUILTIN_SKILLS_VERSION,
+        skills: [
+          {
+            id: "sk_legacy",
+            scope: "shared",
+            ownerId: null,
+            name: "data-analysis",
+            description: "旧数据",
+            instructions: "# 旧说明",
+            builtin: true,
+            createdAt: 0,
+            updatedAt: 0,
+          },
+        ],
+        removedBuiltins: BUILTIN_SHARED_SKILLS.map((seed) => seed.name).filter(
+          (name) => name !== "data-analysis",
+        ),
+      }),
+    );
+    const legacy = new SkillLibrary(file);
+    await legacy.init();
+    expect(legacy.listShared().find((skill) => skill.name === "data-analysis")?.category).toBe(
+      "data",
     );
   });
 });

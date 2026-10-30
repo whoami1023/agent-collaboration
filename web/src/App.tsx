@@ -6,7 +6,7 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
 } from "react";
-import type { Member, PublicUser, RoomEvent, RoomMessage, TaskCard } from "../../src/core/types";
+import type { Member, PublicUser, RoomEvent, RoomMessage, RoomMode, TaskCard } from "../../src/core/types";
 import { Icon } from "./icons";
 import SkillLibraryPanel from "./SkillLibrary";
 import {
@@ -36,6 +36,7 @@ import {
   fetchState,
   fetchWorkspaceFile,
   fetchWorkspaceFiles,
+  fetchWorkspaceRichPreview,
   listUsers,
   loginUser,
   logoutUser,
@@ -46,6 +47,7 @@ import {
   saveMemberSkills,
   saveSettings,
   sendMessage,
+  setRoomMode,
   setupAdmin,
   subscribeEvents,
   updateProfile,
@@ -58,8 +60,10 @@ import {
   type StateSnapshot,
   type WorkspaceFileContent,
   type WorkspaceFileEntry,
+  type WorkspaceRichPreviewResponse,
 } from "./api";
 import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdown/MarkdownText";
+import { CsvPreview, RichPreviewBody } from "./FilePreviews";
 
 type ThemeMode = "light" | "dark";
 type SettingsTab = "profile" | "model" | "appearance";
@@ -489,6 +493,9 @@ function RoomView({
   const [openWorkspacePath, setOpenWorkspacePath] = useState<string | null>(null);
   const [workspaceFileContent, setWorkspaceFileContent] = useState<WorkspaceFileContent | null>(null);
   const [workspaceFileContentError, setWorkspaceFileContentError] = useState<string | null>(null);
+  const [workspaceRichPreview, setWorkspaceRichPreview] =
+    useState<WorkspaceRichPreviewResponse | null>(null);
+  const [workspaceRichPreviewError, setWorkspaceRichPreviewError] = useState<string | null>(null);
   const [workspaceFileSeq, setWorkspaceFileSeq] = useState(0);
   const [uploadingFiles, setUploadingFiles] = useState(false);
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
@@ -700,6 +707,7 @@ function RoomView({
   const messages = state?.messages ?? [];
   const members = state?.members ?? [];
   const tasks = state?.tasks ?? [];
+  const roomMode = state?.room.mode ?? "delegate";
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -776,6 +784,30 @@ function RoomView({
         if (!alive) return;
         if (isUnauthorized(err)) onSessionLost();
         else setWorkspaceFileContentError(messageOf(err));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [openWorkspacePath, workspaceFileSeq, onSessionLost]);
+
+  /** DOCX/XLSX 需要服务端解析，按打开的文件单独加载；CSV/PDF 不走这里。 */
+  useEffect(() => {
+    if (!openWorkspacePath || !isRichPreviewFile(openWorkspacePath)) {
+      setWorkspaceRichPreview(null);
+      setWorkspaceRichPreviewError(null);
+      return;
+    }
+    let alive = true;
+    setWorkspaceRichPreview(null);
+    setWorkspaceRichPreviewError(null);
+    fetchWorkspaceRichPreview(openWorkspacePath)
+      .then((data) => {
+        if (alive) setWorkspaceRichPreview(data);
+      })
+      .catch((err: unknown) => {
+        if (!alive) return;
+        if (isUnauthorized(err)) onSessionLost();
+        else setWorkspaceRichPreviewError(messageOf(err));
       });
     return () => {
       alive = false;
@@ -885,12 +917,26 @@ function RoomView({
   function commandData(): CommandData {
     return {
       roomName: state?.room.name ?? "作战室",
+      mode: roomMode,
       members,
       messages,
       tasks,
       settings: state?.settings ?? null,
       workspaceFileCount,
     };
+  }
+
+  async function handleRoomMode(mode: RoomMode) {
+    if (!state || state.room.mode === mode) return;
+    setError(null);
+    try {
+      const room = await setRoomMode(mode);
+      setState((current) =>
+        current ? { ...current, room: { ...current.room, mode: room.mode } } : current,
+      );
+    } catch (err) {
+      setError(messageOf(err));
+    }
   }
 
   async function handleStopAll() {
@@ -1452,6 +1498,15 @@ function RoomView({
         <span className="mobile-room">{state.room.name}</span>
         <button
           type="button"
+          className={`mode-pill ${roomMode}`}
+          aria-label={`当前${roomMode === "delegate" ? "委派" : "自由交流"}模式，点击切换`}
+          title="切换任务完成模式"
+          onClick={() => void handleRoomMode(roomMode === "delegate" ? "free" : "delegate")}
+        >
+          {roomMode === "delegate" ? "委派" : "自由"}
+        </button>
+        <button
+          type="button"
           className="btn icon ghost"
           aria-pressed={boardOpen && rightTab === "files"}
           aria-label="文件工作区"
@@ -1481,6 +1536,26 @@ function RoomView({
           <span className="env-pill">
             {activeProvider ? `${activeProvider.id} · ${activeProvider.model}` : "未配置模型"}
           </span>
+          <div className="mode-switch" role="group" aria-label="任务完成模式">
+            <button
+              type="button"
+              className={`mode-option${roomMode === "delegate" ? " active" : ""}`}
+              aria-pressed={roomMode === "delegate"}
+              title="委派模式：主智能体拆解任务并 @ 成员分派，成员只对分内任务汇报"
+              onClick={() => void handleRoomMode("delegate")}
+            >
+              委派
+            </button>
+            <button
+              type="button"
+              className={`mode-option${roomMode === "free" ? " active" : ""}`}
+              aria-pressed={roomMode === "free"}
+              title="自由交流模式：成员之间可直接 @ 讨论，讨论安静后由主智能体收集并总结"
+              onClick={() => void handleRoomMode("free")}
+            >
+              自由交流
+            </button>
+          </div>
           {skillsOpen ? (
             <button
               type="button"
@@ -1582,8 +1657,9 @@ function RoomView({
                   </span>
                   <p>在下面发一条消息开始。</p>
                   <p className="empty-sub">
-                    试试「帮我调研多智能体协同的调度方式」，主智能体会拆任务并用 @
-                    派给子成员。
+                    {roomMode === "free"
+                      ? "自由交流模式下，成员会直接 @ 彼此讨论；讨论安静后主智能体收集并总结。"
+                      : "试试「帮我调研多智能体协同的调度方式」，主智能体会拆任务并用 @ 派给子成员。"}
                   </p>
                 </div>
               )}
@@ -1871,6 +1947,8 @@ function RoomView({
               activePath={openWorkspacePath}
               content={workspaceFileContent}
               contentError={workspaceFileContentError}
+              richPreview={workspaceRichPreview}
+              richPreviewError={workspaceRichPreviewError}
               onRefresh={() => void refreshWorkspaceFiles()}
               onPickFiles={() => workspaceFileInput.current?.click()}
               onUpload={(list) => void handleUploadFiles(list, workspaceDir)}
@@ -1906,6 +1984,31 @@ function RoomView({
   );
 }
 
+const MARKDOWN_FILE_RE = /\.(md|markdown)$/i;
+const CSV_FILE_RE = /\.(csv|tsv)$/i;
+const PDF_FILE_RE = /\.pdf$/i;
+const RICH_PREVIEW_FILE_RE = /\.(docx|xlsx|xlsm)$/i;
+
+function isMarkdownFile(path: string): boolean {
+  return MARKDOWN_FILE_RE.test(path);
+}
+
+function isCsvFile(path: string): boolean {
+  return CSV_FILE_RE.test(path);
+}
+
+function isTabSeparatedFile(path: string): boolean {
+  return /\.tsv$/i.test(path);
+}
+
+function isPdfFile(path: string): boolean {
+  return PDF_FILE_RE.test(path);
+}
+
+function isRichPreviewFile(path: string): boolean {
+  return RICH_PREVIEW_FILE_RE.test(path);
+}
+
 /** 清单是整棵树的递归结果，这里只取某个目录的直接子项。 */
 function childEntries(files: WorkspaceFileEntry[], dir: string): WorkspaceFileEntry[] {
   const prefix = dir ? `${dir}/` : "";
@@ -1934,6 +2037,8 @@ function WorkspaceFilesPanel({
   activePath,
   content,
   contentError,
+  richPreview,
+  richPreviewError,
   onRefresh,
   onPickFiles,
   onUpload,
@@ -1955,6 +2060,8 @@ function WorkspaceFilesPanel({
   activePath: string | null;
   content: WorkspaceFileContent | null;
   contentError: string | null;
+  richPreview: WorkspaceRichPreviewResponse | null;
+  richPreviewError: string | null;
   onRefresh: () => void;
   onPickFiles: () => void;
   onUpload: (files: FileList | File[]) => void;
@@ -2058,7 +2165,9 @@ function WorkspaceFilesPanel({
             <div className="workspace-preview-meta">
               <span>{formatBytes(content.sizeBytes)}</span>
               <span>{clock(content.updatedAt)}</span>
-              {content.truncated ? <span className="workspace-preview-warn">仅预览开头部分</span> : null}
+              {content.truncated && !isRichPreviewFile(activePath) && !isPdfFile(activePath) ? (
+                <span className="workspace-preview-warn">仅预览开头部分</span>
+              ) : null}
             </div>
           ) : null}
           {contentError ? (
@@ -2080,6 +2189,34 @@ function WorkspaceFilesPanel({
                 alt={content.name}
               />
             </div>
+          ) : isPdfFile(activePath) ? (
+            <div className="workspace-preview-pdf-wrap">
+              <iframe
+                className="workspace-preview-pdf"
+                src={workspaceFileDownloadUrl(activePath, { inline: true })}
+                title={`PDF 预览：${content.name}`}
+              />
+            </div>
+          ) : isCsvFile(activePath) ? (
+            <CsvPreview text={content.content} tabSeparated={isTabSeparatedFile(activePath)} />
+          ) : isRichPreviewFile(activePath) ? (
+            richPreview ? (
+              <RichPreviewBody
+                preview={richPreview.preview}
+                downloadUrl={workspaceFileDownloadUrl(activePath)}
+              />
+            ) : richPreviewError ? (
+              <div className="workspace-preview-body">
+                <p className="files-error">{richPreviewError}</p>
+                <button type="button" className="btn sm" onClick={onReloadFile}>
+                  重试
+                </button>
+              </div>
+            ) : (
+              <div className="workspace-preview-body">
+                <p className="files-note">正在解析文件…</p>
+              </div>
+            )
           ) : content.preview === "binary" ? (
             <div className="workspace-preview-body">
               <p className="files-empty">
@@ -2089,6 +2226,10 @@ function WorkspaceFilesPanel({
                 <Icon name="download" />
                 <span>下载文件</span>
               </a>
+            </div>
+          ) : isMarkdownFile(activePath) && content.content.trim() ? (
+            <div className="workspace-preview-markdown">
+              <MarkdownText text={content.content} variant="document" />
             </div>
           ) : (
             <pre className="workspace-preview-text">{content.content || "（空文件）"}</pre>
@@ -2856,6 +2997,10 @@ function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnaps
   if (!current) return current;
   if (event.type === "messages-cleared") {
     return current.messages.length === 0 ? current : { ...current, messages: [] };
+  }
+  if (event.type === "mode") {
+    if (current.room.mode === event.mode) return current;
+    return { ...current, room: { ...current.room, mode: event.mode } };
   }
   if (event.type === "message") {
     if (current.messages.some((message) => message.id === event.message.id)) return current;

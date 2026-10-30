@@ -10,6 +10,12 @@ export type SenderKind = "user" | "member" | "system";
 export type MessageKind = "chat" | "announce" | "system";
 export type TaskStatus = "todo" | "doing" | "blocked" | "done" | "failed";
 export type UserRole = "admin" | "user";
+/**
+ * 作战室的任务完成模式：
+ * - delegate：主智能体拆解并 @ 成员分派，成员只对分内任务汇报（对应 OpenClaw announce 语义）；
+ * - free：成员之间可直接 @ 讨论，安静下来后由主智能体统一收集并总结（对应 collector 语义）。
+ */
+export type RoomMode = "delegate" | "free";
 
 export interface PublicUser {
   id: string;
@@ -125,6 +131,7 @@ export type AgentEvent =
 export type RoomEvent =
   | { type: "message"; message: RoomMessage }
   | { type: "messages-cleared" }
+  | { type: "mode"; mode: RoomMode }
   | { type: "member"; member: Member }
   | { type: "member-removed"; memberId: string }
   | { type: "task"; task: TaskCard }

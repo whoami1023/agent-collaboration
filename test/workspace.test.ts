@@ -44,6 +44,21 @@ describe("WorkspaceRegistry", () => {
     expect(bob.board.list()).toHaveLength(0);
   });
 
+  it("作战室模式随群聊状态持久化", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    expect(alice.bus.roomMode).toBe("delegate");
+    alice.setRoomMode("free");
+    await alice.persist();
+    await alice.close();
+
+    const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await skills.init();
+    const reloaded = new WorkspaceRegistry(dir, skills);
+    const restored = await reloaded.get({ id: "u_alice", displayName: "Alice" });
+    expect(restored.bus.roomMode).toBe("free");
+    await reloaded.closeAll();
+  });
+
   it("模型设置按用户隔离", async () => {
     const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
     const bob = await registry.get({ id: "u_bob", displayName: "Bob" });

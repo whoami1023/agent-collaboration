@@ -242,8 +242,22 @@ export function visibleMessageText(text: string): string {
   return stripAssistantScaffolding(text);
 }
 
-export default function MarkdownText({ text, streaming }: { text: string; streaming?: boolean }) {
-  const visible = useMemo(() => stripAssistantScaffolding(text, { streaming }), [text, streaming]);
+/** assistant = 作战室回复（先剥脚手架）；document = 用户文档（原文即正文）。 */
+export type MarkdownVariant = "assistant" | "document";
+
+export default function MarkdownText({
+  text,
+  streaming,
+  variant = "assistant",
+}: {
+  text: string;
+  streaming?: boolean;
+  variant?: MarkdownVariant;
+}) {
+  const visible = useMemo(
+    () => (variant === "document" ? normalizeLineBreaks(text) : stripAssistantScaffolding(text, { streaming })),
+    [text, streaming, variant],
+  );
 
   if (!visible.trim()) return createElement("span", { className: "markdown-empty" }, "…");
   if (isBlockArtText(visible)) {

@@ -1,4 +1,4 @@
-import type { Member, RoomMessage, TaskCard } from "../../src/core/types";
+import type { Member, RoomMessage, RoomMode, TaskCard } from "../../src/core/types";
 import type { MaskedSettings } from "./api";
 
 export interface SlashCommandDef {
@@ -76,6 +76,7 @@ export function suggestSlashCommands(query: string): SlashCommandDef[] {
 
 export interface CommandData {
   roomName: string;
+  mode: RoomMode;
   members: Member[];
   messages: RoomMessage[];
   tasks: TaskCard[];
@@ -147,6 +148,7 @@ export function buildStatusReport(data: CommandData): string {
   const lines = [
     "作战室状态",
     `· 房间：${data.roomName}`,
+    `· 协作模式：${data.mode === "free" ? "自由交流（成员直接讨论，主智能体收集总结）" : "委派（主智能体拆解分派）"}`,
     `· 成员：${data.members.length}（${memberParts.join(" · ")}）`,
     `· 消息：已加载 ${data.messages.length} 条（服务端最多返回 300 条）`,
     `· 任务：${data.tasks.length}${taskParts.length > 0 ? `（${taskParts.join(" · ")}）` : ""}`,

@@ -3,6 +3,7 @@ import type {
   MessageKind,
   RoomEvent,
   RoomMessage,
+  RoomMode,
   SenderKind,
 } from "../core/types";
 import { newId } from "../core/ids";
@@ -32,6 +33,7 @@ export class RoomBus {
   private members = new Map<string, Member>();
   private listeners = new Set<(event: RoomEvent) => void>();
   private seq = 0;
+  private mode: RoomMode = "delegate";
 
   constructor(roomId: string, roomName: string) {
     this.roomId = roomId;
@@ -40,6 +42,16 @@ export class RoomBus {
 
   get roomName(): string {
     return this.name;
+  }
+
+  get roomMode(): RoomMode {
+    return this.mode;
+  }
+
+  setMode(mode: RoomMode): void {
+    if (this.mode === mode) return;
+    this.mode = mode;
+    this.emit({ type: "mode", mode });
   }
 
   rename(roomName: string): void {
@@ -144,12 +156,13 @@ export class RoomBus {
     return picked;
   }
 
-  snapshot(): { seq: number; messages: RoomMessage[] } {
-    return { seq: this.seq, messages: this.messages };
+  snapshot(): { seq: number; messages: RoomMessage[]; mode: RoomMode } {
+    return { seq: this.seq, messages: this.messages, mode: this.mode };
   }
 
-  hydrate(state: { seq?: number; messages?: RoomMessage[] }): void {
+  hydrate(state: { seq?: number; messages?: RoomMessage[]; mode?: RoomMode }): void {
     this.messages = state.messages ?? [];
     this.seq = state.seq ?? this.messages.length;
+    this.mode = state.mode === "free" ? "free" : "delegate";
   }
 }

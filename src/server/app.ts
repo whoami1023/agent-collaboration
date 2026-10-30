@@ -6,8 +6,14 @@ import { maskSettings, mergeSettings } from "../core/settings";
 import { AuthError, type AuthService, type PublicUser } from "../auth/auth-service";
 import { buildClearSessionCookie, buildSessionCookie, readSessionToken } from "../auth/cookies";
 import { SkillError, type SkillRecord, type SkillLibrary } from "../skills/library";
+import {
+  DEFAULT_SKILL_CATEGORY,
+  SKILL_CATEGORIES,
+  builtinCategoryOf,
+} from "../skills/categories";
 import { resolveSkillSelection } from "../skills/selection";
 import { MAX_UPLOAD_BYTES, WorkspaceFileError } from "../files/workspace-files";
+import { buildRichPreview } from "../files/rich-preview";
 import type { Workspace, WorkspaceRegistry } from "../workspace/workspace";
 
 export interface AppDeps {
@@ -84,6 +90,9 @@ export function createApp(deps: AppDeps): express.Express {
     const { files, ...rest } = record;
     return {
       ...rest,
+      category:
+        record.category ??
+        (record.builtin ? builtinCategoryOf(record.name) : DEFAULT_SKILL_CATEGORY),
       // 附带文件可能上 MB，列表只回目录；正文用 /api/skills/:id/file 按需取。
       ...(files
         ? { files: files.map(({ path, encoding, size }) => ({ path, encoding, size })) }
@@ -211,6 +220,7 @@ export function createApp(deps: AppDeps): express.Express {
     res.json({
       shared: deps.skills.listShared().map(skillView),
       personal: deps.skills.listPersonal(user.id).map(skillView),
+      categories: SKILL_CATEGORIES,
       canManageShared: user.role === "admin",
     });
   });
@@ -222,6 +232,7 @@ export function createApp(deps: AppDeps): express.Express {
       name: body["name"],
       description: body["description"],
       instructions: body["instructions"],
+      ...("category" in body ? { category: body["category"] } : {}),
       ...("files" in body ? { files: body["files"] } : {}),
     });
     res.status(201).json({ skill: skillView(skill) });
@@ -258,6 +269,7 @@ export function createApp(deps: AppDeps): express.Express {
       ...("name" in body ? { name: body["name"] } : {}),
       ...("description" in body ? { description: body["description"] } : {}),
       ...("instructions" in body ? { instructions: body["instructions"] } : {}),
+      ...("category" in body ? { category: body["category"] } : {}),
       ...("files" in body ? { files: body["files"] } : {}),
     });
     res.json({ skill: skillView(skill) });
@@ -271,11 +283,26 @@ export function createApp(deps: AppDeps): express.Express {
   app.get("/api/state", async (_req: Request, res: Response) => {
     const workspace = await workspaceFor(res);
     res.json({
-      room: { id: workspace.bus.roomId, name: workspace.bus.roomName },
+      room: { id: workspace.bus.roomId, name: workspace.bus.roomName, mode: workspace.bus.roomMode },
       members: workspace.bus.listMembers(),
       messages: workspace.bus.listMessages(300),
       tasks: workspace.board.list(),
       settings: maskSettings(workspace.getSettings()),
+    });
+  });
+
+  // 作战室任务完成模式：delegate（主智能体委派） / free（成员自由交流，主智能体收集总结）。
+  app.patch("/api/room", async (req: Request, res: Response) => {
+    const mode = bodyOf(req)["mode"];
+    if (mode !== "delegate" && mode !== "free") {
+      res.status(400).json({ error: "mode 必须是 delegate 或 free" });
+      return;
+    }
+    const workspace = await workspaceFor(res);
+    workspace.setRoomMode(mode);
+    await workspace.persist();
+    res.json({
+      room: { id: workspace.bus.roomId, name: workspace.bus.roomName, mode: workspace.bus.roomMode },
     });
   });
 
@@ -433,6 +460,29 @@ export function createApp(deps: AppDeps): express.Express {
     }
     const workspace = await workspaceFor(res);
     res.json(await workspace.files.read(relPath));
+  });
+
+  /** DOCX/XLSX 无法按文本预览，这里按需解析成前端可渲染的结构。 */
+  app.get("/api/files/rich-preview", async (req: Request, res: Response) => {
+    const relPath = queryField(req, "path");
+    if (!relPath.trim()) {
+      res.status(400).json({ error: "path 不能为空" });
+      return;
+    }
+    const workspace = await workspaceFor(res);
+    const file = await workspace.files.download(relPath);
+    const preview = await buildRichPreview(file.absPath, file.sizeBytes);
+    if (!preview) {
+      res.status(415).json({ error: "该文件类型不支持富格式预览" });
+      return;
+    }
+    res.json({
+      path: file.path,
+      name: file.name,
+      sizeBytes: file.sizeBytes,
+      updatedAt: file.updatedAt,
+      preview,
+    });
   });
 
   app.get("/api/files/download", async (req: Request, res: Response) => {

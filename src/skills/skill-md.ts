@@ -220,6 +220,8 @@ export interface ParsedSkillMarkdown {
   description: string;
   instructions: string;
   homepage?: string;
+  /** 可选分类：技能库据此分组，无法识别时由导入流程回退或推断。 */
+  category?: string;
   userInvocable: boolean;
   modelInvocable: boolean;
   warnings: string[];
@@ -271,7 +273,7 @@ function metadataWarning(frontmatter: Record<string, string>): string | undefine
       : undefined;
   const gated = manifest?.["requires"] ?? manifest?.["install"] ?? manifest?.["os"];
   if (!gated) return undefined;
-  return "该技能声明依赖宿主机工具或平台条件（requires / install / os），作战室内的智能体没有 shell 与网络工具，可能只能部分执行。";
+  return "该技能声明依赖宿主机工具或平台条件（requires / install / os）；作战室提供 run_command 与联网工具，但不会自动安装依赖，可能只能部分执行。";
 }
 
 /**
@@ -313,6 +315,7 @@ export function parseSkillMarkdown(
     description,
     instructions,
     homepage: frontmatter["homepage"]?.trim() || undefined,
+    category: frontmatter["category"]?.trim() || undefined,
     userInvocable: parseBool(frontmatter["user-invocable"], true),
     modelInvocable,
     warnings,

@@ -1,3 +1,7 @@
+import { CATALOG_SKILLS } from "./builtin-catalog";
+import { DATA_SKILLS } from "./builtin-data-skills";
+import { HERMES_SKILLS } from "./builtin-hermes-skills";
+
 export interface BuiltinSkillSeed {
   name: string;
   description: string;
@@ -6,9 +10,9 @@ export interface BuiltinSkillSeed {
 }
 
 /** 内置技能内容版本：升级时启动会刷新已有内置记录，用户自建的同名技能不受影响。 */
-export const BUILTIN_SKILLS_VERSION = 2;
+export const BUILTIN_SKILLS_VERSION = 7;
 
-export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
+const CORE_SKILLS: BuiltinSkillSeed[] = [
   {
     name: "task-breakdown",
     description: "把复杂需求拆成可独立交付的子任务，并写清目标与验收标准。",
@@ -182,7 +186,7 @@ export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
 
 ## 边界
 
-- 有链接时先用 web_fetch 读取正文；没有可读正文（JS 空壳、登录墙、PDF、音视频）时再请用户粘贴。视频转写与 PDF 解析仍不具备。
+- 有链接时先用 web_fetch 读取正文；PDF 可用 run_command 调用本机解析器（如 pdftotext / python 库）取文本；JS 空壳、登录墙与音视频转写仍不具备，请用户粘贴或提供文本。
 - 不做超出材料的推理；需要评价时单独标注“我的判断”。`,
   },
   {
@@ -241,7 +245,7 @@ export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
 
 ## 约束
 
-- 当前环境没有命令执行能力，不要声称“已运行 / 已测试”。需要实际执行的验证，写成明确步骤交给用户或子成员。
+- 用 run_command 做实际验证并贴出真实输出；命令不可用或环境缺失时，写成明确步骤交给用户或子成员，不要声称“已运行 / 已测试”。
 - A/B 对比必须同输入、同维度。
 - 允许结论是“证据不足”，不要为了有结论而编造。`,
   },
@@ -302,7 +306,7 @@ export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
 5. 验证：为每个假设写判定方法（看哪条日志、改哪个开关、跑哪条命令），标注“已证实 / 已排除 / 待验证”。
 6. 给修复建议：根因、最小修复、回归验证、预防措施。
 
-## 调试命令建议（由用户在本机执行）
+## 调试命令（优先用 run_command 执行）
 
 - Node.js：node --inspect-brk 或 node inspect；断点、bt、watch；异步挂起先查活动句柄与超时。
 - Python：breakpoint()、python -m pdb、debugpy --listen 127.0.0.1:5678；异常后可用 pdb.post_mortem。
@@ -310,7 +314,7 @@ export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
 
 ## 规则
 
-- 你不能直接运行命令或附加调试器，不要声称已执行。命令统一写成“请你在本机执行”。
+- 能用 run_command 执行的命令自己执行并附输出；需要交互式调试器、改系统配置或访问远程主机时，写成“请你在本机执行”。
 - 没有证据就写“待验证”，不要用“可能是”当结论。
 - 修复建议要可回滚；涉及重启、改配置、改权限时先说明影响面。`,
   },
@@ -329,7 +333,7 @@ export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
 
 信息不全时只给建议，不催着改配置。
 
-## 只读检查（请用户执行后贴回结果）
+## 只读检查（优先用 run_command 执行；权限不足或远程主机再交给用户）
 
 - Linux：cat /etc/os-release、ss -ltnp、ufw status（或 firewall-cmd --state）、systemctl status ssh、lsblk -f
 - macOS：sw_vers、lsof -nP -iTCP -sTCP:LISTEN、fdesetup status、softwareupdate --schedule
@@ -375,8 +379,9 @@ export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
 ## 质量检查
 
 - 描述与正文不重复空话。
-- 正文提到的工具必须真实存在：use_skill、task_create、task_update、task_attach_artifact、room_history、web_search、web_fetch。
-- 不依赖当前环境没有的 CLI 或文件系统能力；联网只用 web_search / web_fetch。
+- 正文提到的工具必须真实存在：use_skill、read_skill_file、run_command、run_skill_script、task_create、task_update、task_attach_artifact、room_history、web_search、web_fetch、file_list、file_read、file_write。
+- 技能可附带脚本：Python/Node/Shell 用 run_skill_script 执行，依赖缺失时在步骤里写明安装命令；不要把需要 shell 的脚本伪装成纯说明。
+- 命令统一走 run_command，不要假设当前目录之外还有可用文件。
 - 不写死用户隐私、密钥或一次性任务细节。`,
   },
   {
@@ -416,4 +421,11 @@ export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
 - 不复用同一个名字创建多个角色；先查成员列表。
 - 角色卡是长期约束，任务简报是当次目标，不要混在一起。`,
   },
+];
+
+export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
+  ...CORE_SKILLS,
+  ...CATALOG_SKILLS,
+  ...DATA_SKILLS,
+  ...HERMES_SKILLS,
 ];

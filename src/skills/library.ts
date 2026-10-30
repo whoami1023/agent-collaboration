@@ -4,6 +4,12 @@ import type { PublicUser } from "../core/types";
 import { writeJsonAtomic } from "../store/persist";
 import { BUILTIN_SHARED_SKILLS, BUILTIN_SKILLS_VERSION } from "./builtin";
 import {
+  builtinCategoryOf,
+  inferSkillCategory,
+  normalizeSkillCategory,
+  type SkillCategory,
+} from "./categories";
+import {
   formatSkillFileSize,
   isSkillEntryPoint,
   MAX_SKILL_BUNDLE_BYTES,
@@ -26,6 +32,8 @@ export interface SkillRecord {
   name: string;
   description: string;
   instructions: string;
+  /** 技能分类；缺失时内置技能按名称归类，其余归入「其他」。 */
+  category?: SkillCategory;
   /** 技能目录里除 SKILL.md 之外的文件：脚本、参考资料、模板等。 */
   files?: SkillFileRecord[];
   builtin?: boolean;
@@ -46,6 +54,7 @@ export interface SkillInput {
   name?: unknown;
   description?: unknown;
   instructions?: unknown;
+  category?: unknown;
   files?: unknown;
 }
 
@@ -138,6 +147,14 @@ function normalizeInstructions(raw: unknown): string {
     throw new SkillError(400, `技能说明不能超过 ${INSTRUCTIONS_MAX} 个字符`);
   }
   return instructions;
+}
+
+function normalizeCategoryInput(raw: unknown): SkillCategory {
+  const category = normalizeSkillCategory(raw);
+  if (!category) {
+    throw new SkillError(400, "技能分类无效，请使用技能库提供的分类");
+  }
+  return category;
 }
 
 function byName(a: SkillRecord, b: SkillRecord): number {
@@ -316,6 +333,7 @@ export class SkillLibrary {
           name: seed.name,
           description: seed.description,
           instructions: seed.instructions,
+          category: builtinCategoryOf(seed.name),
           builtin: true,
           source: seed.source,
           createdAt: now,
@@ -329,7 +347,12 @@ export class SkillLibrary {
         existing.description = seed.description;
         existing.instructions = seed.instructions;
         existing.source = seed.source;
+        existing.category = builtinCategoryOf(seed.name);
         existing.updatedAt = now;
+        changed = true;
+      } else if (existing.builtin && !existing.category) {
+        // 老数据没有分类字段：无需等版本升级，启动时补齐。
+        existing.category = builtinCategoryOf(seed.name);
         changed = true;
       }
     }
@@ -416,6 +439,8 @@ export class SkillLibrary {
       const name = normalizeName(input.name);
       const description = normalizeDescription(input.description);
       const instructions = normalizeInstructions(input.instructions);
+      const category =
+        input.category === undefined ? undefined : normalizeCategoryInput(input.category);
       const files = normalizeFilesInput(input.files);
       const ownerId = user.id;
       this.assertNameFree(name, scope, ownerId, null);
@@ -427,6 +452,7 @@ export class SkillLibrary {
         name,
         description,
         instructions,
+        ...(category ? { category } : {}),
         ...(files.length > 0 ? { files: sortFiles(files) } : {}),
         createdAt: now,
         updatedAt: now,
@@ -450,6 +476,8 @@ export class SkillLibrary {
         input.instructions === undefined
           ? record.instructions
           : normalizeInstructions(input.instructions);
+      const category =
+        input.category === undefined ? record.category : normalizeCategoryInput(input.category);
       if (record.builtin && name !== record.name) {
         throw new SkillError(400, "内置技能不能改名，可以修改描述和说明");
       }
@@ -460,6 +488,8 @@ export class SkillLibrary {
       record.name = name;
       record.description = description;
       record.instructions = instructions;
+      if (category) record.category = category;
+      else delete record.category;
       if (files && files.length > 0) record.files = sortFiles(files);
       else delete record.files;
       record.updatedAt = this.now();
@@ -578,6 +608,10 @@ export class SkillLibrary {
           if (files.length > 0) {
             warnings.push(`附带 ${files.length} 个文件：${bundlePreview(files)}`);
           }
+          const declaredCategory = normalizeSkillCategory(parsed.category);
+          if (parsed.category && !declaredCategory) {
+            warnings.push(`无法识别分类「${parsed.category}」，已按名称与描述归类。`);
+          }
           const source = `导入自 ${filename}`;
           const existing = this.data.skills.find(
             (skill) => skill.scope === scope && skill.ownerId === ownerId && skill.name === name,
@@ -594,6 +628,8 @@ export class SkillLibrary {
             }
             existing.description = description;
             existing.instructions = instructions;
+            existing.category =
+              declaredCategory ?? existing.category ?? inferSkillCategory(name, description);
             existing.source = source;
             existing.imported = true;
             if (files.length > 0) existing.files = sortFiles(files);
@@ -619,6 +655,7 @@ export class SkillLibrary {
             name,
             description,
             instructions,
+            category: declaredCategory ?? inferSkillCategory(name, description),
             ...(files.length > 0 ? { files: sortFiles(files) } : {}),
             imported: true,
             source,

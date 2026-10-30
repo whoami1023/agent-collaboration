@@ -51,12 +51,14 @@ export class MemberRuntime {
     return this.running;
   }
 
-  steer(message: RoomMessage): void {
+  steer(message: RoomMessage, instruction?: string): void {
     this.pending.push({
       role: "user",
-      content: `运行中收到一条新群聊消息（#${message.seq}，来自 ${
-        message.senderKind === "user" ? "用户" : `@${message.senderName}`
-      }）：\n${message.text}`,
+      content:
+        `${instruction ? `${instruction}\n\n` : ""}` +
+        `运行中收到一条新群聊消息（#${message.seq}，来自 ${
+          message.senderKind === "user" ? "用户" : `@${message.senderName}`
+        }）：\n${message.text}`,
     });
   }
 
@@ -134,6 +136,7 @@ export class MemberRuntime {
         members: bus.listMembers(),
         parentName: parent?.name ?? null,
         taskTitles,
+        mode: bus.roomMode,
         limits,
         skills: skills.map((skill) => ({
           name: skill.name,
@@ -159,7 +162,7 @@ export class MemberRuntime {
           role: "user",
           content:
             `${recallContext ? `${recallContext}\n\n` : ""}` +
-            `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(member, trigger)}`,
+            `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(member, trigger, bus.roomMode)}`,
         },
       ];
       const { provider, model } = resolveProvider(this.member.providerId, this.deps.getProviderDeps());

@@ -1,4 +1,4 @@
-import type { Limits, Member, RoomMessage } from "../core/types";
+import type { Limits, Member, RoomMessage, RoomMode } from "../core/types";
 import { DEFAULT_PROVIDER_ID, SYSTEM_ID, USER_ID } from "../core/types";
 import type { Settings } from "../core/settings";
 import { newId } from "../core/ids";
@@ -47,6 +47,9 @@ export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
   return member;
 }
 
+/** 自由交流模式下，最后一次成员报告后等待这么久再唤醒主智能体收集，避免打断讨论。 */
+const FREE_COLLECT_QUIET_MS = 1200;
+
 export class Orchestrator {
   private runtimes = new Map<string, MemberRuntime>();
   private pendingReleases = new Map<string, () => void>();
@@ -57,6 +60,9 @@ export class Orchestrator {
   private stopped = false;
   /** /stop 与 /clear 的屏障：停止前已入队的消息不再唤醒成员。 */
   private stoppedThroughSeq = 0;
+  /** 自由交流模式的汇总定时器与最后一次成员报告。 */
+  private collectorTimer: NodeJS.Timeout | null = null;
+  private collectorDue: RoomMessage | null = null;
 
   constructor(private readonly deps: OrchestratorDeps) {
     deps.bus.subscribe((event) => {
@@ -69,6 +75,7 @@ export class Orchestrator {
 
   stop(): void {
     this.stopped = true;
+    this.clearCollector();
     for (const runtime of this.runtimes.values()) runtime.cancel();
   }
 
@@ -93,6 +100,25 @@ export class Orchestrator {
     return this.runtimes.get(memberId)?.cancel() ?? false;
   }
 
+  /** 切换作战室的任务完成模式；模式随群聊状态持久化，下一条消息与下一次运行立即生效。 */
+  setRoomMode(mode: RoomMode): RoomMode {
+    const bus = this.deps.bus;
+    if (bus.roomMode === mode) return mode;
+    bus.setMode(mode);
+    this.clearCollector();
+    bus.append({
+      senderId: SYSTEM_ID,
+      senderName: "系统",
+      senderKind: "system",
+      kind: "system",
+      text:
+        mode === "free"
+          ? "已切换到「自由交流」模式：成员之间可以直接 @ 对方讨论，讨论安静下来后由主智能体统一收集并总结。"
+          : "已切换到「委派」模式：主智能体负责拆解与分派，成员只对分内任务汇报，跨成员协调经过主智能体。",
+    });
+    return mode;
+  }
+
   /** 清空聊天记录前中止所有在跑的成员：静默取消，且丢弃它们排队中的 steer。 */
   cancelAllRuns(): number {
     return this.stopRuns(true);
@@ -106,6 +132,7 @@ export class Orchestrator {
   private stopRuns(silent: boolean): number {
     // 停止前已入队的消息（含刚发出、尚未派发的）不再唤醒成员；之后的新消息序号更高，不受影响。
     this.stoppedThroughSeq = this.deps.bus.snapshot().seq;
+    this.clearCollector();
     let cancelled = 0;
     for (const runtime of this.runtimes.values()) {
       if (runtime.cancel(silent ? { silent: true } : {})) cancelled += 1;
@@ -227,11 +254,55 @@ export class Orchestrator {
       }
       return;
     }
-    const { wakes } = decideWakes(message, this.deps.bus.listMembers());
+    const mode = this.deps.bus.roomMode;
+    const { wakes } = decideWakes(message, this.deps.bus.listMembers(), mode);
     for (const memberId of wakes) this.wake(memberId, message);
+    // 自由交流：成员报告不逐条唤醒主智能体，等讨论安静后统一收集（OpenClaw collector 语义）。
+    if (mode === "free" && message.kind === "announce" && message.senderKind === "member") {
+      const sender = this.deps.bus.getMember(message.senderId);
+      if (sender?.role === "sub") this.scheduleCollector(message);
+    }
   }
 
-  private wake(memberId: string, trigger: RoomMessage): void {
+  private scheduleCollector(trigger: RoomMessage): void {
+    this.collectorDue = trigger;
+    if (this.collectorTimer) clearTimeout(this.collectorTimer);
+    this.collectorTimer = setTimeout(() => {
+      this.collectorTimer = null;
+      this.fireCollector();
+    }, FREE_COLLECT_QUIET_MS);
+    this.collectorTimer.unref();
+  }
+
+  /** 安静窗口到期：还有成员在跑/排队就继续等，全部安静后唤醒主智能体做综合总结。 */
+  private fireCollector(): void {
+    const trigger = this.collectorDue;
+    this.collectorDue = null;
+    if (!trigger || this.stopped || trigger.seq <= this.stoppedThroughSeq) return;
+    if (this.deps.bus.roomMode !== "free") return;
+    const busy =
+      this.queue.length > 0 ||
+      [...this.runtimes.values()].some((runtime) => runtime.isRunning && runtime.member.role === "sub");
+    if (busy) {
+      this.scheduleCollector(trigger);
+      return;
+    }
+    const main = this.deps.bus.listMembers().find((member) => member.role === "main");
+    if (!main || main.status === "cancelled") return;
+    this.wake(
+      main.id,
+      trigger,
+      "自由交流模式：群里的讨论已安静下来。请收集所有成员的最新结论，给用户一个综合总结。",
+    );
+  }
+
+  private clearCollector(): void {
+    if (this.collectorTimer) clearTimeout(this.collectorTimer);
+    this.collectorTimer = null;
+    this.collectorDue = null;
+  }
+
+  private wake(memberId: string, trigger: RoomMessage, steerNote?: string): void {
     const member = this.deps.bus.getMember(memberId);
     if (!member || member.status === "cancelled") return;
     const key = `${trigger.id}:${memberId}`;
@@ -241,7 +312,7 @@ export class Orchestrator {
 
     const runtime = this.runtimeFor(member);
     if (runtime.isRunning) {
-      runtime.steer(trigger);
+      runtime.steer(trigger, steerNote);
       return;
     }
     this.schedule(() => runtime.run(trigger));

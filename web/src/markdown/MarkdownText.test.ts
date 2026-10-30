@@ -11,6 +11,10 @@ function render(text: string, streaming?: boolean): string {
   return renderToStaticMarkup(createElement(MarkdownText, { text, streaming }));
 }
 
+function renderDocument(text: string): string {
+  return renderToStaticMarkup(createElement(MarkdownText, { text, variant: "document" }));
+}
+
 describe("作战室气泡的渲染门控", () => {
   it("只对带 Markdown 结构的正文显示原文切换", () => {
     expect(hasMarkdownStructure("## 标题")).toBe(true);
@@ -109,5 +113,21 @@ describe("作战室 Markdown 预览渲染", () => {
   it("方块画字符走代码块，避免被 Markdown 折叠", () => {
     const art = ["▀▄█▀▄", "█▀▄█▀", "▀█▄▀█"].join("\n");
     expect(render(art)).toContain("block-art");
+  });
+});
+
+describe("文件工作区 Markdown 文档预览", () => {
+  it("按 Markdown 结构渲染而非显示源码", () => {
+    const html = renderDocument("# 使用说明\n\n1. 上传文件\n2. 点开预览\n\n**注意**：相对路径以工作区为根。");
+    expect(html).toContain("<h1>使用说明</h1>");
+    expect(html).toContain("<ol>");
+    expect(html).toContain("<strong>注意</strong>");
+    expect(html).not.toContain("# 使用说明");
+  });
+
+  it("文档模式不剥离聊天脚手架，正文中的标签示例照常显示", () => {
+    const html = renderDocument('示例：<invoke name="exec">');
+    expect(html).toContain("invoke");
+    expect(html).not.toContain("markdown-empty");
   });
 });

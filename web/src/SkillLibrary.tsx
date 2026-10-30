@@ -7,6 +7,8 @@ import {
   fetchSkills,
   importSkills,
   updateSkill,
+  type SkillCategory,
+  type SkillCategoryView,
   type SkillFileInput,
   type SkillFileView,
   type SkillImportResult,
@@ -17,6 +19,7 @@ import {
 import { Icon } from "./icons";
 
 type SkillTab = "shared" | "personal";
+type CategoryFilter = SkillCategory | "all";
 
 type SkillMode =
   | { kind: "list" }
@@ -113,6 +116,8 @@ function filesOf(skill: SkillView): SkillFileView[] {
 export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) {
   const [snapshot, setSnapshot] = useState<SkillSnapshot | null>(null);
   const [tab, setTab] = useState<SkillTab>("shared");
+  const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>("all");
+  const [query, setQuery] = useState("");
   const [mode, setMode] = useState<SkillMode>({ kind: "list" });
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -162,12 +167,131 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
   const skills = tab === "shared" ? shared : personal;
   const canManage = (skill: SkillView) => skill.scope === "personal" || canManageShared;
 
+  const categories = snapshot?.categories ?? [];
+  const categoryById = new Map(categories.map((item) => [item.id, item]));
+  const categoryLabel = (id: SkillCategory): string => categoryById.get(id)?.label ?? "其他";
+  const normalizedQuery = query.trim().toLowerCase();
+  const matching = skills.filter((skill) => {
+    if (!normalizedQuery) return true;
+    return (
+      skill.name.toLowerCase().includes(normalizedQuery) ||
+      skill.description.toLowerCase().includes(normalizedQuery) ||
+      categoryLabel(skill.category).includes(query.trim())
+    );
+  });
+  const countByCategory = new Map<SkillCategory, number>();
+  for (const skill of matching) {
+    countByCategory.set(skill.category, (countByCategory.get(skill.category) ?? 0) + 1);
+  }
+  // 只展示有内容的分类；当前选中的分类即使被搜索筛空也保留，避免筛选器突然消失。
+  const chipCategories = categories.filter(
+    (item) => (countByCategory.get(item.id) ?? 0) > 0 || categoryFilter === item.id,
+  );
+  const visibleSkills =
+    categoryFilter === "all"
+      ? matching
+      : matching.filter((skill) => skill.category === categoryFilter);
+  const groups =
+    categoryFilter === "all"
+      ? chipCategories.map((category) => ({
+          category,
+          items: matching.filter((skill) => skill.category === category.id),
+        }))
+      : [];
+
   const hint =
     tab === "shared"
       ? canManageShared
         ? "共享技能对全部账号的智能体可见，只有管理员可以新建、编辑或删除。"
         : "共享技能由管理员维护；你和你的智能体都可以直接使用。"
       : "个人技能只有你自己的主智能体与子成员能用，其他账号看不到。";
+
+  const renderCard = (skill: SkillView) => (
+    <li key={skill.id} className="skill-card">
+      <div className="skill-card-head">
+        <span className="skill-name">{skill.name}</span>
+        <span className="skill-owner">
+          {skill.builtin
+            ? "随系统预装"
+            : skill.imported
+              ? (skill.source ?? "导入自 SKILL.md")
+              : skill.scope === "shared"
+                ? `由 ${skill.ownerName ?? "管理员"} 维护`
+                : "仅自己可见"}
+        </span>
+      </div>
+      <div className="skill-card-meta">
+        <span className="chip skill-category-chip" title={categoryById.get(skill.category)?.hint}>
+          {categoryLabel(skill.category)}
+        </span>
+        <span className={`chip${skill.scope === "shared" ? " accent" : ""}`}>
+          {scopeLabel(skill.scope)}
+        </span>
+        {skill.builtin && <span className="chip">内置</span>}
+        {skill.imported && <span className="chip">导入</span>}
+        {fileCountLabel(skill) && <span className="chip">{fileCountLabel(skill)}</span>}
+      </div>
+      <p className="skill-desc">{skill.description}</p>
+      <div className="skill-foot">
+        <span className="skill-time">更新于 {new Date(skill.updatedAt).toLocaleDateString()}</span>
+        <div className="skill-actions">
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={() => {
+              setNotice(null);
+              setMode({ kind: "view", skill });
+            }}
+          >
+            查看
+          </button>
+          {canManage(skill) && (
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={() => {
+                setNotice(null);
+                setMode({ kind: "edit", skill });
+              }}
+            >
+              编辑
+            </button>
+          )}
+          {canManage(skill) &&
+            (confirmingId === skill.id ? (
+              <>
+                <button
+                  type="button"
+                  className="btn danger sm"
+                  disabled={deleting}
+                  onClick={() => void handleDelete(skill)}
+                >
+                  {deleting ? "删除中…" : "确认删除"}
+                </button>
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => setConfirmingId(null)}
+                >
+                  取消
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="btn ghost sm danger"
+                onClick={() => {
+                  setNotice(null);
+                  setConfirmingId(skill.id);
+                }}
+              >
+                删除
+              </button>
+            ))}
+        </div>
+      </div>
+    </li>
+  );
 
   return (
     <div className="board-sheet skills-sheet">
@@ -211,6 +335,7 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
                 className={`skills-tab${tab === "shared" ? " active" : ""}`}
                 onClick={() => {
                   setTab("shared");
+                  setCategoryFilter("all");
                   setConfirmingId(null);
                 }}
               >
@@ -224,6 +349,7 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
                 className={`skills-tab${tab === "personal" ? " active" : ""}`}
                 onClick={() => {
                   setTab("personal");
+                  setCategoryFilter("all");
                   setConfirmingId(null);
                 }}
               >
@@ -259,6 +385,53 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
             </div>
             <p className="hint">{hint}</p>
 
+            <div className="skills-filters">
+              <label className="skills-search">
+                <Icon name="search" />
+                <input
+                  value={query}
+                  placeholder="搜索技能名称、描述或分类"
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+                {query && (
+                  <button
+                    type="button"
+                    className="skills-search-clear"
+                    aria-label="清除搜索"
+                    onClick={() => setQuery("")}
+                  >
+                    <Icon name="close" />
+                  </button>
+                )}
+              </label>
+              {snapshot && (
+                <div className="skill-cats" aria-label="按分类筛选">
+                  <button
+                    type="button"
+                    className={`skill-cat${categoryFilter === "all" ? " active" : ""}`}
+                    aria-pressed={categoryFilter === "all"}
+                    onClick={() => setCategoryFilter("all")}
+                  >
+                    全部
+                    <span>{matching.length}</span>
+                  </button>
+                  {chipCategories.map((category) => (
+                    <button
+                      key={category.id}
+                      type="button"
+                      className={`skill-cat${categoryFilter === category.id ? " active" : ""}`}
+                      aria-pressed={categoryFilter === category.id}
+                      title={category.hint}
+                      onClick={() => setCategoryFilter(category.id)}
+                    >
+                      {category.label}
+                      <span>{countByCategory.get(category.id) ?? 0}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {!snapshot ? (
               <p className="hint">正在加载技能…</p>
             ) : skills.length === 0 ? (
@@ -267,92 +440,46 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
                   ? "共享库还是空的。"
                   : "你还没有个人技能，可以新建一个，或导入现成的 SKILL.md。"}
               </p>
-            ) : (
-              <ul className="skill-list">
-                {skills.map((skill) => (
-                  <li key={skill.id} className="skill-card">
-                    <div className="skill-card-head">
-                      <span className="skill-name">{skill.name}</span>
-                      <span className={`chip${skill.scope === "shared" ? " accent" : ""}`}>
-                        {scopeLabel(skill.scope)}
-                      </span>
-                      {skill.builtin && <span className="chip">内置</span>}
-                      {skill.imported && <span className="chip">导入</span>}
-                      {fileCountLabel(skill) && <span className="chip">{fileCountLabel(skill)}</span>}
-                      <span className="skill-owner">
-                        {skill.builtin
-                          ? "随系统预装"
-                          : skill.imported
-                            ? (skill.source ?? "导入自 SKILL.md")
-                            : skill.scope === "shared"
-                              ? `由 ${skill.ownerName ?? "管理员"} 维护`
-                              : "仅自己可见"}
-                      </span>
+            ) : matching.length === 0 ? (
+              <div className="skills-empty">
+                <p className="empty small">没有匹配「{query.trim()}」的技能。</p>
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => {
+                    setQuery("");
+                    setCategoryFilter("all");
+                  }}
+                >
+                  清除筛选
+                </button>
+              </div>
+            ) : visibleSkills.length === 0 ? (
+              <div className="skills-empty">
+                <p className="empty small">「{categoryLabel(categoryFilter as SkillCategory)}」下没有匹配的技能。</p>
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => setCategoryFilter("all")}
+                >
+                  查看全部分类
+                </button>
+              </div>
+            ) : categoryFilter === "all" ? (
+              <div className="skill-groups">
+                {groups.map((group) => (
+                  <section key={group.category.id} className="skill-group">
+                    <div className="skill-group-head">
+                      <span className="skill-group-title">{group.category.label}</span>
+                      <span className="chip">{group.items.length}</span>
+                      <span className="skill-group-hint">{group.category.hint}</span>
                     </div>
-                    <p className="skill-desc">{skill.description}</p>
-                    <div className="skill-foot">
-                      <span className="skill-time">
-                        更新于 {new Date(skill.updatedAt).toLocaleDateString()}
-                      </span>
-                      <div className="skill-actions">
-                        <button
-                          type="button"
-                          className="btn ghost sm"
-                          onClick={() => {
-                            setNotice(null);
-                            setMode({ kind: "view", skill });
-                          }}
-                        >
-                          查看
-                        </button>
-                        {canManage(skill) && (
-                          <button
-                            type="button"
-                            className="btn ghost sm"
-                            onClick={() => {
-                              setNotice(null);
-                              setMode({ kind: "edit", skill });
-                            }}
-                          >
-                            编辑
-                          </button>
-                        )}
-                        {canManage(skill) &&
-                          (confirmingId === skill.id ? (
-                            <>
-                              <button
-                                type="button"
-                                className="btn danger sm"
-                                disabled={deleting}
-                                onClick={() => void handleDelete(skill)}
-                              >
-                                {deleting ? "删除中…" : "确认删除"}
-                              </button>
-                              <button
-                                type="button"
-                                className="btn ghost sm"
-                                onClick={() => setConfirmingId(null)}
-                              >
-                                取消
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              type="button"
-                              className="btn ghost sm danger"
-                              onClick={() => {
-                                setNotice(null);
-                                setConfirmingId(skill.id);
-                              }}
-                            >
-                              删除
-                            </button>
-                          ))}
-                      </div>
-                    </div>
-                  </li>
+                    <ul className="skill-list">{group.items.map(renderCard)}</ul>
+                  </section>
                 ))}
-              </ul>
+              </div>
+            ) : (
+              <ul className="skill-list">{visibleSkills.map(renderCard)}</ul>
             )}
           </>
         )}
@@ -364,6 +491,9 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
                 ← 返回列表
               </button>
               <span className="skill-name">{mode.skill.name}</span>
+              <span className="chip skill-category-chip" title={categoryById.get(mode.skill.category)?.hint}>
+                {categoryLabel(mode.skill.category)}
+              </span>
               <span className={`chip${mode.skill.scope === "shared" ? " accent" : ""}`}>
                 {scopeLabel(mode.skill.scope)}
               </span>
@@ -412,6 +542,7 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
             key={mode.kind === "edit" ? mode.skill.id : `new-${mode.scope}`}
             scope={mode.kind === "edit" ? mode.skill.scope : mode.scope}
             skill={mode.kind === "edit" ? mode.skill : undefined}
+            categories={categories}
             onCancel={() =>
               setMode(mode.kind === "edit" ? { kind: "view", skill: mode.skill } : { kind: "list" })
             }
@@ -790,17 +921,20 @@ function SkillFilesView({ skill }: { skill: SkillView }) {
 function SkillForm({
   scope,
   skill,
+  categories,
   onCancel,
   onSaved,
 }: {
   scope: SkillScope;
   skill?: SkillView;
+  categories: SkillCategoryView[];
   onCancel: () => void;
   onSaved: (skill: SkillView, created: boolean) => void;
 }) {
   const [name, setName] = useState(skill?.name ?? "");
   const [description, setDescription] = useState(skill?.description ?? "");
   const [instructions, setInstructions] = useState(skill?.instructions ?? "");
+  const [category, setCategory] = useState<SkillCategory>(skill?.category ?? "other");
   /** 库里已有且本次继续保留的附带文件：只带元信息，正文在保存时按需取回。 */
   const [kept, setKept] = useState<SkillFileView[]>(skill?.files ?? []);
   const [added, setAdded] = useState<PendingFile[]>([]);
@@ -870,7 +1004,7 @@ function SkillForm({
     setBusy(true);
     setError(null);
     try {
-      const payload = { name, description, instructions };
+      const payload = { name, description, instructions, category };
       let files: SkillFileInput[] | undefined;
       if (skill) {
         const retained = await Promise.all(
@@ -938,6 +1072,21 @@ function SkillForm({
           onChange={(event) => setDescription(event.target.value)}
         />
       </label>
+
+      <label className="field">
+        <span>分类</span>
+        <select value={category} onChange={(event) => setCategory(event.target.value as SkillCategory)}>
+          {(categories.length > 0
+            ? categories
+            : [{ id: "other" as SkillCategory, label: "其他", hint: "尚未归类的技能" }]
+          ).map((item) => (
+            <option key={item.id} value={item.id}>
+              {item.label} · {item.hint}
+            </option>
+          ))}
+        </select>
+      </label>
+      <p className="hint">分类只影响技能库的筛选与分组，不影响智能体调用。</p>
 
       <label className="field">
         <span>完整说明</span>

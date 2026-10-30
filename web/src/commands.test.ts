@@ -82,6 +82,7 @@ const settings: MaskedSettings = {
 function data(overrides: Partial<CommandData> = {}): CommandData {
   return {
     roomName: "老板 的作战室",
+    mode: "delegate",
     members: [member("running", "主智能体"), member("idle", "调研员")],
     messages: [message("旧消息", 1), message("新消息", 2)],
     tasks: [task("todo", "调研"), task("done", "汇总")],
@@ -180,6 +181,7 @@ describe("命令报告", () => {
   it("/status 汇总成员、任务、模型与文件", () => {
     const report = buildStatusReport(data());
     expect(report).toContain("房间：老板 的作战室");
+    expect(report).toContain("协作模式：委派");
     expect(report).toContain("成员：2（运行中 1 · 空闲 1）");
     expect(report).toContain("消息：已加载 2 条");
     expect(report).toContain("任务：2（待办 1 · 完成 1）");

@@ -2,6 +2,7 @@ import { createServer, type Server } from "node:http";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import ExcelJS from "exceljs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthService } from "../src/auth/auth-service";
 import { SkillLibrary } from "../src/skills/library";
@@ -134,6 +135,37 @@ describe("多用户 API", () => {
     expect((aliceAfter.body["messages"] as unknown[]).length).toBe(0);
     const adminAfter = await call("/api/state", { cookie: adminCookie });
     expect((adminAfter.body["messages"] as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it("作战室模式：默认委派，可切换自由交流并持久化，非法值 400", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const cookie = setup.cookie as string;
+
+    const initial = await call("/api/state", { cookie });
+    expect((initial.body["room"] as Record<string, unknown>)["mode"]).toBe("delegate");
+
+    const switched = await call("/api/room", {
+      method: "PATCH",
+      cookie,
+      body: { mode: "free" },
+    });
+    expect(switched.status).toBe(200);
+    expect((switched.body["room"] as Record<string, unknown>)["mode"]).toBe("free");
+
+    const after = await call("/api/state", { cookie });
+    expect((after.body["room"] as Record<string, unknown>)["mode"]).toBe("free");
+    const last = (after.body["messages"] as Array<{ text: string }>).at(-1);
+    expect(last?.text).toContain("自由交流");
+
+    const bad = await call("/api/room", {
+      method: "PATCH",
+      cookie,
+      body: { mode: "unknown" },
+    });
+    expect(bad.status).toBe(400);
   });
 
   it("个人资料更新：房间名同步、其他会话失效、新密码可登录", async () => {
@@ -960,6 +992,43 @@ describe("文件工作区 API", () => {
     expect((await upload(cookie, "C:/Windows/x.txt", new TextEncoder().encode("x"))).status).toBe(400);
     expect((await upload(cookie, "", new TextEncoder().encode("x"))).status).toBe(400);
     expect((await call(`/api/files/content?path=${encodeURIComponent("nope.txt")}`, { cookie })).status).toBe(404);
+  });
+
+  it("富格式预览：XLSX 返回工作表结构，CSV 与不存在文件给出明确错误", async () => {
+    const cookie = await login();
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("预算");
+    sheet.addRow(["项目", "金额"]);
+    sheet.addRow(["服务器", 1200]);
+    const xlsx = Buffer.from(await workbook.xlsx.writeBuffer());
+
+    expect(
+      (await call(`/api/files/rich-preview?path=${encodeURIComponent("预算.xlsx")}`)).status,
+    ).toBe(401);
+    expect((await upload(cookie, "数据/预算.xlsx", xlsx)).status).toBe(201);
+
+    const preview = await call(
+      `/api/files/rich-preview?path=${encodeURIComponent("数据/预算.xlsx")}`,
+      { cookie },
+    );
+    expect(preview.status).toBe(200);
+    expect(preview.body["name"]).toBe("预算.xlsx");
+    const rich = preview.body["preview"] as { kind: string; sheets: Array<{ name: string; rows: string[][] }> };
+    expect(rich.kind).toBe("sheet");
+    expect(rich.sheets[0]?.name).toBe("预算");
+    expect(rich.sheets[0]?.rows).toEqual([
+      ["项目", "金额"],
+      ["服务器", "1200"],
+    ]);
+
+    await upload(cookie, "说明.csv", new TextEncoder().encode("a,b\n1,2"));
+    expect(
+      (await call(`/api/files/rich-preview?path=${encodeURIComponent("说明.csv")}`, { cookie })).status,
+    ).toBe(415);
+    expect(
+      (await call(`/api/files/rich-preview?path=${encodeURIComponent("缺失.xlsx")}`, { cookie })).status,
+    ).toBe(404);
+    expect((await call("/api/files/rich-preview", { cookie })).status).toBe(400);
   });
 
   it("新建目录：登录后可建，重名 409，非法路径 400", async () => {

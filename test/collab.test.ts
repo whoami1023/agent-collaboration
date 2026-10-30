@@ -195,6 +195,60 @@ describe("group-chat collaboration", () => {
     await waitFor(() => orchestrator.activeRuns === 0);
   });
 
+  it("自由交流模式：成员报告不即时唤醒主智能体，安静后统一收集总结", async () => {
+    const handler: MockHandler = (request) => {
+      const system = request.messages[0]?.content ?? "";
+      const userText = request.messages
+        .filter((message) => message.role === "user")
+        .map((message) => message.content)
+        .join("\n");
+      if (system.includes("里的主智能体")) {
+        if (userText.includes("交回了结果")) return { text: "自由交流综合总结：成员结论已收集。" };
+        return { text: "已让大家展开讨论。" };
+      }
+      return { text: "成员结论：方案 A 可行。" };
+    };
+
+    const { bus, orchestrator } = await makeRig(handler);
+    const researcher = await orchestrator.createMember({
+      name: "研究员",
+      description: "负责方案评估",
+    });
+    expect(orchestrator.setRoomMode("free")).toBe("free");
+    expect(bus.roomMode).toBe("free");
+
+    orchestrator.sendUserMessage("@研究员 讨论一下方案 A");
+    await waitFor(() =>
+      bus.listMessages().some((message) => message.senderId === researcher.id && message.kind === "announce"),
+    );
+
+    // 安静窗口未到：主智能体不应立即被成员报告唤醒。
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(bus.listMessages().some((message) => message.text.includes("自由交流综合总结"))).toBe(false);
+
+    await waitFor(() =>
+      bus.listMessages().some((message) => message.senderId === "m_main" && message.text.includes("自由交流综合总结")),
+    );
+    await waitFor(() => orchestrator.activeRuns === 0);
+  });
+
+  it("切换模式广播 mode 事件并留下系统提示，重复切换不重复提示", async () => {
+    const { bus, orchestrator } = await makeRig(() => ({ text: "ok" }));
+    const events: string[] = [];
+    bus.subscribe((event) => {
+      if (event.type === "mode") events.push(event.mode);
+    });
+
+    expect(bus.roomMode).toBe("delegate");
+    expect(orchestrator.setRoomMode("free")).toBe("free");
+    expect(events).toEqual(["free"]);
+    expect(bus.listMessages().at(-1)?.text).toContain("自由交流");
+
+    const count = bus.listMessages().length;
+    orchestrator.setRoomMode("free");
+    expect(bus.listMessages()).toHaveLength(count);
+  });
+
   it("运行前读取成员最新技能白名单：提示词只出现勾选的技能", async () => {
     let system = "";
     const handler: MockHandler = (request) => {

@@ -4,7 +4,12 @@
   "private": true,
   "type": "module",
   "description": "Group-chat multi-agent collaboration: users create members, agents dispatch work by @mention.",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=9.0.0"
+  },
   "scripts": {
+    "check:env": "node scripts/check-env.mjs",
     "dev": "tsx watch src/server/index.ts",
     "start": "tsx src/server/index.ts",
     "test": "vitest run",
@@ -14,7 +19,10 @@
     "web:build": "vite build --config web/vite.config.ts"
   },
   "dependencies": {
+    "dompurify": "^3.4.17",
+    "exceljs": "^4.4.0",
     "express": "^5.1.0",
+    "mammoth": "^1.13.0",
     "markdown-it": "^15.0.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
