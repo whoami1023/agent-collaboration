@@ -129,11 +129,18 @@ describe("斜杠命令解析", () => {
   it("命令表覆盖全部本地命令", () => {
     expect(SLASH_COMMANDS.map((command) => command.name)).toEqual([
       "help",
+      "new",
       "clear",
       "stop",
       "status",
       "context",
     ]);
+  });
+
+  it("/new 的说明要说清「与上一个任务无关」且保留文件工作区", () => {
+    const command = SLASH_COMMANDS.find((item) => item.name === "new");
+    expect(command?.summary).toContain("与之前无关");
+    expect(command?.summary).toContain("文件工作区保留");
   });
 });
 
@@ -167,8 +174,12 @@ describe("命令提示", () => {
       "status",
     ]);
     expect(suggestSlashCommands("cle").map((command) => command.name)).toEqual(["clear"]);
-    // 说明命中：“聊天记录”出现在 /clear 的摘要里
-    expect(suggestSlashCommands("聊天记录").map((command) => command.name)).toEqual(["clear"]);
+    expect(suggestSlashCommands("new").map((command) => command.name)).toEqual(["new"]);
+    // 说明命中：“聊天记录”同时出现在 /new 与 /clear 的摘要里，按注册表顺序给
+    expect(suggestSlashCommands("聊天记录").map((command) => command.name)).toEqual([
+      "new",
+      "clear",
+    ]);
     expect(suggestSlashCommands("e").map((command) => command.name)).toContain("help");
   });
 
@@ -230,7 +241,9 @@ describe("命令报告", () => {
     for (const command of SLASH_COMMANDS) expect(help).toContain(command.usage);
     expect(help).toContain("不会作为聊天消息发给智能体");
     expect(help).toContain("智能体记忆不受影响");
-    // /clear 现在是归档语义：帮助里要说清任务看板与文件工作区可恢复。
-    expect(help).toContain("整体归档（可恢复）");
+    // 帮助要说清 /new 与 /clear 的分别，以及两者都可恢复。
+    expect(help).toContain("/new 只把聊天记录与任务卡归档起来");
+    expect(help).toContain("/clear 连文件成果一起归档");
+    expect(help).toContain("都能在右侧「归档」恢复");
   });
 });

@@ -29,6 +29,7 @@ export type IconName =
   | "trash"
   | "archive"
   | "restore"
+  | "sliders"
   | "check";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
@@ -181,6 +182,14 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
     </>
   ),
   check: <path d="m5 12.5 4.5 4.5L19 7" />,
+  sliders: (
+    <>
+      <path d="M4 8h9M17 8h3" />
+      <path d="M4 16h3M11 16h9" />
+      <circle cx="15" cy="8" r="2.2" />
+      <circle cx="9" cy="16" r="2.2" />
+    </>
+  ),
 };
 
 export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {

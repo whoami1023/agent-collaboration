@@ -294,23 +294,25 @@ export async function sendMessage(text: string): Promise<RoomMessage> {
   return body.message;
 }
 
-/** /clear：中止在跑的成员，把群聊记录、任务卡与文件成果归档后清空作战室。 */
-export function clearMessages(): Promise<{
+/** /clear 与 /new 的返回：被清掉的消息数、任务卡数、中止的运行，以及生成的归档摘要（原本为空则是 null）。 */
+export interface SessionResetResult {
   cleared: number;
   tasksCleared: number;
   cancelled: number;
   archived: SessionArchiveSummary | null;
-}> {
-  return request<{
-    cleared: number;
-    tasksCleared: number;
-    cancelled: number;
-    archived: SessionArchiveSummary | null;
-  }>("/api/messages", { method: "DELETE" });
 }
 
-export async function fetchArchives(): Promise<SessionArchiveSummary[]> {
-  const body = await request<{ archives: SessionArchiveSummary[] }>("/api/archives");
+/** /clear：中止在跑的成员，把群聊记录、任务卡与文件成果归档后清空作战室。 */
+export function clearMessages(): Promise<SessionResetResult> {
+  return request<SessionResetResult>("/api/messages", { method: "DELETE" });
+}
+
+/** /new：归档聊天记录与任务卡后开一个新会话；文件工作区、成员与智能体记忆都保留。 */
+export function startNewSession(): Promise<SessionResetResult> {
+  return request<SessionResetResult>("/api/session/new", { method: "POST" });
+}
+
+export async function fetchArchives(): Promise<SessionArchiveSummary[]> {  const body = await request<{ archives: SessionArchiveSummary[] }>("/api/archives");
   return body.archives;
 }
 
@@ -565,6 +567,8 @@ export async function patchTask(taskId: string, patch: { status?: string }): Pro
 export async function saveSettings(patch: {
   activeProviderId?: string;
   providers?: Array<{ id: string; apiKey?: string; baseUrl?: string; model?: string }>;
+  /** 以存储单位提交（超时为毫秒），服务端按 LIMIT_FIELDS 区间校验。 */
+  limits?: Partial<Limits>;
 }): Promise<MaskedSettings> {
   const body = await request<{ settings: MaskedSettings }>("/api/settings", {
     method: "PUT",

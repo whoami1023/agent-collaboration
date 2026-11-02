@@ -99,6 +99,28 @@ describe("会话归档采集", () => {
     expect(await archives.list()).toEqual([]);
   });
 
+  it("includeFiles:false 只归档会话本体，文件工作区留在原地", async () => {
+    say("换一个新任务");
+    board.create({ title: "旧任务", createdBy: "user" });
+    await writeLiveFile("report.md", "# 调研");
+
+    const summary = await archives.capture({ ...input(), includeFiles: false });
+    expect(summary).not.toBeNull();
+    expect(summary!.messageCount).toBe(1);
+    expect(summary!.taskCount).toBe(1);
+    expect(summary!.fileCount).toBe(0);
+    expect(summary!.totalBytes).toBe(0);
+    expect((await archives.read(summary!.id)).files).toEqual([]);
+    expect(await readLiveFile("report.md")).toContain("# 调研");
+    await expect(readdir(join(dir, "archives", summary!.id, "files"))).rejects.toThrow();
+  });
+
+  it("includeFiles:false 时只剩文件也不算有内容，不生成归档", async () => {
+    await writeLiveFile("report.md", "# 调研");
+    expect(await archives.capture({ ...input(), includeFiles: false })).toBeNull();
+    expect(await exists("report.md")).toBe(true);
+  });
+
   it("技能脚本缓存目录 .skill-runtime 不进归档", async () => {
     say("跑一下技能脚本");
     await writeLiveFile(".skill-runtime/run.py", "print(1)");

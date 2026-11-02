@@ -1,4 +1,10 @@
-import type { Member, RoomMessage, RoomMode, TaskCard } from "../../src/core/types";
+import {
+  DEFAULT_LIMITS,
+  type Member,
+  type RoomMessage,
+  type RoomMode,
+  type TaskCard,
+} from "../../src/core/types";
 import type { MaskedSettings } from "./api";
 
 export interface SlashCommandDef {
@@ -10,6 +16,11 @@ export interface SlashCommandDef {
 /** 前端本地命令表：解析、帮助文案与可用性共用一份，避免散落的正则。 */
 export const SLASH_COMMANDS: SlashCommandDef[] = [
   { name: "help", usage: "/help", summary: "查看可用命令与说明" },
+  {
+    name: "new",
+    usage: "/new",
+    summary: "开启新会话：归档当前聊天记录与任务卡，接下来的任务与之前无关（文件工作区保留）",
+  },
   { name: "clear", usage: "/clear", summary: "归档并清空作战室（聊天记录、任务卡、文件成果），可在右侧归档区恢复" },
   { name: "stop", usage: "/stop", summary: "中止当前作战室里所有正在运行的成员" },
   { name: "status", usage: "/status", summary: "查看成员、任务、模型与运行状态" },
@@ -165,9 +176,9 @@ export function buildContextReport(data: CommandData): string {
   const maxChars = numberOr(limits.maxRoomWindowChars, 12_000);
   const window = estimateWindow(data.messages, maxChars);
   const contextTokens = numberOr(limits.contextWindowTokens, 0);
-  const stepLimit = numberOr(limits.maxStepsPerRun, 24);
-  const timeout = numberOr(limits.runTimeoutMs, 180_000);
-  const concurrency = numberOr(limits.maxConcurrent, 8);
+  const stepLimit = numberOr(limits.maxStepsPerRun, DEFAULT_LIMITS.maxStepsPerRun);
+  const timeout = numberOr(limits.runTimeoutMs, DEFAULT_LIMITS.runTimeoutMs);
+  const concurrency = numberOr(limits.maxConcurrent, DEFAULT_LIMITS.maxConcurrent);
   const transcriptBytes =
     typeof limits.maxActiveTranscriptBytes === "string" ||
     typeof limits.maxActiveTranscriptBytes === "number"
@@ -183,7 +194,7 @@ export function buildContextReport(data: CommandData): string {
     `· 模型视图字节上限：${transcriptBytes ?? "未设置"}`,
     `· 运行限制：最多 ${stepLimit} 步工具调用、单次超时 ${formatDuration(timeout)}、并发 ${concurrency}`,
     "· 记忆召回：运行前按消息检索 MEMORY.md、USER.md、memory/**/*.md 与群聊转录，命中才注入",
-    "· 历史记录：消息不会自动删除；/clear 会把作战室整体归档，随时可恢复",
+    "· 历史记录：消息不会自动删除；/new 把上一会话归档起来（文件保留），/clear 连文件成果一起归档，随时可恢复",
     "",
     "说明：字符与 token 为前端估算，实际上下文由服务端按运行时预算裁剪。",
   ].join("\n");
@@ -194,6 +205,7 @@ export function buildHelpReport(): string {
     "可用命令（在本机执行，不会作为聊天消息发给智能体）",
     ...SLASH_COMMANDS.map((command) => `· ${command.usage} — ${command.summary}`),
     "",
-    "/clear 与 /stop 会影响正在运行的成员；/clear 会把任务看板与文件工作区整体归档（可恢复），智能体记忆不受影响。",
+    "/new 只把聊天记录与任务卡归档起来，文件工作区、成员与智能体记忆都不动，适合换一个新任务；/clear 连文件成果一起归档。",
+    "/clear 与 /stop 会影响正在运行的成员；两者归档的内容都能在右侧「归档」恢复，智能体记忆不受影响。",
   ].join("\n");
 }

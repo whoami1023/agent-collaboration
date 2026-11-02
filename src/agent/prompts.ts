@@ -64,7 +64,7 @@ const FILE_WORKSPACE_SECTION = `文件工作区
 
 const COMMAND_SECTION = `命令执行
 - run_command 在文件工作区执行命令（默认 30 秒、最长 120 秒，输出截断到 32 KB）：可跑 Python/Node 脚本、pip/npm 安装、数据校验；cwd 必须留在工作区内。
-- run_skill_script 执行技能附带脚本：会先把该技能的全部文件展开到 files/.skill-runtime/<技能名>/，再用对应解释器运行，产出保留在该目录。
+- run_skill_script 执行技能附带脚本：会先把该技能的全部文件展开到 files/.skill-runtime/<技能名>/，再用对应解释器运行。默认在该展开目录里跑（产出只留在临时目录）；要处理文件工作区里的成果就传 cwd="." 让脚本在 files/ 里读写。
 - 命令以服务进程权限运行，不会经过 shell 传递参数的部分只限脚本参数；执行前想清后果，不要运行来源不明的命令。
 - 执行后如实引用真实输出（退出码与关键日志）；失败就贴错误并说明下一步，不要编造运行结果。`;
 

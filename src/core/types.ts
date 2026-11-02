@@ -46,13 +46,109 @@ export const DEFAULT_LIMITS: Limits = {
   maxConcurrent: 8,
   maxChildrenPerAgent: 5,
   maxSpawnDepth: 5,
-  maxStepsPerRun: 24,
+  maxStepsPerRun: 48,
   maxRoomWindowChars: 12000,
   maxTurnsPerUserMessage: 12,
-  runTimeoutMs: 180000,
+  runTimeoutMs: 420000,
   contextWindowTokens: 64000,
   maxActiveTranscriptBytes: "2mb",
 };
+
+/** `Limits` 里按整数校验的字段（可选的 token 预算/字节上限除外）。 */
+export type LimitCountKey =
+  | "maxConcurrent"
+  | "maxChildrenPerAgent"
+  | "maxSpawnDepth"
+  | "maxStepsPerRun"
+  | "maxRoomWindowChars"
+  | "maxTurnsPerUserMessage"
+  | "runTimeoutMs";
+
+export interface LimitFieldSpec {
+  key: LimitCountKey;
+  label: string;
+  /** 合法区间以存储单位表示（`runTimeoutMs` 为毫秒）。 */
+  min: number;
+  max: number;
+  displayUnit: string;
+  /** 界面编辑值 = 存储值 / displayDivisor；省略表示与存储单位一致。 */
+  displayDivisor?: number;
+  /** 是否在设置面板「运行限额」分组里暴露给用户。 */
+  inSettingsPanel?: boolean;
+  hint?: string;
+}
+
+/**
+ * 运行限额的合法区间：服务端 `sanitizeLimits()` 用它拒绝越界值，
+ * 设置面板用它渲染表单，两边共用一套，避免 UI 与校验漂移。
+ */
+export const LIMIT_FIELDS: readonly LimitFieldSpec[] = [
+  {
+    key: "maxStepsPerRun",
+    label: "单次运行工具步数",
+    min: 4,
+    max: 120,
+    displayUnit: "步",
+    inSettingsPanel: true,
+    hint: "一个成员被派发一次最多能调用多少轮工具；用尽后会自动收尾并给出「继续」。",
+  },
+  {
+    key: "runTimeoutMs",
+    label: "单次运行超时",
+    min: 15_000,
+    max: 900_000,
+    displayUnit: "秒",
+    displayDivisor: 1000,
+    inSettingsPanel: true,
+    hint: "整轮运行的墙上时钟上限，与步数同时生效：只调大步数不调超时会先触发超时中止。",
+  },
+  {
+    key: "maxConcurrent",
+    label: "同时运行成员数",
+    min: 1,
+    max: 32,
+    displayUnit: "个",
+    inSettingsPanel: true,
+    hint: "同一时刻最多允许多少个智能体并发跑。",
+  },
+  {
+    key: "maxChildrenPerAgent",
+    label: "每个智能体子成员上限",
+    min: 1,
+    max: 20,
+    displayUnit: "个",
+    inSettingsPanel: true,
+  },
+  {
+    key: "maxSpawnDepth",
+    label: "最大层级深度",
+    min: 1,
+    max: 8,
+    displayUnit: "层",
+    inSettingsPanel: true,
+  },
+  {
+    key: "maxRoomWindowChars",
+    label: "群聊上下文窗口",
+    min: 2000,
+    max: 60000,
+    displayUnit: "字符",
+  },
+  {
+    key: "maxTurnsPerUserMessage",
+    label: "单条消息接力轮数",
+    min: 1,
+    max: 24,
+    displayUnit: "轮",
+  },
+];
+
+/** 系统提示里「这次没跑完」的恢复入口：前端据此渲染一键「继续」。 */
+export interface ResumeHint {
+  memberId: string;
+  memberName: string;
+  taskId?: string;
+}
 
 export interface Member {
   id: string;
@@ -94,6 +190,7 @@ export interface RoomMessage {
   replyTo?: string;
   chainRootId?: string;
   depthTurn?: number;
+  resume?: ResumeHint;
 }
 
 export interface ArtifactRef {

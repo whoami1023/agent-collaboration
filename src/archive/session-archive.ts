@@ -33,6 +33,8 @@ export interface CaptureInput {
   seq: number;
   messages: RoomMessage[];
   tasks: TaskCard[];
+  /** false 时只存群聊与任务卡，文件工作区留在原地（/new 开新会话用）；缺省为 true。 */
+  includeFiles?: boolean;
 }
 
 export interface RestoreResult {
@@ -130,8 +132,9 @@ export class SessionArchives {
 
   /** 采集当前作战室内容成一份归档；三样都是空的就返回 null（不留下空归档）。 */
   async capture(input: CaptureInput): Promise<SessionArchiveSummary | null> {
-    const topLevel = await this.liveTopLevel();
-    const files = await this.listFiles(this.filesRoot);
+    const withFiles = input.includeFiles !== false;
+    const topLevel = withFiles ? await this.liveTopLevel() : [];
+    const files = withFiles ? await this.listFiles(this.filesRoot) : [];
     if (input.messages.length === 0 && input.tasks.length === 0 && files.length === 0) {
       return null;
     }

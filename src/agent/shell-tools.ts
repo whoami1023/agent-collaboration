@@ -6,6 +6,7 @@ import type { WorkspaceFiles } from "../files/workspace-files";
 import type { SkillLibrary } from "../skills/library";
 import { isSkillSelected } from "../skills/selection";
 import type { ToolImpl } from "./loop";
+import { describeCandidates, resolvePythonLaunch } from "./python-launcher";
 
 export const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 export const MAX_COMMAND_TIMEOUT_MS = 120_000;
@@ -179,6 +180,13 @@ function formatResult(header: string, result: RunResult, timeoutMs: number): str
   if (result.truncated) {
     lines.push(`（输出超过 ${MAX_OUTPUT_BYTES / 1024} KB，已截断；请缩小输出范围后重跑）`);
   }
+  // Windows 的 python/python3 常常是商店占位程序：给出可执行的下一步，而不是让用户读那句英文提示。
+  if (/Python was not found|python\.exe.*WindowsApps/i.test(`${result.stdout}\n${result.stderr}`)) {
+    lines.push(
+      "提示：这条命令的 python 指向 Microsoft Store 占位程序，不是真实解释器。" +
+        "Windows 上请改用 py -3（或 run_skill_script 执行 .py，它会自动挑选可用的 Python）。",
+    );
+  }
   return lines.join("\n");
 }
 
@@ -206,14 +214,23 @@ interface Interpreter {
   args: string[];
 }
 
-function interpreterFor(scriptRel: string, scriptAbs: string, args: string[]): Interpreter | string {
+async function interpreterFor(
+  scriptRel: string,
+  scriptAbs: string,
+  args: string[],
+): Promise<Interpreter | string> {
   const ext = path.extname(scriptRel).toLowerCase();
   switch (ext) {
-    case ".py":
-      return {
-        command: process.env.PYTHON?.trim() || (process.platform === "win32" ? "python" : "python3"),
-        args: [scriptAbs, ...args],
-      };
+    case ".py": {
+      const python = await resolvePythonLaunch();
+      if (!python) {
+        return (
+          `找不到可用的 Python 解释器（已尝试：${describeCandidates()}）；` +
+          "请确认可执行文件已安装并在 PATH 中，或用 PYTHON 指定，例如 PYTHON=py -3"
+        );
+      }
+      return { command: python.command, args: [...python.args, scriptAbs, ...args] };
+    }
     case ".js":
     case ".mjs":
     case ".cjs":
@@ -293,7 +310,7 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
       schema: {
         name: "run_skill_script",
         description:
-          "执行技能附带的脚本。会把该技能的全部附带文件展开到 files/.skill-runtime/<技能名>/ 后运行指定脚本（参数不会经过 shell），产出保留在该目录。支持 .py / .js / .mjs / .sh / .ps1 / .cmd / .bat。",
+          "执行技能附带的脚本。会把该技能的全部附带文件展开到 files/.skill-runtime/<技能名>/ 后运行指定脚本（参数不会经过 shell）。默认在技能脚本目录里跑，产出也留在那里；要读写文件工作区里的成果时传 cwd（相对 files/），这样输入输出都是右侧「文件」能看到的路径。支持 .py / .js / .mjs / .sh / .ps1 / .cmd / .bat。",
         parameters: {
           type: "object",
           properties: {
@@ -303,6 +320,11 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
               type: "array",
               items: { type: "string" },
               description: "可选：传给脚本的参数数组",
+            },
+            cwd: {
+              type: "string",
+              description:
+                '可选：运行目录，相对文件工作区（"." = files/ 根目录，也可 "reports"）。省略时在 files/.skill-runtime/<技能名>/ 里跑',
             },
             timeout_ms: { type: "number", description: "可选：超时毫秒数，默认 30000，最大 120000" },
           },
@@ -363,13 +385,28 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
         }
 
         const scriptAbs = path.join(skillDir, ...hit.file.path.split("/"));
-        const interpreter = interpreterFor(hit.file.path, scriptAbs, scriptArgs);
+        const interpreter = await interpreterFor(hit.file.path, scriptAbs, scriptArgs);
         if (typeof interpreter === "string") return `错误：${interpreter}`;
 
+        let runDir = skillDir;
+        const rawCwd = readString(args, "cwd");
+        if (rawCwd !== undefined) {
+          try {
+            runDir = resolveCwd(deps.files.rootDir, rawCwd);
+          } catch (err) {
+            return `错误：${err instanceof Error ? err.message : String(err)}`;
+          }
+          try {
+            if (!(await fs.stat(runDir)).isDirectory()) return "错误：cwd 不是目录";
+          } catch {
+            return `错误：cwd 目录不存在：files/${rawCwd}`;
+          }
+        }
+
         const timeoutMs = clampTimeout(args["timeout_ms"]);
-        const relDir = path.relative(deps.files.rootDir, skillDir).split(path.sep).join("/");
+        const relDir = path.relative(deps.files.rootDir, runDir).split(path.sep).join("/");
         const result = await runProcess(interpreter.command, interpreter.args, {
-          cwd: skillDir,
+          cwd: runDir,
           timeoutMs,
           signal,
           shell: false,

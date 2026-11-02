@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildShellTools } from "../src/agent/shell-tools";
+import { resetPythonLaunchCache, resolvePythonLaunch } from "../src/agent/python-launcher";
 import type { Member, PublicUser } from "../src/core/types";
 import { WorkspaceFiles } from "../src/files/workspace-files";
 import { SkillLibrary } from "../src/skills/library";
@@ -51,6 +52,7 @@ async function setup(overrides: Partial<Member> = {}): Promise<void> {
 }
 
 beforeEach(async () => {
+  resetPythonLaunchCache();
   dir = await mkdtemp(join(tmpdir(), "ac-shell-"));
   files = new WorkspaceFiles(dir);
   library = new SkillLibrary(join(dir, "skills.json"));
@@ -59,6 +61,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  resetPythonLaunchCache();
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -153,7 +156,7 @@ describe("run_skill_script", () => {
     expect(missing).toContain("没有文件");
   });
 
-  it("解释器缺失时返回启动失败而不是堆栈", async () => {
+  it("PYTHON 指定了不可用的解释器时报错说明候选，不会抛堆栈", async () => {
     await library.create(admin, {
       scope: "shared",
       name: "py-script",
@@ -161,18 +164,93 @@ describe("run_skill_script", () => {
       instructions: "# 测试\n\n运行 scripts/run.py。",
       files: [{ path: "scripts/run.py", content: "print('hello')\n" }],
     });
-    const previous = process.env.PYTHON;
-    process.env.PYTHON = "definitely-not-a-python-binary-xyz";
+    const previous = process.env["PYTHON"];
+    process.env["PYTHON"] = "definitely-not-a-python-binary-xyz";
     try {
       const out = await tools
         .get("run_skill_script")!
         .execute({ skill: "py-script", path: "scripts/run.py" }, signal);
-      expect(out).toContain("启动失败");
+      expect(out).toContain("找不到可用的 Python 解释器");
+      expect(out).toContain("definitely-not-a-python-binary-xyz");
       expect(out).toContain("确认可执行文件已安装");
     } finally {
-      if (previous === undefined) delete process.env.PYTHON;
-      else process.env.PYTHON = previous;
+      if (previous === undefined) delete process.env["PYTHON"];
+      else process.env["PYTHON"] = previous;
     }
+  });
+
+  it("本机装了 Python 时，附带的 .py 技能不用配 PYTHON 也能跑起来", async () => {
+    resetPythonLaunchCache();
+    const launch = await resolvePythonLaunch();
+    if (!launch) return; // 无 Python 的环境（例如 CI 容器）跳过：本用例验证的是解释器挑选，不是 Python 本身
+    await library.create(admin, {
+      scope: "shared",
+      name: "py-real",
+      description: "真实 Python 脚本",
+      instructions: "# 测试\n\n运行 scripts/gen.py。",
+      files: [
+        {
+          path: "scripts/gen.py",
+          content: "import sys, pathlib\npathlib.Path('out.txt').write_text('ok', encoding='utf-8')\nprint(sys.version.split()[0])\n",
+        },
+      ],
+    });
+    const out = await tools
+      .get("run_skill_script")!
+      .execute({ skill: "py-real", path: "scripts/gen.py" }, signal);
+    expect(out).toContain("退出码：0");
+    const produced = await readFile(join(files.rootDir, ".skill-runtime", "py-real", "out.txt"), "utf8");
+    expect(produced).toBe("ok");
+  });
+
+  it("带 cwd 时脚本在文件工作区里读写，产出不再是临时目录的私有物", async () => {
+    await library.create(admin, {
+      scope: "shared",
+      name: "cwd-skill",
+      description: "读写文件工作区的技能脚本",
+      instructions: "# 测试\n\n用 run_skill_script 带 cwd 执行 scripts/copy.mjs。",
+      files: [
+        {
+          path: "scripts/copy.mjs",
+          content:
+            "import fs from 'node:fs';\n" +
+            "const [input, output] = process.argv.slice(2);\n" +
+            `console.log('cwd=', process.cwd());\n` +
+            "fs.writeFileSync(output, fs.readFileSync(input, 'utf8').toUpperCase());\n",
+        },
+      ],
+    });
+    await files.write("input.txt", Buffer.from("hello", "utf8"), { overwrite: true });
+
+    const out = await tools
+      .get("run_skill_script")!
+      .execute(
+        { skill: "cwd-skill", path: "scripts/copy.mjs", args: ["input.txt", "upper.txt"], cwd: "." },
+        signal,
+      );
+    expect(out).toContain("退出码：0");
+    expect(out).toContain("工作目录：files/");
+    expect((await files.read("upper.txt")).content).toBe("HELLO");
+  });
+
+  it("cwd 越界或不存在的目录都拒绝执行", async () => {
+    await library.create(admin, {
+      scope: "shared",
+      name: "cwd-guard",
+      description: "cwd 校验",
+      instructions: "# 测试\n\n执行 scripts/noop.mjs。",
+      files: [{ path: "scripts/noop.mjs", content: "console.log('ok');\n" }],
+    });
+    expect(
+      await tools
+        .get("run_skill_script")!
+        .execute({ skill: "cwd-guard", path: "scripts/noop.mjs", cwd: "../secrets" }, signal),
+    ).toContain("cwd 必须位于文件工作区内");
+    expect(
+      await tools
+        .get("run_skill_script")!
+        .execute({ skill: "cwd-guard", path: "scripts/noop.mjs", cwd: "nope" }, signal),
+    ).toContain("cwd 目录不存在");
   });
 
   it("不支持的文件类型给出明确提示", async () => {

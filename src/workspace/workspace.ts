@@ -10,6 +10,7 @@ import type {
   SessionArchiveSummary,
   TaskCard,
 } from "../core/types";
+import { SYSTEM_ID } from "../core/types";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
 import { WorkspaceFiles } from "../files/workspace-files";
@@ -155,6 +156,42 @@ export class Workspace {
     const cleared = this.bus.clearMessages();
     const tasksCleared = this.board.clearAll();
     if (archived) this.bus.emit({ type: "session-archived", archive: archived });
+    await this.persist();
+    return { cleared, tasksCleared, cancelled, archived };
+  }
+
+  /**
+   * /new：开一个新会话。与 /clear 的区别是文件工作区原地不动——上一轮的成果还能继续引用，
+   * 但群聊记录与任务卡归档起来，新会话里智能体看不到上一个任务。
+   * 归档后的会话仍可在右侧「归档」恢复；恢复是交换语义，会再把当前会话存回去。
+   */
+  async newSession(): Promise<{
+    cleared: number;
+    tasksCleared: number;
+    cancelled: number;
+    archived: SessionArchiveSummary | null;
+  }> {
+    const cancelled = this.orchestrator.cancelAllRuns();
+    const snapshot = this.bus.snapshot();
+    const archived = await this.archives.capture({
+      roomName: this.bus.roomName,
+      seq: snapshot.seq,
+      messages: snapshot.messages,
+      tasks: this.board.list(),
+      includeFiles: false,
+    });
+    const cleared = this.bus.clearMessages();
+    const tasksCleared = this.board.clearAll();
+    if (archived) this.bus.emit({ type: "session-archived", archive: archived });
+    this.bus.append({
+      senderId: SYSTEM_ID,
+      senderName: "系统",
+      senderKind: "system",
+      kind: "system",
+      text: archived
+        ? `已开启新会话：上一个会话（${archived.messageCount} 条消息、${archived.taskCount} 张任务卡）已归档，与当前任务无关；文件工作区与智能体记忆保留。`
+        : "已开启新会话：当前没有需要归档的内容，这是一个全新的任务。",
+    });
     await this.persist();
     return { cleared, tasksCleared, cancelled, archived };
   }

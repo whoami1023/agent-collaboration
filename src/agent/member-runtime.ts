@@ -1,4 +1,4 @@
-import type { AgentEvent, Limits, Member, RoomMessage } from "../core/types";
+import type { AgentEvent, Limits, Member, ResumeHint, RoomMessage } from "../core/types";
 import { SYSTEM_ID } from "../core/types";
 import { newId } from "../core/ids";
 import type { RoomBus } from "../room/bus";
@@ -102,7 +102,12 @@ export class MemberRuntime {
     const runId = newId("run");
     const controller = new AbortController();
     this.controller = controller;
-    const timeout = setTimeout(() => controller.abort(), limits.runTimeoutMs);
+    /** 区分「跑满整轮超时」与「用户手动取消」：前者要给出可继续的恢复入口。 */
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, limits.runTimeoutMs);
     timeout.unref();
 
     this.setStatus("running");
@@ -219,7 +224,10 @@ export class MemberRuntime {
 
       if (result.error) {
         this.emit({ type: "run-error", runId, memberId: this.member.id, error: result.error });
-        this.notice(`@${this.member.name} 运行中止：${result.error}`);
+        this.notice(
+          `@${this.member.name} 运行中止：${result.error}`,
+          result.errorCode === "max_steps_reached" ? this.resumeHint(trigger) : undefined,
+        );
         this.setStatus("error");
         return;
       }
@@ -244,14 +252,28 @@ export class MemberRuntime {
       }
       if (result.maxStepsReached) {
         this.notice(
-          `@${this.member.name} 单次运行 ${limits.maxStepsPerRun} 步工具调用已用尽，已停止调用工具并基于当前进展收尾；未完成的任务可以再发一条消息继续。`,
+          `@${this.member.name} 单次运行 ${limits.maxStepsPerRun} 步工具调用已用尽，已停止调用工具并基于当前进展收尾。`,
+          this.resumeHint(trigger),
         );
       }
       this.setStatus("idle");
     } catch (err) {
       if (isAbort(err)) {
         this.emit({ type: "run-aborted", runId, memberId: this.member.id });
-        if (!this.silentAbort) this.notice(`@${this.member.name} 本次运行已取消`);
+        if (this.silentAbort) {
+          // 刚清空会话就中止：不再往群里补一条系统消息。
+        } else if (timedOut && bus.getMember(this.member.id)) {
+          const timeoutLabel =
+            limits.runTimeoutMs >= 1000
+              ? `${Math.round(limits.runTimeoutMs / 1000)} 秒`
+              : `${limits.runTimeoutMs} 毫秒`;
+          this.notice(
+            `@${this.member.name} 本次运行达到 ${timeoutLabel}整轮超时被中止，当前进展已保留。`,
+            this.resumeHint(trigger),
+          );
+        } else {
+          this.notice(`@${this.member.name} 本次运行已取消`);
+        }
         this.setStatus("idle");
         return;
       }
@@ -276,13 +298,23 @@ export class MemberRuntime {
     this.deps.bus.emit({ type: "run", event });
   }
 
-  private notice(text: string): void {
+  private notice(text: string, resume?: ResumeHint): void {
     this.deps.bus.append({
       senderId: SYSTEM_ID,
       senderName: "系统",
       senderKind: "system",
       kind: "system",
       text,
+      ...(resume ? { resume } : {}),
     });
+  }
+
+  /** 中止原因可恢复时带上「继续」所需的成员/任务定位信息，前端据此渲染一键重派。 */
+  private resumeHint(trigger: RoomMessage): ResumeHint {
+    return {
+      memberId: this.member.id,
+      memberName: this.member.name,
+      ...(trigger.taskId ? { taskId: trigger.taskId } : {}),
+    };
   }
 }

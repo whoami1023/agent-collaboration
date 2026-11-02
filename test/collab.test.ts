@@ -133,7 +133,27 @@ describe("group-chat collaboration", () => {
     expect(texts.some((text) => text.includes("运行中止") || text.includes("运行失败"))).toBe(false);
     expect(texts.some((text) => text.includes("3 步工具调用已用尽"))).toBe(true);
     const main = bus.listMembers().find((member) => member.role === "main");
+    const notice = bus.listMessages().find((message) => message.text.includes("步工具调用已用尽"));
+    expect(notice?.resume?.memberId).toBe(main?.id);
     expect(main?.status).toBe("idle");
+  });
+
+  it("整轮超时中止时给出「继续」所需的恢复信息，手动取消的文案不变", async () => {
+    const handler: MockHandler = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return { text: "超时之后才完成的回复" };
+    };
+    const { bus, orchestrator } = await makeRig(handler, { runTimeoutMs: 80 });
+    orchestrator.sendUserMessage("一个会跑满整轮超时的任务");
+
+    await waitFor(() => bus.listMessages().some((message) => message.text.includes("整轮超时被中止")));
+    await waitFor(() => orchestrator.activeRuns === 0);
+
+    const notice = bus.listMessages().find((message) => message.text.includes("整轮超时被中止"));
+    const main = bus.listMembers().find((member) => member.role === "main");
+    expect(notice?.resume?.memberId).toBe(main?.id);
+    expect(notice?.text).toContain("80 毫秒");
+    expect(bus.listMessages().some((message) => message.text.includes("本次运行已取消"))).toBe(false);
   });
 
   it("主智能体没有创建成员的通道，被要求建成员时只能直接回答", async () => {

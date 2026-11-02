@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { newId } from "../core/ids";
 import type { PublicUser } from "../core/types";
 import { writeJsonAtomic } from "../store/persist";
-import { BUILTIN_SHARED_SKILLS, BUILTIN_SKILLS_VERSION } from "./builtin";
+import { BUILTIN_SHARED_SKILLS, BUILTIN_SKILLS_VERSION, type BuiltinSkillSeed } from "./builtin";
 import {
   builtinCategoryOf,
   inferSkillCategory,
@@ -196,6 +196,22 @@ function sortFiles(files: SkillFileRecord[]): SkillFileRecord[] {
   return [...files].sort((a, b) => a.path.localeCompare(b.path));
 }
 
+/**
+ * 内置技能预装的脚本同样要走技能目录校验；
+ * 某个技能的脚本写坏了只跳过它的脚本，技能说明照常安装，不拖垮启动。
+ */
+function builtinFilesOf(seed: BuiltinSkillSeed): SkillFileRecord[] {
+  if (!seed.files?.length) return [];
+  try {
+    return normalizeSkillFiles(seed.files.map((file) => ({ path: file.path, content: file.content })));
+  } catch (err) {
+    console.error(
+      `内置技能 ${seed.name} 的附带文件不符合技能目录规则，已跳过脚本预装：${String(err)}`,
+    );
+    return [];
+  }
+}
+
 interface ImportEntry {
   filename: string;
   content: unknown;
@@ -324,6 +340,7 @@ export class SkillLibrary {
     let changed = false;
     for (const seed of BUILTIN_SHARED_SKILLS) {
       if (removed.has(seed.name)) continue;
+      const files = builtinFilesOf(seed);
       const existing = byName.get(seed.name);
       if (!existing) {
         this.data.skills.push({
@@ -336,6 +353,7 @@ export class SkillLibrary {
           category: builtinCategoryOf(seed.name),
           builtin: true,
           source: seed.source,
+          ...(files.length > 0 ? { files: sortFiles(files) } : {}),
           createdAt: now,
           updatedAt: now,
         });
@@ -348,12 +366,17 @@ export class SkillLibrary {
         existing.instructions = seed.instructions;
         existing.source = seed.source;
         existing.category = builtinCategoryOf(seed.name);
+        // 有脚本的内置技能随版本刷新；内置本身不带脚本时不动用户自己上传的附带文件。
+        if (files.length > 0) existing.files = sortFiles(files);
         existing.updatedAt = now;
         changed = true;
-      } else if (existing.builtin && !existing.category) {
-        // 老数据没有分类字段：无需等版本升级，启动时补齐。
-        existing.category = builtinCategoryOf(seed.name);
-        changed = true;
+      } else if (existing.builtin) {
+        // 同版本启动：老数据可能缺分类或缺脚本，按需补齐但不动用户可见内容。
+        if (!existing.category) existing.category = builtinCategoryOf(seed.name);
+        if (files.length > 0 && !existing.files?.length) {
+          existing.files = sortFiles(files);
+          changed = true;
+        }
       }
     }
     if (migrate) {

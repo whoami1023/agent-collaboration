@@ -1719,6 +1719,11 @@ body.pane-dragging * {
 
 .system-line {
   align-self: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
   max-width: 90%;
   padding: 2px 12px;
   border-radius: 999px;
@@ -1726,6 +1731,24 @@ body.pane-dragging * {
   color: var(--muted);
   font-size: var(--text-sm);
   text-align: center;
+}
+
+/* 运行被步数/整轮超时中止时的「继续」：将未完成任务重新 @ 派给原成员。 */
+.system-resume {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 999px;
+  background: var(--accent-subtle);
+  color: var(--accent);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.system-resume:hover {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .composer-wrap {

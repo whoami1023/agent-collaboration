@@ -970,6 +970,58 @@ describe("会话归档 API", () => {
     expect((await call("/api/archives", { cookie })).body["archives"]).toHaveLength(1);
   });
 
+  it("/new 归档会话本体但保留文件工作区；恢复时交换语义同样适用", async () => {
+    expect((await call("/api/session/new", { method: "POST" })).status).toBe(401);
+
+    const { cookie, userId } = await owner();
+    await call("/api/tasks", { method: "POST", cookie, body: { title: "写一份报告" } });
+    await addLiveFile(userId, "report.md", "第一版结论");
+
+    const fresh = await call("/api/session/new", { method: "POST", cookie });
+    expect(fresh.status).toBe(200);
+    expect(fresh.body["tasksCleared"]).toBe(1);
+    const archived = fresh.body["archived"] as Record<string, unknown>;
+    expect(archived).toMatchObject({ messageCount: 0, taskCount: 1, fileCount: 0, totalBytes: 0 });
+
+    // 新房间不是空的：一条系统起点提示，既告诉用户也告诉智能体上一个会话已经归档。
+    const state = await call("/api/state", { cookie });
+    const messages = state.body["messages"] as Array<{ text: string; senderKind: string }>;
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.senderKind).toBe("system");
+    expect(messages[0]?.text).toContain("已开启新会话");
+    expect(state.body["tasks"]).toEqual([]);
+
+    // 文件工作区原地不动：新会话还能把上一轮成果当输入，这是 /new 与 /clear 的分别。
+    const files = await call("/api/files", { cookie });
+    expect((files.body["files"] as Array<{ path: string }>).map((file) => file.path)).toContain("report.md");
+
+    const listed = await call("/api/archives", { cookie });
+    const archiveId = String((listed.body["archives"] as Array<Record<string, unknown>>)[0]?.["id"]);
+    const detail = await call(`/api/archives/${archiveId}`, { cookie });
+    const archive = detail.body["archive"] as Record<string, unknown>;
+    expect((archive["tasks"] as Array<{ title: string }>)[0]?.title).toBe("写一份报告");
+    expect(archive["fileCount"]).toBe(0);
+
+    // 恢复仍是交换：当前会话（含它的文件）先自动归档，上一会话的任务卡回到作战室。
+    const restored = await call(`/api/archives/${archiveId}/restore`, {
+      method: "POST",
+      cookie,
+      body: {},
+    });
+    expect(restored.status).toBe(200);
+    expect(restored.body["autoArchived"]).toMatchObject({
+      messageCount: 1,
+      taskCount: 0,
+      fileCount: 1,
+    });
+    expect(restored.body["restoredFiles"]).toEqual([]);
+    const back = await call("/api/state", { cookie });
+    expect(back.body["messages"]).toEqual([]);
+    expect((back.body["tasks"] as Array<{ title: string }>).map((task) => task.title)).toEqual([
+      "写一份报告",
+    ]);
+  });
+
   it("空的作战室不生成归档；非法或不存在的归档 ID 分别报 400/404", async () => {
     const { cookie } = await owner();
     const cleared = await call("/api/messages", { method: "DELETE", cookie });

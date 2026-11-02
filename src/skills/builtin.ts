@@ -1,16 +1,25 @@
 import { CATALOG_SKILLS } from "./builtin-catalog";
 import { DATA_SKILLS } from "./builtin-data-skills";
+import { DOCX_SKILLS } from "./builtin-docx-skills";
 import { HERMES_SKILLS } from "./builtin-hermes-skills";
+
+export interface BuiltinSkillFile {
+  /** 技能目录内的相对路径，如 scripts/build_docx.py。 */
+  path: string;
+  content: string;
+}
 
 export interface BuiltinSkillSeed {
   name: string;
   description: string;
   instructions: string;
   source: string;
+  /** 随内置技能一起预装的脚本或资料；受 skill-files 的大小与数量上限约束。 */
+  files?: BuiltinSkillFile[];
 }
 
 /** 内置技能内容版本：升级时启动会刷新已有内置记录，用户自建的同名技能不受影响。 */
-export const BUILTIN_SKILLS_VERSION = 7;
+export const BUILTIN_SKILLS_VERSION = 8;
 
 const CORE_SKILLS: BuiltinSkillSeed[] = [
   {
@@ -428,4 +437,5 @@ export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
   ...CATALOG_SKILLS,
   ...DATA_SKILLS,
   ...HERMES_SKILLS,
+  ...DOCX_SKILLS,
 ];

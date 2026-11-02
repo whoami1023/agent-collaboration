@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -109,6 +109,77 @@ describe("WorkspaceRegistry", () => {
     const memory = await again.memory.readAgentFile("MEMORY.md");
     expect(memory.content).toContain("自定义条目");
     expect(memory.content).not.toContain("示例：");
+    await reloaded.closeAll();
+  });
+
+  it("/new 归档消息与任务卡、保留文件工作区，并切断上一个会话的上下文", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    alice.bus.append({
+      senderId: "user",
+      senderName: "老板",
+      senderKind: "user",
+      text: "上一个任务：调研多智能体协同",
+    });
+    alice.board.create({ title: "调研报告", createdBy: "user" });
+    await mkdir(join(dir, "u_alice", "files"), { recursive: true });
+    await writeFile(join(dir, "u_alice", "files", "report.md"), "# 上一轮成果", "utf8");
+    const beforeSeq = alice.bus.snapshot().seq;
+
+    const result = await alice.newSession();
+    expect(result.archived).not.toBeNull();
+    expect(result.archived!.messageCount).toBe(1);
+    expect(result.archived!.taskCount).toBe(1);
+    // 文件不进这份归档，也不被移走：新会话还能接着用上一轮的成果。
+    expect(result.archived!.fileCount).toBe(0);
+    expect(await readFile(join(dir, "u_alice", "files", "report.md"), "utf8")).toContain("上一轮成果");
+
+    // 当前会话只剩一条起点提示：群聊窗口里不会再出现上一个任务。
+    const texts = alice.bus.listMessages(10).map((message) => message.text);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain("已开启新会话");
+    expect(alice.bus.window(12000).some((message) => message.text.includes("调研多智能体协同"))).toBe(false);
+    expect(alice.board.list()).toEqual([]);
+    expect(alice.bus.snapshot().seq).toBeGreaterThan(beforeSeq);
+
+    const listed = await alice.archives.list();
+    expect(listed).toHaveLength(1);
+    const detail = await alice.archives.read(listed[0]!.id);
+    expect(detail.messages.map((message) => message.text)).toEqual(["上一个任务：调研多智能体协同"]);
+    expect(detail.tasks.map((task) => task.title)).toEqual(["调研报告"]);
+    expect(detail.fileCount).toBe(0);
+  });
+
+  it("/new 在空房间里不生成归档，只留下新会话提示", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    const result = await alice.newSession();
+    expect(result.archived).toBeNull();
+    expect(result.cleared).toBe(0);
+    expect(result.tasksCleared).toBe(0);
+    const texts = alice.bus.listMessages(10).map((message) => message.text);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain("当前没有需要归档的内容");
+    expect(await alice.archives.list()).toEqual([]);
+  });
+
+  it("/new 的结果落盘：重载工作区仍在同一个新会话里", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    alice.bus.append({
+      senderId: "user",
+      senderName: "老板",
+      senderKind: "user",
+      text: "旧会话内容",
+    });
+    await alice.newSession();
+    await alice.close();
+
+    const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await skills.init();
+    const reloaded = new WorkspaceRegistry(dir, skills);
+    const restored = await reloaded.get({ id: "u_alice", displayName: "Alice" });
+    expect(restored.bus.listMessages(10).map((message) => message.text)).toEqual([
+      expect.stringContaining("已开启新会话"),
+    ]);
+    expect(restored.board.list()).toEqual([]);
     await reloaded.closeAll();
   });
 });

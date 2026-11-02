@@ -2,7 +2,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { createReadStream, existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Member, TaskStatus } from "../core/types";
-import { maskSettings, mergeSettings } from "../core/settings";
+import { maskSettings, mergeSettings, sanitizeLimits } from "../core/settings";
 import { AuthError, type AuthService, type PublicUser } from "../auth/auth-service";
 import { buildClearSessionCookie, buildSessionCookie, readSessionToken } from "../auth/cookies";
 import { SkillError, type SkillRecord, type SkillLibrary } from "../skills/library";
@@ -363,6 +363,12 @@ export function createApp(deps: AppDeps): express.Express {
     res.json(await workspace.clearRoomSession());
   });
 
+  // /new：开一个新会话——群聊记录与任务卡归档（可恢复），文件工作区、成员与智能体记忆都留在原地。
+  app.post("/api/session/new", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    res.json(await workspace.newSession());
+  });
+
   app.get("/api/archives", async (_req: Request, res: Response) => {
     const workspace = await workspaceFor(res);
     res.json({ archives: await workspace.archives.list() });
@@ -685,7 +691,10 @@ export function createApp(deps: AppDeps): express.Express {
     const workspace = await workspaceFor(res);
     try {
       const body = bodyOf(req) as Parameters<typeof mergeSettings>[1];
-      const next = mergeSettings(workspace.getSettings(), body);
+      const next = mergeSettings(workspace.getSettings(), {
+        ...body,
+        ...(body.limits === undefined ? {} : { limits: sanitizeLimits(body.limits) }),
+      });
       await workspace.setSettings(next);
       res.json({ settings: maskSettings(next) });
     } catch (err) {

@@ -1,6 +1,7 @@
 import type {
   Member,
   MessageKind,
+  ResumeHint,
   RoomEvent,
   RoomMessage,
   RoomMode,
@@ -21,6 +22,7 @@ export interface AppendInput {
   replyTo?: string;
   chainRootId?: string;
   depthTurn?: number;
+  resume?: ResumeHint;
 }
 
 const MAX_MESSAGES = 2000;
@@ -133,6 +135,7 @@ export class RoomBus {
       ...(input.replyTo ? { replyTo: input.replyTo } : {}),
       ...(input.chainRootId ? { chainRootId: input.chainRootId } : {}),
       ...(input.depthTurn !== undefined ? { depthTurn: input.depthTurn } : {}),
+      ...(input.resume ? { resume: input.resume } : {}),
     };
     this.messages.push(message);
     if (this.messages.length > MAX_MESSAGES) {

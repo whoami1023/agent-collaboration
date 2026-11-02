@@ -85,6 +85,11 @@ export const BUILTIN_SKILL_CATEGORIES: Readonly<Record<string, SkillCategory>> =
   postmortem: "product",
   "document-to-action-items": "product",
   "meeting-action-items": "product",
+  "docx-writer": "product",
+  "docx-track-changes": "product",
+  "docx-formula": "product",
+
+  "docx-reader": "research",
 
   "diagram-maker": "design",
   "claude-design": "design",

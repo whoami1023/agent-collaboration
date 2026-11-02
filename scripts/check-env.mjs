@@ -304,13 +304,36 @@ function parsePythonVersion(text) {
   return match ? `${match[1]}.${match[2]}${match[3] ? `.${match[3]}` : ""}` : null;
 }
 
-function probePython(command, commandArgs) {
-  const result = spawnSync(command, commandArgs, { encoding: "utf8", timeout: 5000, windowsHide: true });
+/** spec 形如 `py -3`：第一段是命令，其余是固定参数，与 src/agent/python-launcher.ts 保持一致。 */
+function splitSpec(spec) {
+  const [command, ...args] = spec.trim().split(/\s+/);
+  return { command, args };
+}
+
+function runPythonSpec(spec, extraArgs) {
+  const { command, args } = splitSpec(spec);
+  return spawnSync(command, [...args, ...extraArgs], {
+    encoding: "utf8",
+    timeout: 5000,
+    windowsHide: true,
+  });
+}
+
+function probePython(spec) {
+  const result = runPythonSpec(spec, ["--version"]);
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
   if (/Microsoft Store|was not found|not found|未找到/i.test(output)) return null;
   if (result.error || result.status !== 0) return null;
   const version = parsePythonVersion(output);
-  return version ? { command, version } : null;
+  return version ? { command: spec, version } : null;
+}
+
+/** 与运行时同一套候选顺序：显式 PYTHON 优先且不回退。 */
+function pythonSpecs() {
+  const explicit = process.env.PYTHON?.trim();
+  if (explicit) return [explicit];
+  if (process.platform === "win32") return ["py -3", "py", "python", "python3"];
+  return ["python3", "python"];
 }
 
 function addPythonResult(found, source) {
@@ -329,44 +352,48 @@ function addPythonResult(found, source) {
   }
 }
 
+/** Word 技能脚本依赖 python-docx + lxml：能跑 Python 但缺库时，技能会在第一步就失败。 */
+function checkPythonLibraries(spec) {
+  const result = runPythonSpec(spec, [
+    "-c",
+    "import docx, lxml.etree; print('docx-libs-ok')",
+  ]);
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  if (!result.error && result.status === 0 && output.includes("docx-libs-ok")) {
+    add("python-docx", "可选能力", "Word 技能依赖", "pass", "python-docx 与 lxml 可用（docx 技能可直接运行）");
+    return;
+  }
+  add(
+    "python-docx",
+    "可选能力",
+    "Word 技能依赖",
+    "warn",
+    "当前 Python 缺少 python-docx 或 lxml",
+    `内置 Word 技能需要它们：${spec} -m pip install python-docx lxml`,
+  );
+}
+
 function checkPython() {
   const explicit = process.env.PYTHON?.trim();
+  const specs = pythonSpecs();
+  for (const spec of specs) {
+    const found = probePython(spec);
+    if (!found) continue;
+    addPythonResult(found, explicit ? `PYTHON=${spec}` : `${spec}，run_skill_script 会选用它`);
+    checkPythonLibraries(spec);
+    return;
+  }
+
   if (explicit) {
-    const found = probePython(explicit, ["--version"]);
-    if (!found) {
-      add(
-        "python",
-        "可选能力",
-        "Python",
-        "warn",
-        `PYTHON 已设为 ${explicit}，但无法执行`,
-        "修正或删除该环境变量；删除后 run_skill_script 会回退到 python / python3。",
-      );
-      return;
-    }
-    addPythonResult(found, `PYTHON=${explicit}`);
+    add(
+      "python",
+      "可选能力",
+      "Python",
+      "warn",
+      `PYTHON 已设为 ${explicit}，但无法执行`,
+      "修正或删除该环境变量；删除后 run_skill_script 会自动尝试 py -3 / python / python3。",
+    );
     return;
-  }
-
-  const standard = probePython("python", ["--version"]) ?? probePython("python3", ["--version"]);
-  if (standard) {
-    addPythonResult(standard, `${path.basename(standard.command)}，可被 run_skill_script 直接使用`);
-    return;
-  }
-
-  if (process.platform === "win32") {
-    const launcher = probePython("py", ["-3", "--version"]);
-    if (launcher) {
-      add(
-        "python",
-        "可选能力",
-        "Python",
-        "warn",
-        `仅检测到 py 启动器 ${launcher.version}（run_skill_script 默认不调用 py）`,
-        "设置 PYTHON=py 后即可执行 .py 技能脚本；或在 PATH 中提供 python 命令。run_command 也可直接运行 py 脚本。",
-      );
-      return;
-    }
   }
 
   add(
@@ -374,8 +401,8 @@ function checkPython() {
     "可选能力",
     "Python",
     "warn",
-    "未检测到 Python 3（可选）",
-    "只影响 run_skill_script 执行 .py 技能脚本；Node / Shell 脚本不受影响。安装后可用 PYTHON 环境变量指定解释器。",
+    "未检测到可用的 Python 3（可选）",
+    "只影响 run_skill_script 执行 .py 技能脚本（含内置 Word 技能）；Node / Shell 脚本不受影响。安装后可用 PYTHON 环境变量指定解释器。",
   );
 }
 

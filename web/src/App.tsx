@@ -7,6 +7,8 @@ import type {
   PointerEvent as ReactPointerEvent,
 } from "react";
 import type {
+  LimitFieldSpec,
+  Limits,
   Member,
   PublicUser,
   RoomEvent,
@@ -16,6 +18,7 @@ import type {
   SessionArchiveSummary,
   TaskCard,
 } from "../../src/core/types";
+import { DEFAULT_LIMITS, LIMIT_FIELDS } from "../../src/core/types";
 import { Icon, type IconName } from "./icons";
 import {
   LAYOUT_KEY,
@@ -77,6 +80,7 @@ import {
   sendMessage,
   setRoomMode,
   setupAdmin,
+  startNewSession,
   subscribeEvents,
   updateProfile,
   uploadWorkspaceFile,
@@ -94,7 +98,7 @@ import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdo
 import { CsvPreview, RichPreviewBody } from "./FilePreviews";
 
 type ThemeMode = "light" | "dark";
-type SettingsTab = "profile" | "model" | "appearance";
+type SettingsTab = "profile" | "model" | "limits" | "appearance";
 /** 右侧面板的三个视图：任务看板、文件工作区、归档区。 */
 type RightTab = "tasks" | "files" | "archives";
 
@@ -466,6 +470,7 @@ function RoomView({
   const [error, setError] = useState<string | null>(null);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [clearingChat, setClearingChat] = useState(false);
+  const [startingSession, setStartingSession] = useState(false);
   const [commandOutput, setCommandOutput] = useState<{ title: string; body: string } | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [usersOpen, setUsersOpen] = useState(false);
@@ -1074,6 +1079,10 @@ function RoomView({
       return;
     }
     switch (name) {
+      case "new":
+        setCommandOutput(null);
+        await handleNewSession();
+        return;
       case "clear":
         setCommandOutput(null);
         await handleClearChat();
@@ -1089,6 +1098,43 @@ function RoomView({
         return;
       default:
         setCommandOutput({ title: "可用命令", body: buildHelpReport() });
+    }
+  }
+
+  /**
+   * /new：把当前会话（消息+任务卡）归档起来，开一个与之无关的新会话。
+   * 文件工作区、成员、智能体记忆都不动，因此不关预览、也不重拉文件列表。
+   */
+  async function handleNewSession() {
+    if (startingSession || clearingChat) return;
+    const runningNote =
+      runningCount > 0 ? `\n\n正在运行的 ${runningCount} 个智能体会先被中止本轮回复。` : "";
+    const confirmed = window.confirm(
+      `开启新会话？当前聊天记录与任务卡会归档起来，可在右侧「归档」随时恢复；新会话里的任务与之前无关。${runningNote}\n\n文件工作区、成员与智能体记忆（MEMORY.md、USER.md、memory/）保持不变。`,
+    );
+    if (!confirmed) return;
+    setStartingSession(true);
+    setError(null);
+    try {
+      const result = await startNewSession();
+      // 服务端会在新会话里写一条起点提示，直接以服务端为准重拉视图（同时刷新归档列表）。
+      await reloadSession();
+      if (result.archived) {
+        setRightTab("archives");
+        setOpenArchiveId(result.archived.id);
+      }
+      setChatNotice(
+        result.archived
+          ? `已开启新会话：上一个会话的 ${result.archived.messageCount} 条消息、${result.archived.taskCount} 张任务卡已归档，可在右侧「归档」恢复${
+              result.cancelled > 0 ? `，并中止了 ${result.cancelled} 个正在运行的成员` : ""
+            }；文件工作区保持不变。`
+          : "已开启新会话：之前没有需要归档的内容。",
+      );
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    } finally {
+      setStartingSession(false);
     }
   }
 
@@ -1197,7 +1243,7 @@ function RoomView({
 
   async function handleSend() {
     const text = draft.trim();
-    if (!text || clearingChat) return;
+    if (!text || clearingChat || startingSession) return;
     const parsed = parseSlashCommand(text);
     if (parsed) {
       setDraft("");
@@ -1214,6 +1260,19 @@ function RoomView({
     setCommandOutput(null);
     try {
       await sendMessage(text);
+    } catch (err) {
+      setError(messageOf(err));
+    }
+  }
+
+  /** 一键续跑：走普通 @ mention 派发，让同一个成员带着当前进展再来一轮。 */
+  async function handleResume(memberName: string) {
+    setError(null);
+    try {
+      await sendMessage(
+        `@${memberName} 接着刚才没做完的继续：先回顾上一轮的进展与未完成项，` +
+          "把剩下的做完后汇报结论、关键产出路径和仍未解决的地方。",
+      );
     } catch (err) {
       setError(messageOf(err));
     }
@@ -1594,7 +1653,7 @@ function RoomView({
                 >
                   <Icon name="settings" />
                   <span className="menu-label">设置</span>
-                  <span className="menu-hint">资料 · 模型 · 外观</span>
+                  <span className="menu-hint">资料 · 模型 · 限额 · 外观</span>
                 </button>
                 {user.role === "admin" && (
                   <button
@@ -1826,7 +1885,12 @@ function RoomView({
                 </div>
               )}
               {messages.map((message) => (
-                <MessageBubble key={message.id} message={message} nameById={nameById} />
+                <MessageBubble
+                  key={message.id}
+                  message={message}
+                  nameById={nameById}
+                  onResume={handleResume}
+                />
               ))}
               {Object.values(runs).map((run) => {
                 const name = nameById.get(run.memberId) ?? "成员";
@@ -1933,7 +1997,7 @@ function RoomView({
                 type="button"
                 className="send-btn"
                 aria-label="发送消息"
-                disabled={!draft.trim() || clearingChat}
+                disabled={!draft.trim() || clearingChat || startingSession}
                 onClick={() => {
                   if (slashMenuOpen && slashActive && draft.trim() !== `/${slashActive.name}`) {
                     applySlashCompletion(slashActive.name);
@@ -2648,7 +2712,7 @@ function ArchivePanel({
     <div className="archive-panel">
       <div className="archive-head">
         <p className="files-note">
-          /clear 会把群聊记录、任务卡与文件成果整体存成一份归档。恢复时当前内容先自动存成新归档再交换，所以反复恢复也不会丢东西。
+          /new 只把群聊记录与任务卡存成归档（文件留在工作区），/clear 连文件成果一起存。恢复时当前内容先自动存成新归档再交换，所以反复恢复也不会丢东西。
         </p>
         <button
           type="button"
@@ -3373,13 +3437,33 @@ function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnaps
 function MessageBubble({
   message,
   nameById,
+  onResume,
 }: {
   message: RoomMessage;
   nameById: Map<string, string>;
+  onResume: (memberName: string) => void;
 }) {
   const [source, setSource] = useState(false);
   if (message.senderKind === "system") {
-    return <div className="system-line">{message.text}</div>;
+    // 「继续」只对还在花名册里的成员出现：被移除的成员没有可重派的对象。
+    const resume = message.resume;
+    const targetName = resume ? nameById.get(resume.memberId) : undefined;
+    return (
+      <div className="system-line">
+        {message.text}
+        {resume && targetName && (
+          <button
+            type="button"
+            className="system-resume"
+            title={`把未完成的任务重新派给 @${targetName}`}
+            onClick={() => onResume(targetName)}
+          >
+            <Icon name="restore" size={13} />
+            继续
+          </button>
+        )}
+      </div>
+    );
   }
   const isUser = message.senderKind === "user";
   // 结构判断以去掉脚手架后的可见正文为准：否则「整段都是 invoke 块」的消息会被当纯文本原样显示。
@@ -3652,7 +3736,7 @@ function SettingsDialog({
         <div className="modal-head">
           <div>
             <strong>设置</strong>
-            <span className="modal-sub">账号资料、模型与界面偏好</span>
+            <span className="modal-sub">账号资料、模型、运行限额与界面偏好</span>
           </div>
           <button type="button" className="btn icon ghost" aria-label="关闭" onClick={onClose}>
             <Icon name="close" />
@@ -3678,6 +3762,14 @@ function SettingsDialog({
             </button>
             <button
               type="button"
+              className={`settings-tab${tab === "limits" ? " active" : ""}`}
+              onClick={() => setTab("limits")}
+            >
+              <Icon name="sliders" />
+              运行限额
+            </button>
+            <button
+              type="button"
               className={`settings-tab${tab === "appearance" ? " active" : ""}`}
               onClick={() => setTab("appearance")}
             >
@@ -3690,6 +3782,7 @@ function SettingsDialog({
               <ProfileSection user={user} roomName={roomName} onUserUpdated={onUserUpdated} />
             )}
             {tab === "model" && <ModelSection settings={settings} onSaved={onSettingsSaved} />}
+            {tab === "limits" && <LimitsSection settings={settings} onSaved={onSettingsSaved} />}
             {tab === "appearance" && (
               <AppearanceSection theme={theme} onThemeChange={onThemeChange} />
             )}
@@ -3969,6 +4062,113 @@ function ModelSection({
       <p className="hint">
         Key 只保存在你自己的 data/workspaces 目录下（已 gitignore），其他账号看不到。演示桩模式不需要
         Key。
+      </p>
+    </div>
+  );
+}
+
+/** 存储值 → 界面编辑值（`runTimeoutMs` 存毫秒、按秒编辑）。 */
+function limitToDisplay(value: number | undefined, field: LimitFieldSpec): number {
+  return (value ?? DEFAULT_LIMITS[field.key]) / (field.displayDivisor ?? 1);
+}
+
+/**
+ * 设置面板的「运行限额」分组：字段、区间、单位全部取 `LIMIT_FIELDS`，
+ * 与服务端 `sanitizeLimits()` 同源，界面不会比校验宽。
+ */
+function LimitsSection({
+  settings,
+  onSaved,
+}: {
+  settings: MaskedSettings;
+  onSaved: (next: MaskedSettings) => void;
+}) {
+  const fields = LIMIT_FIELDS.filter((field) => field.inSettingsPanel);
+  const paneValues = (limits: Partial<Limits>) =>
+    Object.fromEntries(fields.map((field) => [field.key, String(limitToDisplay(limits[field.key], field))]));
+
+  const [values, setValues] = useState<Record<string, string>>(() => paneValues(settings.limits));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  async function handleSave() {
+    if (busy) return;
+    setError(null);
+    setNote(null);
+    const patch: Record<string, number> = {};
+    for (const field of fields) {
+      const raw = (values[field.key] ?? "").trim();
+      const parsed = Number(raw);
+      if (!raw || !Number.isFinite(parsed)) {
+        setError(`${field.label}必须是数字`);
+        return;
+      }
+      patch[field.key] = Math.round(parsed * (field.displayDivisor ?? 1));
+    }
+    setBusy(true);
+    try {
+      const next = await saveSettings({ limits: patch });
+      onSaved(next);
+      setValues(paneValues(next.limits));
+      setNote("已保存，下一次运行起生效");
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="settings-form">
+      <div className="section-label">运行限额</div>
+      {fields.map((field) => {
+        const divisor = field.displayDivisor ?? 1;
+        const min = field.min / divisor;
+        const max = field.max / divisor;
+        return (
+          <label className="field" key={field.key}>
+            <span>
+              {field.label}
+              <em>
+                （{min}–{max}
+                {field.displayUnit}）
+              </em>
+            </span>
+            <input
+              type="number"
+              value={values[field.key] ?? ""}
+              min={min}
+              max={max}
+              step={1}
+              onChange={(event) =>
+                setValues((current) => ({ ...current, [field.key]: event.target.value }))
+              }
+            />
+            {field.hint && <span className="hint">{field.hint}</span>}
+          </label>
+        );
+      })}
+      {error && <p className="form-error">{error}</p>}
+      {note && <p className="form-note">{note}</p>}
+      <div className="modal-actions">
+        <button className="btn primary" disabled={busy} onClick={() => void handleSave()}>
+          {busy ? "保存中…" : "保存限额"}
+        </button>
+        <button
+          className="btn ghost"
+          disabled={busy}
+          onClick={() => {
+            setError(null);
+            setNote(null);
+            setValues(paneValues(DEFAULT_LIMITS));
+          }}
+        >
+          填入默认值
+        </button>
+      </div>
+      <p className="hint">
+        步数与超时同时生效：只调大步数、不调超时，长任务会先被整轮超时中止。超限的值服务端会拒绝保存。
       </p>
     </div>
   );
