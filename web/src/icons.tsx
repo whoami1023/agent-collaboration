@@ -15,6 +15,7 @@ export type IconName =
   | "back"
   | "columns"
   | "book"
+  | "template"
   | "chat"
   | "inspect"
   | "search"
@@ -89,6 +90,13 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
     <>
       <path d="M12 6.4C10 4.8 7.5 4.1 4 4.3v13.3c3.5-.2 6 .5 8 2.1 2-1.6 4.5-2.3 8-2.1V4.3c-3.5-.2-6 .5-8 2.1Z" />
       <path d="M12 6.4v13.3" />
+    </>
+  ),
+  template: (
+    <>
+      <rect x="3.5" y="4" width="17" height="16" rx="2.5" />
+      <path d="M3.5 9.5h17" />
+      <path d="M9 9.5V20" />
     </>
   ),
   chat: (

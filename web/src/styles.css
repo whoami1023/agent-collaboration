@@ -4065,6 +4065,141 @@ body.pane-dragging * {
   font-size: 11.5px;
 }
 
+/* ---------- agent templates ---------- */
+
+/* 模板库复用技能库的面板骨架，这里只补模板特有的部分。 */
+.template-card .skill-actions .btn.primary.sm {
+  flex: none;
+}
+
+.template-emoji {
+  flex: none;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.template-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 13.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.template-section-title {
+  margin: 12px 0 4px;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.template-workstyle {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.template-skill-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.template-source-chip {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.member-template {
+  margin-left: 4px;
+  color: var(--accent);
+}
+
+.template-detail .skill-read {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.template-apply-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+
+.template-apply-preview .template-section-title {
+  margin-top: 0;
+}
+
+.template-apply-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 4px 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.template-apply-facts li {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.template-apply-facts span {
+  color: var(--muted);
+}
+
+.template-apply-facts em {
+  overflow: hidden;
+  color: var(--text-strong);
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.template-field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.template-skills-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+}
+
+.template-skills-picker .agent-skills-list {
+  max-height: 320px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
 /* ---------- auth ---------- */
 
 .auth-screen {

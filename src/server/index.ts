@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { createApp } from "./app";
 import { AuthService } from "../auth/auth-service";
 import { SkillLibrary } from "../skills/library";
+import { TemplateLibrary } from "../templates/template-library";
 import { WorkspaceRegistry } from "../workspace/workspace";
 
 const root = process.cwd();
@@ -14,11 +15,15 @@ async function main(): Promise<void> {
   const skills = new SkillLibrary(join(dataDir, "skills.json"));
   await skills.init();
 
+  const templates = new TemplateLibrary(join(dataDir, "templates.json"));
+  await templates.init();
+
   const workspaces = new WorkspaceRegistry(join(dataDir, "workspaces"), skills);
   const app = createApp({
     auth,
     workspaces,
     skills,
+    templates,
     webDist: join(root, "web", "dist"),
   });
 

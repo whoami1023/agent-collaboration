@@ -30,7 +30,7 @@ import {
   extractCuratedEntryRecallMetadata,
   stripMemoryAnnotationCarriers,
 } from "./annotations";
-import { AGENT_FILE_ORDER, ensureMemberAgentFiles } from "./bootstrap-files";
+import { AGENT_FILE_ORDER, ensureMemberAgentFiles, type MemberProfileHints } from "./bootstrap-files";
 import { chunkMarkdown, hashText, remapChunkLines, type MemoryChunk } from "./chunking";
 import type { MemoryEmbeddingProvider } from "./embedding";
 import { cosineSimilarity, HashProjectionEmbeddingProvider } from "./embedding";
@@ -975,7 +975,11 @@ export class MemorySearchManager {
   }
 
   /** 生成子成员的默认档案（SOUL.md / IDENTITY.md），返回本次新建的文件名。 */
-  async ensureMemberProfile(member: Member, parentName?: string): Promise<string[]> {
+  async ensureMemberProfile(
+    member: Member,
+    parentName?: string,
+    profile?: MemberProfileHints,
+  ): Promise<string[]> {
     const parent = parentName ?? (member.spawnedBy ? this.options.bus.getMember(member.spawnedBy)?.name : undefined);
     const brief = member.brief?.trim();
     return ensureMemberAgentFiles(this.options.workspaceDir, member.id, {
@@ -983,6 +987,7 @@ export class MemorySearchManager {
       brief: brief ? brief.slice(0, 800) : "由用户创建的成员，等待分配任务；职责写在给你的简报里。",
       roomName: this.options.bus.roomName,
       parentName: parent ?? "主智能体",
+      profile,
     });
   }
 

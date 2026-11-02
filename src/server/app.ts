@@ -6,6 +6,7 @@ import { maskSettings, mergeSettings, sanitizeLimits } from "../core/settings";
 import { AuthError, type AuthService, type PublicUser } from "../auth/auth-service";
 import { buildClearSessionCookie, buildSessionCookie, readSessionToken } from "../auth/cookies";
 import { SkillError, type SkillRecord, type SkillLibrary } from "../skills/library";
+import { TemplateError, type AgentTemplateRecord, type TemplateLibrary } from "../templates/template-library";
 import {
   DEFAULT_SKILL_CATEGORY,
   SKILL_CATEGORIES,
@@ -21,6 +22,7 @@ export interface AppDeps {
   auth: AuthService;
   workspaces: WorkspaceRegistry;
   skills: SkillLibrary;
+  templates: TemplateLibrary;
   webDist: string;
 }
 
@@ -221,6 +223,21 @@ export function createApp(deps: AppDeps): express.Express {
     res.json({ user });
   });
 
+  app.delete("/api/users/:id", async (req: Request, res: Response) => {
+    const actor = currentUser(res);
+    if (actor.role !== "admin") {
+      res.status(403).json({ error: "只有管理员可以删除账号" });
+      return;
+    }
+    const userId = String(req.params["id"] ?? "");
+    const deleted = await deps.auth.deleteUser(actor, userId);
+    closeUserStreams(userId);
+    const removedSkills = await deps.skills.removeOwnedBy(userId);
+    const removedTemplates = await deps.templates.removeOwnedBy(userId);
+    const workspaceRemoved = await deps.workspaces.drop(userId);
+    res.json({ deleted, removedSkills, removedTemplates, workspaceRemoved });
+  });
+
   app.get("/api/skills", (_req: Request, res: Response) => {
     const user = currentUser(res);
     res.json({
@@ -284,6 +301,61 @@ export function createApp(deps: AppDeps): express.Express {
   app.delete("/api/skills/:id", async (req: Request, res: Response) => {
     await deps.skills.remove(currentUser(res), String(req.params["id"] ?? ""));
     res.json({ ok: true });
+  });
+
+  app.get("/api/templates", (_req: Request, res: Response) => {
+    const user = currentUser(res);
+    res.json({
+      builtin: deps.templates.listBuiltin(),
+      personal: deps.templates.listPersonal(user.id),
+      categories: SKILL_CATEGORIES,
+      availableSkills: deps.skills
+        .listForAgent(user.id)
+        .map((skill) => ({ name: skill.name, description: skill.description })),
+    });
+  });
+
+  app.post("/api/templates", async (req: Request, res: Response) => {
+    const template = await deps.templates.create(currentUser(res), bodyOf(req));
+    res.status(201).json({ template });
+  });
+
+  app.patch("/api/templates/:id", async (req: Request, res: Response) => {
+    const template = await deps.templates.update(
+      currentUser(res),
+      String(req.params["id"] ?? ""),
+      bodyOf(req),
+    );
+    res.json({ template });
+  });
+
+  app.delete("/api/templates/:id", async (req: Request, res: Response) => {
+    const removed = await deps.templates.remove(currentUser(res), String(req.params["id"] ?? ""));
+    res.json({ removed: removed.id });
+  });
+
+  // 引用模板生成成员：成员名由用户当场决定，其余（功能描述、工作方式、技能白名单）来自模板。
+  app.post("/api/templates/apply", async (req: Request, res: Response) => {
+    const body = bodyOf(req);
+    const user = currentUser(res);
+    const template = deps.templates.getFor(user, String(body["id"] ?? ""));
+    const workspace = await workspaceFor(res);
+    try {
+      const member = await workspace.orchestrator.createMember({
+        name: stringField(body, "name"),
+        description: template.brief,
+        ...(template.skillNames ? { skillNames: template.skillNames } : {}),
+        profile: {
+          ...(template.vibe ? { vibe: template.vibe } : {}),
+          ...(template.emoji ? { emoji: template.emoji } : {}),
+          ...(template.workstyle ? { workstyle: template.workstyle } : {}),
+        },
+        template: { key: template.key, title: template.title },
+      });
+      res.status(201).json({ member, template });
+    } catch (err) {
+      res.status(400).json({ error: errorMessage(err) });
+    }
   });
 
   app.get("/api/state", async (_req: Request, res: Response) => {
@@ -719,7 +791,7 @@ export function createApp(deps: AppDeps): express.Express {
       res.status(err.status).json({ error: err.message });
       return;
     }
-    if (err instanceof AuthError || err instanceof SkillError) {
+    if (err instanceof AuthError || err instanceof SkillError || err instanceof TemplateError) {
       const retryAfterMs = err instanceof AuthError ? err.retryAfterMs : undefined;
       if (retryAfterMs) {
         res.setHeader("retry-after", String(Math.ceil(retryAfterMs / 1000)));

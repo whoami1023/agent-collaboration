@@ -1,16 +1,29 @@
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { PublicUser } from "../src/core/types";
 import { SkillLibrary } from "../src/skills/library";
 import { WorkspaceRegistry } from "../src/workspace/workspace";
 
 let dir: string;
+let skills: SkillLibrary;
 let registry: WorkspaceRegistry;
+
+const adminUser: PublicUser = {
+  id: "u_admin",
+  username: "owner",
+  displayName: "老板",
+  role: "admin",
+  createdAt: 0,
+  mainAgentId: "m_main",
+  roomId: "room_main",
+};
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "ac-workspace-"));
-  const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+  skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
   await skills.init();
   registry = new WorkspaceRegistry(dir, skills);
 });
@@ -42,6 +55,76 @@ describe("WorkspaceRegistry", () => {
     expect(bob.bus.listMessages(10)).toHaveLength(0);
     expect(alice.board.list()).toHaveLength(1);
     expect(bob.board.list()).toHaveLength(0);
+  });
+
+  it("按模板创建成员：技能白名单只留可用的，档案文件写入模板设定", async () => {
+    await skills.create(adminUser, {
+      scope: "shared",
+      name: "web-search",
+      description: "联网搜索现时信息",
+      instructions: "# 联网搜索",
+    });
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+
+    const member = await alice.orchestrator.createMember({
+      name: "调研员",
+      description: "把问题查透并给出带出处的结论",
+      skillNames: ["web-search", "已消失的技能"],
+      profile: { vibe: "查证狂", emoji: "🔍", workstyle: ["关键结论至少两条独立来源。"] },
+      template: { key: "deep-researcher", title: "深度调研员" },
+    });
+
+    expect(member.skillNames).toEqual(["web-search"]);
+    expect(member.templateKey).toBe("deep-researcher");
+    expect(member.templateTitle).toBe("深度调研员");
+
+    const agentDir = join(dir, "u_alice", "agents", member.id);
+    const soul = await readFile(join(agentDir, "SOUL.md"), "utf8");
+    expect(soul).toContain("关键结论至少两条独立来源。");
+    // 模板的工作方式排在通用底线之前，两者都在。
+    expect(soul.indexOf("关键结论至少两条独立来源")).toBeLessThan(
+      soul.indexOf("只做分给我的任务"),
+    );
+    const identity = await readFile(join(agentDir, "IDENTITY.md"), "utf8");
+    expect(identity).toContain("- **Emoji:** 🔍");
+    expect(identity).toContain("- **Vibe:** 查证狂");
+    expect(identity).toContain("- **模板:** 深度调研员");
+
+    const last = alice.bus.listMessages().at(-1);
+    expect(last?.text).toContain("已按模板「深度调研员」创建成员 @调研员");
+    expect(last?.text).toContain("可用技能 1 个");
+  });
+
+  it("不用模板创建成员时档案文件保持默认设定", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    const member = await alice.orchestrator.createMember({
+      name: "资料员",
+      description: "整理资料并归档",
+    });
+    const identity = await readFile(join(dir, "u_alice", "agents", member.id, "IDENTITY.md"), "utf8");
+    expect(identity).toContain("- **Emoji:** 待挑选");
+    expect(identity).toContain("- **Vibe:** 直接、先查证再开口");
+    expect(identity).not.toContain("- **模板:**");
+    expect(member.skillNames).toBeUndefined();
+    expect(member.templateKey).toBeUndefined();
+  });
+
+  it("drop 关闭并删除该用户的工作区目录，其他用户不受影响", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    const bob = await registry.get({ id: "u_bob", displayName: "Bob" });
+    await alice.files.write("草稿.md", Buffer.from("Alice 的成果", "utf8"));
+    await bob.files.write("Bob的.md", Buffer.from("别动我", "utf8"));
+
+    expect(await registry.drop("u_alice")).toBe(true);
+    expect(existsSync(join(dir, "u_alice"))).toBe(false);
+    expect((await bob.files.list()).files.map((entry) => entry.name)).toEqual(["Bob的.md"]);
+
+    // 目录已没了也要能重复调用（幂等），之后取用会重建一个空工作区。
+    expect(await registry.drop("u_alice")).toBe(true);
+    const rebuilt = await registry.get({ id: "u_alice", displayName: "Alice" });
+    expect(rebuilt.bus.listMessages(50)).toHaveLength(0);
+    await expect(registry.drop("../escape")).rejects.toThrow("账号 ID 不合法");
+    expect(existsSync(join(dir, "u_bob"))).toBe(true);
   });
 
   it("作战室模式随群聊状态持久化", async () => {

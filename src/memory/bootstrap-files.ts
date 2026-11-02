@@ -165,7 +165,24 @@ export interface MemberAgentFileContext {
   brief: string;
   roomName: string;
   parentName: string;
+  /** 引用模板创建时带入的角色设定：工作方式、气质、Emoji 与来源模板名。 */
+  profile?: MemberProfileHints;
 }
+
+export interface MemberProfileHints {
+  vibe?: string;
+  emoji?: string;
+  workstyle?: string[];
+  sourceTemplate?: string;
+}
+
+/** 没有模板时使用的通用工作方式，模板条目排在前面。 */
+const DEFAULT_MEMBER_WORKSTYLE = [
+  "只做分给我的任务；别人的闲聊和同级成员的活不接。",
+  "先自己查再开口：room_history、use_skill、memory_search 能查到的不要问回来。",
+  "一次只发一条完整结论，不刷屏，不说「收到」这类空话。",
+  "汇报格式固定：结论、证据（路径/链接/关键输出）、未解决项。",
+];
 
 function memberMemoryTemplate(context: MemberAgentFileContext): string {
   return `# MEMORY.md - 我的长期记忆
@@ -205,6 +222,10 @@ function memberUserTemplate(context: MemberAgentFileContext): string {
 }
 
 function memberSoulTemplate(context: MemberAgentFileContext): string {
+  const roleLines = [
+    ...(context.profile?.workstyle ?? []),
+    ...DEFAULT_MEMBER_WORKSTYLE,
+  ].filter((line, index, all) => all.indexOf(line) === index);
   return `# SOUL.md - 我是谁
 
 _我是 @${context.memberName}，${context.roomName} 里的成员，由 @${context.parentName} 创建。_
@@ -215,10 +236,7 @@ ${context.brief}
 
 ## 工作方式
 
-- 只做分给我的任务；别人的闲聊和同级成员的活不接。
-- 先自己查再开口：room_history、use_skill、memory_search 能查到的不要问回来。
-- 一次只发一条完整结论，不刷屏，不说「收到」这类空话。
-- 汇报格式固定：结论、证据（路径/链接/关键输出）、未解决项。
+${roleLines.map((line) => `- ${line}`).join("\n")}
 - 对外发送、删除、覆盖这类不可逆动作，先向 @${context.parentName} 确认。
 
 ## 边界
@@ -233,13 +251,18 @@ ${context.brief}
 }
 
 function memberIdentityTemplate(context: MemberAgentFileContext): string {
+  const profile = context.profile ?? {};
+  const lines = [
+    `- **Name:** ${context.memberName}`,
+    `- **Creature:** ${context.roomName}里的子成员，向 @${context.parentName} 汇报`,
+    `- **Role:** ${context.brief}`,
+    `- **Vibe:** ${profile.vibe ?? "直接、先查证再开口"}`,
+    `- **Emoji:** ${profile.emoji ?? "待挑选"}`,
+  ];
+  if (profile.sourceTemplate) lines.push(`- **模板:** ${profile.sourceTemplate}`);
   return `# IDENTITY.md - 身份档案
 
-- **Name:** ${context.memberName}
-- **Creature:** ${context.roomName}里的子成员，向 @${context.parentName} 汇报
-- **Role:** ${context.brief}
-- **Vibe:** 直接、先查证再开口
-- **Emoji:** 待挑选
+${lines.join("\n")}
 
 ---
 

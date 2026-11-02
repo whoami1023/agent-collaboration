@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { rm } from "node:fs/promises";
 import { ensureMainMember, Orchestrator } from "../agent/orchestrator";
 import { SessionArchives, summaryOf } from "../archive/session-archive";
 import { loadSettings, saveSettings, type Settings } from "../core/settings";
@@ -248,6 +249,12 @@ export class Workspace {
   }
 
   async persist(): Promise<void> {
+    // 已关闭（通常是删号流程）后不再落盘，否则异步任务收尾会把刚删掉的目录重建出来。
+    if (this.closed) return;
+    await this.writeState();
+  }
+
+  private async writeState(): Promise<void> {
     const snapshot = this.bus.snapshot();
     await writeJsonAtomic(join(this.dir, "state.json"), {
       members: this.bus.listMembers(),
@@ -266,7 +273,7 @@ export class Workspace {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    await this.persist().catch(() => undefined);
+    await this.writeState().catch(() => undefined);
   }
 }
 
@@ -289,6 +296,22 @@ export class WorkspaceRegistry {
     return created;
   }
 
+  /**
+   * 删号：先从缓存取出工作区并 close（中止在跑的成员、停止定时落盘），
+   * 再删除 `workspaces/<userId>` 目录（聊天记录、任务卡、文件工作区、归档与智能体文件）。
+   * 返回目录是否真的删掉了——Windows 上刚中止的子进程可能短暂占用目录。
+   */
+  async drop(userId: string): Promise<boolean> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(userId)) throw new Error("账号 ID 不合法");
+    const cached = this.workspaces.get(userId);
+    this.workspaces.delete(userId);
+    if (cached) {
+      const workspace = await cached.catch(() => undefined);
+      await workspace?.close();
+    }
+    return removeWorkspaceDir(join(this.rootDir, userId));
+  }
+
   async closeAll(): Promise<void> {
     const pending = [...this.workspaces.values()];
     this.workspaces.clear();
@@ -297,4 +320,22 @@ export class WorkspaceRegistry {
       workspaces.map((result) => (result.status === "fulfilled" ? result.value.close() : undefined)),
     );
   }
+}
+
+/** 带重试的目录删除：短暂的文件占用不该让整个删号请求失败。 */
+async function removeWorkspaceDir(dir: string): Promise<boolean> {
+  const attempts = 4;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return true;
+    } catch (err) {
+      if (attempt === attempts) {
+        console.warn(`删除工作区目录失败：${dir}`, err);
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
+    }
+  }
+  return false;
 }

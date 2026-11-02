@@ -6,6 +6,7 @@ import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
 import { decideWakes } from "../room/wake";
 import type { SkillLibrary } from "../skills/library";
+import type { MemberProfileHints } from "../memory/bootstrap-files";
 import type { MemorySearchManager } from "../memory/manager";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import { MemberRuntime } from "./member-runtime";
@@ -141,11 +142,20 @@ export class Orchestrator {
   }
 
   /**
-   * 用户在「新建成员」面板直接创建子智能体：名字 + 功能描述。
+   * 用户在「新建成员」面板直接创建子智能体：名字 + 功能描述（可来自模板库）。
    * 与 spawn 共用准入规则（成员数上限、命名与重名校验），但不派发任务，
    * 只生成成员与其默认档案（agents/<id>/SOUL.md、IDENTITY.md），等主智能体或用户 @ 它。
    */
-  async createMember(input: { name: string; description: string }): Promise<Member> {
+  async createMember(input: {
+    name: string;
+    description: string;
+    /** 模板引用的技能白名单；该用户当前用不了的技能名会被忽略。 */
+    skillNames?: string[];
+    /** 模板带入的角色设定（工作方式、气质、Emoji），写进成员档案文件。 */
+    profile?: MemberProfileHints;
+    /** 来源模板；用于成员列表显示「来自模板」。 */
+    template?: { key: string; title: string };
+  }): Promise<Member> {
     const { bus } = this.deps;
     const limits: Limits = this.deps.getSettings().limits;
     const main = bus.listMembers().find((member) => member.role === "main");
@@ -173,6 +183,13 @@ export class Orchestrator {
     if (!admission.ok) throw new Error(admission.error);
 
     try {
+      const allowed = new Set(
+        this.deps.skills.listForAgent(this.deps.ownerId).map((skill) => skill.name),
+      );
+      // 模板里的技能可能已被删除或属于别人：只带过去当前可用的，剩下的不阻塞创建。
+      const skillNames = (input.skillNames ?? [])
+        .map((name) => name.trim().toLowerCase())
+        .filter((name, index, all) => allowed.has(name) && all.indexOf(name) === index);
       const member: Member = {
         id: newId("m"),
         roomId: bus.roomId,
@@ -185,18 +202,29 @@ export class Orchestrator {
         contextMode: "isolated",
         systemPrompt: "",
         brief: description,
+        ...(skillNames.length > 0 ? { skillNames } : {}),
+        ...(input.template
+          ? { templateKey: input.template.key, templateTitle: input.template.title }
+          : {}),
         providerId: DEFAULT_PROVIDER_ID,
         createdAt: Date.now(),
         lastActiveAt: Date.now(),
       };
       bus.addMember(member);
-      await this.deps.memory?.ensureMemberProfile(member, main.name);
+      await this.deps.memory?.ensureMemberProfile(member, main.name, {
+        ...input.profile,
+        sourceTemplate: input.template?.title ?? input.profile?.sourceTemplate,
+      });
       bus.append({
         senderId: SYSTEM_ID,
         senderName: "系统",
         senderKind: "system",
         kind: "system",
-        text: `已创建成员 @${member.name}：${description}`,
+        text: input.template
+          ? `已按模板「${input.template.title}」创建成员 @${member.name}${
+              skillNames.length > 0 ? `，可用技能 ${skillNames.length} 个` : ""
+            }。`
+          : `已创建成员 @${member.name}：${description}`,
       });
       return member;
     } finally {

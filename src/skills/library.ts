@@ -535,6 +535,19 @@ export class SkillLibrary {
     });
   }
 
+  /** 删号时清掉该用户的个人技能；共享技能保留（归属显示为「已注销账号」）。 */
+  async removeOwnedBy(ownerId: string): Promise<number> {
+    return this.mutate(async () => {
+      const before = this.data.skills.length;
+      this.data.skills = this.data.skills.filter(
+        (skill) => !(skill.scope === "personal" && skill.ownerId === ownerId),
+      );
+      const removed = before - this.data.skills.length;
+      if (removed > 0) await this.persist();
+      return removed;
+    });
+  }
+
   async importMany(user: PublicUser, input: SkillImportInput): Promise<SkillImportResult[]> {
     return this.mutate(async () => {
       const scope = normalizeScope(input.scope);

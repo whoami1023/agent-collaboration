@@ -140,6 +140,22 @@ export async function resetUserPassword(
   return body.user;
 }
 
+export interface DeleteUserResult {
+  deleted: PublicUser;
+  /** 一并删除的个人技能数量；共享技能不会被动。 */
+  removedSkills: number;
+  /** 一并删除的个人模板数量。 */
+  removedTemplates: number;
+  /** 工作区目录（聊天、任务卡、文件、归档、智能体文件）是否已删除。 */
+  workspaceRemoved: boolean;
+}
+
+export async function deleteUser(userId: string): Promise<DeleteUserResult> {
+  return request<DeleteUserResult>(`/api/users/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+  });
+}
+
 export type SkillScope = "shared" | "personal";
 
 /** 技能附带文件的元信息：正文要单独调 /api/skills/:id/file 取。 */
@@ -269,6 +285,89 @@ export async function fetchSkillFile(
 export async function deleteSkill(skillId: string): Promise<void> {
   await request<{ ok: boolean }>(`/api/skills/${encodeURIComponent(skillId)}`, {
     method: "DELETE",
+  });
+}
+
+export type TemplateScope = "builtin" | "personal";
+
+/** 智能体模板：引用它可以直接生成一个成员。 */
+export interface TemplateView {
+  id: string;
+  key: string;
+  scope: TemplateScope;
+  ownerId: string | null;
+  title: string;
+  category: SkillCategory;
+  description: string;
+  suggestedName: string;
+  brief: string;
+  emoji?: string;
+  vibe?: string;
+  workstyle?: string[];
+  skillNames?: string[];
+  builtin?: boolean;
+  source?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TemplateInput {
+  key?: string;
+  title: string;
+  description: string;
+  brief: string;
+  category?: SkillCategory;
+  suggestedName?: string;
+  emoji?: string;
+  vibe?: string;
+  workstyle?: string[];
+  skillNames?: string[];
+}
+
+export interface TemplateSnapshot {
+  builtin: TemplateView[];
+  personal: TemplateView[];
+  categories: SkillCategoryView[];
+  availableSkills: Array<{ name: string; description: string }>;
+}
+
+export async function fetchTemplates(): Promise<TemplateSnapshot> {
+  return request<TemplateSnapshot>("/api/templates");
+}
+
+export async function createTemplate(input: TemplateInput): Promise<TemplateView> {
+  const body = await request<{ template: TemplateView }>("/api/templates", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return body.template;
+}
+
+export async function updateTemplate(
+  templateId: string,
+  input: Partial<TemplateInput>,
+): Promise<TemplateView> {
+  const body = await request<{ template: TemplateView }>(
+    `/api/templates/${encodeURIComponent(templateId)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+  return body.template;
+}
+
+export async function deleteTemplate(templateId: string): Promise<void> {
+  await request<{ removed: string }>(`/api/templates/${encodeURIComponent(templateId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** 引用模板生成成员：只传成员名，其余设定都来自模板。 */
+export async function applyTemplate(
+  templateId: string,
+  name: string,
+): Promise<{ member: Member; template: TemplateView }> {
+  return request<{ member: Member; template: TemplateView }>("/api/templates/apply", {
+    method: "POST",
+    body: JSON.stringify({ id: templateId, name }),
   });
 }
 

@@ -131,6 +131,35 @@ describe("SkillLibrary", () => {
     expect(library.listPersonal(alice.id)).toHaveLength(0);
   });
 
+  it("删号清理个人技能：只动本人，共享与他人的技能不受影响", async () => {
+    const shared = await library.create(admin, {
+      scope: "shared",
+      name: "shared-skill",
+      description: "共享",
+      instructions: "共享说明",
+    });
+    await library.create(alice, { name: "alice-a", description: "A", instructions: "a" });
+    await library.create(alice, { name: "alice-b", description: "B", instructions: "b" });
+    const bobSkill = await library.create(bob, { name: "bob-skill", description: "B", instructions: "b" });
+
+    expect(await library.removeOwnedBy(alice.id)).toBe(2);
+    expect(library.listPersonal(alice.id)).toHaveLength(0);
+    expect(library.listPersonal(bob.id).map((skill) => skill.id)).toEqual([bobSkill.id]);
+    expect(library.listShared().map((skill) => skill.id)).toContain(shared.id);
+
+    expect(await library.removeOwnedBy("u_nobody")).toBe(0);
+    expect(library.listPersonal(bob.id).map((skill) => skill.id)).toEqual([bobSkill.id]);
+    expect(await library.removeOwnedBy(bob.id)).toBe(1);
+    expect(library.listPersonal(bob.id)).toHaveLength(0);
+    expect(library.listShared()).toHaveLength(1);
+
+    const reloaded = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await reloaded.init();
+    expect(reloaded.listPersonal(alice.id)).toHaveLength(0);
+    expect(reloaded.listPersonal(bob.id)).toHaveLength(0);
+    expect(reloaded.listShared().map((skill) => skill.id)).toContain(shared.id);
+  });
+
   it("校验名称、描述、说明，并在同一范围内拒绝重名", async () => {
     await expect(
       library.create(alice, { name: "Bad Name", description: "x", instructions: "x" }),

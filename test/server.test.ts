@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,7 @@ import ExcelJS from "exceljs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthService } from "../src/auth/auth-service";
 import { SkillLibrary } from "../src/skills/library";
+import { TemplateLibrary } from "../src/templates/template-library";
 import { WorkspaceRegistry } from "../src/workspace/workspace";
 import { createApp } from "../src/server/app";
 
@@ -49,8 +51,16 @@ beforeEach(async () => {
   await auth.init();
   const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
   await skills.init();
+  const templates = new TemplateLibrary(join(dir, "templates.json"));
+  await templates.init();
   registry = new WorkspaceRegistry(join(dir, "workspaces"), skills);
-  const app = createApp({ auth, workspaces: registry, skills, webDist: join(dir, "missing-dist") });
+  const app = createApp({
+    auth,
+    workspaces: registry,
+    skills,
+    templates,
+    webDist: join(dir, "missing-dist"),
+  });
   server = createServer(app);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -277,6 +287,149 @@ describe("多用户 API", () => {
       body: { username: "alice", password: "newalice1" },
     });
     expect(relogin.status).toBe(200);
+  });
+
+  it("删除账号：非管理员/自删/未知 ID 被拒，成功后会话、个人技能与工作区一并清除", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const adminCookie = setup.cookie as string;
+    const adminId = (setup.body["user"] as Record<string, unknown>)["id"] as string;
+
+    const created = await call("/api/users", {
+      method: "POST",
+      cookie: adminCookie,
+      body: { username: "alice", displayName: "Alice", password: "alicepass1" },
+    });
+    const aliceId = (created.body["user"] as Record<string, unknown>)["id"] as string;
+    const aliceCookie = (
+      await call("/api/auth/login", {
+        method: "POST",
+        body: { username: "alice", password: "alicepass1" },
+      })
+    ).cookie as string;
+    await call("/api/users", {
+      method: "POST",
+      cookie: adminCookie,
+      body: { username: "bob", displayName: "Bob", password: "bobpass123" },
+    });
+    const bobCookie = (
+      await call("/api/auth/login", {
+        method: "POST",
+        body: { username: "bob", password: "bobpass123" },
+      })
+    ).cookie as string;
+
+    // Alice 留下三类数据：作战室消息、文件工作区、个人技能（外加一份共享技能供对照）。
+    expect(
+      (
+        await fetch(`${baseUrl}/api/files?path=${encodeURIComponent("成果.md")}`, {
+          method: "POST",
+          headers: { "content-type": "application/octet-stream", cookie: aliceCookie },
+          body: new TextEncoder().encode("# Alice 的成果"),
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await fetch(`${baseUrl}/api/files?path=${encodeURIComponent("Bob 的文件.md")}`, {
+          method: "POST",
+          headers: { "content-type": "application/octet-stream", cookie: bobCookie },
+          body: new TextEncoder().encode("# Bob"),
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await call("/api/messages", {
+          method: "POST",
+          cookie: aliceCookie,
+          body: { text: "Alice 的任务请求" },
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await call("/api/skills", {
+          method: "POST",
+          cookie: aliceCookie,
+          body: { name: "alice-only", description: "仅自己", instructions: "# 私有" },
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await call("/api/skills", {
+          method: "POST",
+          cookie: adminCookie,
+          body: {
+            scope: "shared",
+            name: "team-brief",
+            description: "团队简报",
+            instructions: "# 共享",
+          },
+        })
+      ).status,
+    ).toBe(201);
+    expect(existsSync(join(dir, "workspaces", aliceId))).toBe(true);
+
+    // 个人模板同样归属账号：Alice 一份、Bob 一份。
+    const templateBody = {
+      title: "我的整理模板",
+      description: "把材料整理成段落。",
+      brief: "负责把给到的材料整理成结构清楚的段落。",
+    };
+    expect(
+      (await call("/api/templates", { method: "POST", cookie: aliceCookie, body: templateBody })).status,
+    ).toBe(201);
+    expect(
+      (await call("/api/templates", { method: "POST", cookie: bobCookie, body: templateBody })).status,
+    ).toBe(201);
+
+    expect((await call(`/api/users/${aliceId}`, { method: "DELETE", cookie: aliceCookie })).status).toBe(403);
+    expect((await call(`/api/users/${adminId}`, { method: "DELETE", cookie: adminCookie })).status).toBe(400);
+    expect((await call("/api/users/u_missing", { method: "DELETE", cookie: adminCookie })).status).toBe(404);
+    expect((await call("/api/users/u_missing", { method: "DELETE" })).status).toBe(401);
+
+    const removed = await call(`/api/users/${aliceId}`, { method: "DELETE", cookie: adminCookie });
+    expect(removed.status).toBe(200);
+    expect(removed.body["workspaceRemoved"]).toBe(true);
+    expect(removed.body["removedSkills"]).toBe(1);
+    expect(removed.body["removedTemplates"]).toBe(1);
+    expect((removed.body["deleted"] as Record<string, unknown>)["username"]).toBe("alice");
+
+    expect((await call("/api/auth/me", { cookie: aliceCookie })).status).toBe(401);
+    expect(
+      (await call("/api/auth/login", { method: "POST", body: { username: "alice", password: "alicepass1" } }))
+        .status,
+    ).toBe(401);
+    expect(existsSync(join(dir, "workspaces", aliceId))).toBe(false);
+
+    const users = (await call("/api/users", { cookie: adminCookie })).body["users"] as Array<
+      Record<string, unknown>
+    >;
+    expect(users.map((user) => user["username"])).toEqual(["owner", "bob"]);
+
+    const skillStore = JSON.parse(await readFile(join(dir, "skills.json"), "utf8")) as {
+      skills: Array<{ scope: string; ownerId?: string; name: string }>;
+    };
+    expect(skillStore.skills.some((skill) => skill.name === "alice-only")).toBe(false);
+    expect(skillStore.skills.some((skill) => skill.name === "team-brief")).toBe(true);
+
+    const templateStore = JSON.parse(await readFile(join(dir, "templates.json"), "utf8")) as {
+      templates: Array<{ scope: string; ownerId?: string }>;
+    };
+    expect(templateStore.templates.filter((item) => item.scope === "personal" && item.ownerId === aliceId)).toHaveLength(0);
+    expect(templateStore.templates.filter((item) => item.scope === "personal")).toHaveLength(1);
+    expect(
+      ((await call("/api/templates", { cookie: bobCookie })).body["personal"] as Array<unknown>),
+    ).toHaveLength(1);
+
+    const bobFiles = (await call("/api/files", { cookie: bobCookie })).body["files"] as Array<
+      Record<string, unknown>
+    >;
+    expect(bobFiles.map((entry) => entry["name"])).toEqual(["Bob 的文件.md"]);
   });
 
   it("技能库：共享技能全员可见仅管理员可管，个人技能按账号隔离", async () => {
@@ -1338,5 +1491,157 @@ describe("成员 API：移除成员", () => {
     const cookie = await login();
     expect((await call("/api/members/m_main", { method: "DELETE", cookie })).status).toBe(400);
     expect((await call("/api/members/m_missing", { method: "DELETE", cookie })).status).toBe(404);
+  });
+});
+
+describe("模板库 API", () => {
+  async function login(): Promise<string> {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    return setup.cookie as string;
+  }
+
+  async function secondAccount(cookie: string): Promise<string> {
+    expect(
+      (
+        await call("/api/users", {
+          method: "POST",
+          cookie,
+          body: { username: "alice", displayName: "Alice", password: "alicepass1" },
+        })
+      ).status,
+    ).toBe(201);
+    const login = await call("/api/auth/login", {
+      method: "POST",
+      body: { username: "alice", password: "alicepass1" },
+    });
+    return login.cookie as string;
+  }
+
+  it("内置模板全员可见；引用模板创建成员并带来技能白名单与档案设定", async () => {
+    const cookie = await login();
+    const list = await call("/api/templates", { cookie });
+    expect(list.status).toBe(200);
+    const builtin = list.body["builtin"] as Array<Record<string, unknown>>;
+    expect(builtin.length).toBeGreaterThan(10);
+    expect((list.body["categories"] as unknown[]).length).toBeGreaterThan(0);
+    const researcher = builtin.find((item) => item["key"] === "deep-researcher");
+    expect(researcher).toBeTruthy();
+    const templateId = String(researcher?.["id"]);
+
+    // 测试用技能库未预装：先建一个共享技能，模板里的同名技能才会被带进白名单。
+    expect(
+      (
+        await call("/api/skills", {
+          method: "POST",
+          cookie,
+          body: { scope: "shared", name: "web-search", description: "联网搜索", instructions: "# 联网搜索" },
+        })
+      ).status,
+    ).toBe(201);
+
+    const applied = await call("/api/templates/apply", {
+      method: "POST",
+      cookie,
+      body: { id: templateId, name: "调研员" },
+    });
+    expect(applied.status).toBe(201);
+    const member = applied.body["member"] as Record<string, unknown>;
+    expect(member["name"]).toBe("调研员");
+    expect(member["templateKey"]).toBe("deep-researcher");
+    expect(member["templateTitle"]).toBe("深度调研员");
+    expect(member["brief"]).toBe(researcher?.["brief"]);
+    expect(member["skillNames"]).toEqual(["web-search"]);
+
+    const identity = await call(
+      `/api/members/${member["id"]}/files/content?path=${encodeURIComponent(`agents/${member["id"]}/IDENTITY.md`)}`,
+      { cookie },
+    );
+    expect(String(identity.body["content"])).toContain("- **模板:** 深度调研员");
+    expect(String(identity.body["content"])).toContain("- **Emoji:** 🔍");
+
+    const state = await call("/api/state", { cookie });
+    const members = state.body["members"] as Array<Record<string, unknown>>;
+    expect(members.some((item) => item["id"] === member["id"])).toBe(true);
+    const messages = state.body["messages"] as Array<Record<string, unknown>>;
+    expect(String(messages.at(-1)?.["text"])).toContain("已按模板「深度调研员」创建成员 @调研员");
+
+    // 重名成员：模板引用失败要报 400，不能留下半成品。
+    const clash = await call("/api/templates/apply", {
+      method: "POST",
+      cookie,
+      body: { id: templateId, name: "调研员" },
+    });
+    expect(clash.status).toBe(400);
+    expect(String(clash.body["error"])).toContain("已存在");
+  });
+
+  it("未知模板 404，未登录 401，个人模板他人不可见也不能引用", async () => {
+    const cookie = await login();
+    const aliceCookie = await secondAccount(cookie);
+    expect((await call("/api/templates")).status).toBe(401);
+
+    const created = await call("/api/templates", {
+      method: "POST",
+      cookie,
+      body: {
+        title: "我的临时写手",
+        description: "按简报把材料整理成段落。",
+        brief: "负责把给到的材料整理成结构清楚的段落，不改事实、不补数据。",
+        category: "product",
+        skillNames: ["summarize"],
+      },
+    });
+    expect(created.status).toBe(201);
+    const template = created.body["template"] as Record<string, unknown>;
+    expect(template["scope"]).toBe("personal");
+    expect(template["suggestedName"]).toBe("我的临时写手");
+
+    const aliceList = await call("/api/templates", { cookie: aliceCookie });
+    const alicePersonal = aliceList.body["personal"] as Array<Record<string, unknown>>;
+    expect(alicePersonal).toHaveLength(0);
+    expect(
+      (await call("/api/templates/apply", { method: "POST", cookie: aliceCookie, body: { id: template["id"], name: "写手" } })).status,
+    ).toBe(403);
+
+    const patched = await call(`/api/templates/${template["id"]}`, {
+      method: "PATCH",
+      cookie,
+      body: { title: "我的材料整理", workstyle: ["一段一个意思。"] },
+    });
+    expect(patched.status).toBe(200);
+    expect((patched.body["template"] as Record<string, unknown>)["title"]).toBe("我的材料整理");
+
+    expect((await call(`/api/templates/tpl_missing`, { method: "PATCH", cookie, body: { title: "x" } })).status).toBe(404);
+    expect((await call(`/api/templates/${template["id"]}`, { method: "DELETE", cookie })).status).toBe(200);
+    expect(
+      ((await call("/api/templates", { cookie })).body["personal"] as Array<unknown>),
+    ).toHaveLength(0);
+
+    expect((await call("/api/templates/apply", { method: "POST", cookie, body: { id: "tpl_missing", name: "甲" } })).status).toBe(404);
+  });
+
+  it("内置模板普通账号只能引用不能改删，管理员删除后重启不再预装", async () => {
+    const cookie = await login();
+    const aliceCookie = await secondAccount(cookie);
+    const builtin = (await call("/api/templates", { cookie })).body["builtin"] as Array<
+      Record<string, unknown>
+    >;
+    const analyst = builtin.find((item) => item["key"] === "data-analyst");
+    expect(
+      (await call(`/api/templates/${analyst?.["id"]}`, { method: "PATCH", cookie: aliceCookie, body: { title: "改掉内置" } })).status,
+    ).toBe(403);
+    expect(
+      (await call(`/api/templates/${analyst?.["id"]}`, { method: "DELETE", cookie: aliceCookie })).status,
+    ).toBe(403);
+    expect(
+      (await call(`/api/templates/${analyst?.["id"]}`, { method: "DELETE", cookie })).status,
+    ).toBe(200);
+    const after = (await call("/api/templates", { cookie })).body["builtin"] as Array<
+      Record<string, unknown>
+    >;
+    expect(after.some((item) => item["key"] === "data-analyst")).toBe(false);
   });
 });

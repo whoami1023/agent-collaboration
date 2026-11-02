@@ -206,6 +206,38 @@ describe("AuthService", () => {
     expect(adminRelogin.user.role).toBe("admin");
   });
 
+  it("删除账号：仅管理员、不能删自己、被删者的会话立即失效", async () => {
+    const auth = service();
+    await auth.init();
+    const admin = await auth.setupAdmin({ username: "owner", password: "secret123" });
+    const alice = await auth.createUser(admin.user, {
+      username: "alice",
+      displayName: "Alice",
+      password: "alicepass1",
+    });
+    const aliceSession = await auth.login("alice", "alicepass1", "127.0.0.1");
+
+    await expect(auth.deleteUser(alice, alice.id)).rejects.toMatchObject({ status: 403 });
+    await expect(auth.deleteUser(admin.user, admin.user.id)).rejects.toMatchObject({
+      status: 400,
+      message: "不能删除自己的账号",
+    });
+    await expect(auth.deleteUser(admin.user, "u_missing")).rejects.toMatchObject({ status: 404 });
+
+    const deleted = await auth.deleteUser(admin.user, alice.id);
+    expect(deleted.username).toBe("alice");
+    expect(auth.listUsers().map((user) => user.username)).toEqual(["owner"]);
+    expect(await auth.authenticate(aliceSession.token)).toBeNull();
+    await expect(auth.login("alice", "alicepass1", "127.0.0.1")).rejects.toMatchObject({
+      status: 401,
+    });
+
+    const reloaded = service();
+    await reloaded.init();
+    expect(reloaded.listUsers().map((user) => user.username)).toEqual(["owner"]);
+    expect(await auth.authenticate(admin.token)).toMatchObject({ username: "owner" });
+  });
+
   it("会话可持久化，过期后失效", async () => {
     const auth = service();
     await auth.init();

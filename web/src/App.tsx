@@ -36,6 +36,7 @@ import {
   type PaneWidths,
 } from "./layout";
 import SkillLibraryPanel from "./SkillLibrary";
+import TemplateLibraryPanel from "./TemplateLibrary";
 import {
   buildContextReport,
   buildHelpReport,
@@ -55,6 +56,7 @@ import {
   createUser,
   createWorkspaceFolder,
   deleteArchive,
+  deleteUser,
   deleteWorkspaceFile,
   fetchArchive,
   fetchArchives,
@@ -481,6 +483,7 @@ function RoomView({
       return false;
     }
   });
+  const [templatesOpen, setTemplatesOpen] = useState(false);
   const [membersOpen, setMembersOpen] = useState(true);
   const [navOpen, setNavOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -824,9 +827,10 @@ function RoomView({
   }, [members]);
 
   const selectedMember = members.find((member) => member.id === selectedMemberId);
-  const inWarRoom = !skillsOpen && !newMemberOpen && !selectedMember;
-  /** 技能库 / 智能体文件 / 新建成员独占右侧整块区域：此时连作战室（群聊）一起收起。 */
-  const takeover = skillsOpen || newMemberOpen || Boolean(selectedMember);
+  const inWarRoom = !skillsOpen && !templatesOpen && !newMemberOpen && !selectedMember;
+  /** 技能库 / 模板库 / 智能体文件 / 新建成员独占右侧整块区域：此时连作战室（群聊）一起收起。 */
+  const takeover =
+    skillsOpen || templatesOpen || newMemberOpen || Boolean(selectedMember);
   const panelVisible = boardOpen || takeover;
   const runningCount = members.filter((member) => member.status === "running").length;
   const workspaceFileCount =
@@ -1409,6 +1413,7 @@ function RoomView({
     setSelectedMemberId(memberId);
     setNewMemberOpen(false);
     setSkillsOpen(false);
+    setTemplatesOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -1417,6 +1422,7 @@ function RoomView({
     setNewMemberOpen(true);
     setSelectedMemberId(null);
     setSkillsOpen(false);
+    setTemplatesOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -1424,6 +1430,16 @@ function RoomView({
   function openSkills() {
     setSkillsOpen(true);
     setNewMemberOpen(false);
+    setTemplatesOpen(false);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
+  function openTemplates() {
+    setTemplatesOpen(true);
+    setSkillsOpen(false);
+    setNewMemberOpen(false);
+    setSelectedMemberId(null);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -1431,6 +1447,7 @@ function RoomView({
   /** 作战室＝聊天本身：收起右侧的技能库/智能体文件，把焦点还给输入框。 */
   function goToWarRoom() {
     setSkillsOpen(false);
+    setTemplatesOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setNavOpen(false);
@@ -1550,6 +1567,17 @@ function RoomView({
 
             <button
               type="button"
+              className={`nav-item${templatesOpen ? " active" : ""}`}
+              aria-pressed={templatesOpen}
+              onClick={() => (templatesOpen ? setTemplatesOpen(false) : openTemplates())}
+            >
+              <Icon name="template" />
+              <span className="nav-label">模板库</span>
+              <span className="nav-hint">引用模板生成成员</span>
+            </button>
+
+            <button
+              type="button"
               className={`nav-item${newMemberOpen ? " active" : ""}`}
               aria-pressed={newMemberOpen}
               onClick={() => (newMemberOpen ? setNewMemberOpen(false) : openNewMember())}
@@ -1604,6 +1632,11 @@ function RoomView({
                     {runs[member.id]?.tools.length
                       ? ` · ${runs[member.id]?.tools.at(-1)}`
                       : ""}
+                    {member.templateTitle && (
+                      <span className="member-template" title={`来自模板「${member.templateTitle}」`}>
+                        · {member.templateTitle}
+                      </span>
+                    )}
                   </div>
                 </button>
                 {member.status === "running" && (
@@ -1668,7 +1701,7 @@ function RoomView({
                   >
                     <Icon name="users" />
                     <span className="menu-label">用户管理</span>
-                    <span className="menu-hint">账号 · 重置密码</span>
+                    <span className="menu-hint">账号 · 重置密码 · 删除</span>
                   </button>
                 )}
               </div>
@@ -1791,6 +1824,19 @@ function RoomView({
               <Icon name="book" />
               <span>技能库</span>
               <span className="chip">共享 · 个人</span>
+            </button>
+          ) : templatesOpen ? (
+            <button
+              type="button"
+              className="btn ghost board-toggle"
+              aria-pressed
+              aria-controls="templates-panel"
+              title="关闭模板库，回到作战室"
+              onClick={() => setTemplatesOpen(false)}
+            >
+              <Icon name="template" />
+              <span>模板库</span>
+              <span className="chip">内置 · 个人</span>
             </button>
           ) : selectedMember ? (
             <button
@@ -2034,10 +2080,23 @@ function RoomView({
         <aside id="skills-panel" className="board-panel" aria-label="技能库">
           <SkillLibraryPanel onClose={() => setSkillsOpen(false)} />
         </aside>
+      ) : templatesOpen ? (
+        <aside id="templates-panel" className="board-panel" aria-label="模板库">
+          <TemplateLibraryPanel
+            onClose={() => setTemplatesOpen(false)}
+            takenNames={members.map((member) => member.name)}
+            onApplied={(member, template) => {
+              openAgentFiles(member.id);
+              setChatNotice(
+                `已按模板「${template.title}」创建 @${member.name}，在群里 @${member.name} 就能派活。`,
+              );
+            }}
+          />
+        </aside>
       ) : selectedMember ? (
         <aside id="agent-files-panel" className="board-panel" aria-label="智能体文件">
           <AgentFilesPanel
-            member={{ id: selectedMember.id, name: selectedMember.name }}
+            member={selectedMember}
             files={agentFiles}
             fileError={agentFileError}
             activePath={openFilePath}
@@ -2230,7 +2289,9 @@ function RoomView({
         />
       )}
 
-      {usersOpen && user.role === "admin" && <AdminPanel onClose={() => setUsersOpen(false)} />}
+      {usersOpen && user.role === "admin" && (
+        <AdminPanel me={user} onClose={() => setUsersOpen(false)} />
+      )}
     </div>
   );
 }
@@ -2851,7 +2912,7 @@ function AgentFilesPanel({
   onLoadFull,
   onClose,
 }: {
-  member: { id: string; name: string };
+  member: { id: string; name: string; templateTitle?: string };
   files: AgentFileEntry[] | null;
   fileError: string | null;
   activePath: string | null;
@@ -3013,6 +3074,11 @@ function AgentFilesPanel({
         <span className="section-label">智能体文件</span>
         <div className="board-head-actions">
           <span className="chip">@{member.name}</span>
+          {member.templateTitle && (
+            <span className="chip template-source-chip" title={`该成员由模板库的「${member.templateTitle}」创建`}>
+              模板 · {member.templateTitle}
+            </span>
+          )}
           <button
             type="button"
             className={`btn ghost sm${showSkills ? " active" : ""}`}
@@ -3312,6 +3378,7 @@ function NewMemberPanel({
         <p className="new-member-hint">
           新建一个子智能体加入成员列表。名字是群里 @ 它的引用；功能描述会写进它的默认智能体文件（SOUL.md
           与 IDENTITY.md）。每个成员还拥有自己的 MEMORY.md 与 USER.md，记忆检索只在该成员自己的范围内命中；创建后都可在「智能体文件」里继续修改。
+          想省事可以先到侧边栏「模板库」引用一个现成角色。
         </p>
         <form className="new-member-form" onSubmit={submit}>
           <label className="field">
@@ -3506,7 +3573,7 @@ function MessageBubble({
   );
 }
 
-function AdminPanel({ onClose }: { onClose: () => void }) {
+function AdminPanel({ me, onClose }: { me: PublicUser; onClose: () => void }) {
   const [users, setUsers] = useState<PublicUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -3518,6 +3585,7 @@ function AdminPanel({ onClose }: { onClose: () => void }) {
   const [resetFor, setResetFor] = useState<string | null>(null);
   const [resetPassword, setResetPassword] = useState("");
   const [resetBusy, setResetBusy] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -3579,6 +3647,41 @@ function AdminPanel({ onClose }: { onClose: () => void }) {
     }
   }
 
+  async function handleDelete(target: PublicUser) {
+    if (deletingId) return;
+    const confirmed = window.confirm(
+      `确定删除 @${target.username} 吗？\n\n会一并删除：作战室聊天记录与任务卡、文件工作区里的文件、会话归档、该账号的个人技能与个人模板，以及已登录的会话。\n共享技能、内置模板与其他账号不受影响。此操作不可恢复。`,
+    );
+    if (!confirmed) return;
+    setDeletingId(target.id);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await deleteUser(target.id);
+      const tail = result.workspaceRemoved
+        ? "作战室数据与文件已一并删除。"
+        : `作战室目录暂时被占用，重启服务后可手动清理 data/workspaces/${result.deleted.id}。`;
+      const cleaned = [
+        result.removedSkills ? `${result.removedSkills} 个个人技能` : "",
+        result.removedTemplates ? `${result.removedTemplates} 个个人模板` : "",
+      ]
+        .filter(Boolean)
+        .join(" 和 ");
+      setNotice(
+        `已删除 @${result.deleted.username}${cleaned ? `，同时清理 ${cleaned}` : ""}。${tail}`,
+      );
+      if (resetFor === target.id) {
+        setResetFor(null);
+        setResetPassword("");
+      }
+      await refresh();
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div
@@ -3591,7 +3694,7 @@ function AdminPanel({ onClose }: { onClose: () => void }) {
         <div className="modal-head">
           <div>
             <strong>用户管理</strong>
-            <span className="modal-sub">每个账号拥有独立房间与绑定的主智能体</span>
+            <span className="modal-sub">每个账号拥有独立房间与绑定的主智能体；删除账号会一并清除其作战室数据</span>
           </div>
           <button type="button" className="btn icon ghost" aria-label="关闭" onClick={onClose}>
             <Icon name="close" />
@@ -3624,10 +3727,21 @@ function AdminPanel({ onClose }: { onClose: () => void }) {
                       type="button"
                       className="btn sm"
                       aria-expanded={resetFor === item.id}
+                      disabled={deletingId !== null}
                       onClick={() => startReset(item)}
                     >
                       {resetFor === item.id ? "收起" : "重置密码"}
                     </button>
+                    {item.id !== me.id && (
+                      <button
+                        type="button"
+                        className="btn sm danger"
+                        disabled={deletingId !== null}
+                        onClick={() => void handleDelete(item)}
+                      >
+                        {deletingId === item.id ? "删除中…" : "删除"}
+                      </button>
+                    )}
                   </div>
                   {resetFor === item.id && (
                     <form

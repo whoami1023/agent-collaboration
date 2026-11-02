@@ -347,6 +347,24 @@ export class AuthService {
     });
   }
 
+  /**
+   * 删除账号：连同该账号的全部登录会话一起失效。
+   * 工作区目录与个人技能不在这里处理——由接口层调用 WorkspaceRegistry / SkillLibrary 清理，
+   * 保持认证服务只管 auth.json。
+   */
+  async deleteUser(actor: PublicUser, userId: string): Promise<PublicUser> {
+    return this.mutate(async () => {
+      if (actor.role !== "admin") throw new AuthError(403, "只有管理员可以删除账号");
+      if (userId === actor.id) throw new AuthError(400, "不能删除自己的账号");
+      const user = this.data.users.find((candidate) => candidate.id === userId);
+      if (!user) throw new AuthError(404, "账号不存在");
+      this.data.users = this.data.users.filter((candidate) => candidate.id !== userId);
+      this.data.sessions = this.data.sessions.filter((session) => session.userId !== userId);
+      await this.persist();
+      return publicUser(user);
+    });
+  }
+
   async authenticate(token: string | undefined): Promise<PublicUser | null> {
     if (!token) return null;
     const tokenHash = hashToken(token);

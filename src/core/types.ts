@@ -168,6 +168,9 @@ export interface Member {
    * undefined = 跟随技能库全部可用技能，[] = 全部禁用。
    */
   skillNames?: string[];
+  /** 引用「模板库」里的模板创建时记录的来源模板，用于成员列表展示与再编辑。 */
+  templateKey?: string;
+  templateTitle?: string;
   providerId: string;
   createdAt: number;
   lastActiveAt: number;
