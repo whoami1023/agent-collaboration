@@ -146,9 +146,12 @@ describe("WorkspaceRegistry", () => {
     const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
     const bob = await registry.get({ id: "u_bob", displayName: "Bob" });
 
-    await alice.setSettings({ ...alice.getSettings(), activeProviderId: "deepseek" });
-    expect(alice.getSettings().activeProviderId).toBe("deepseek");
-    expect(bob.getSettings().activeProviderId).toBe("demo");
+    await alice.setSettings({
+      ...alice.getSettings(),
+      selection: { ...alice.getSettings().selection, defaultModel: "deepseek/deepseek-chat" },
+    });
+    expect(alice.getSettings().selection.defaultModel).toBe("deepseek/deepseek-chat");
+    expect(bob.getSettings().selection.defaultModel).toBe("demo/mock");
   });
 
   it("重启后从各自目录恢复状态与设置", async () => {
@@ -161,7 +164,10 @@ describe("WorkspaceRegistry", () => {
       text: "需要保留的消息",
     });
     alice.board.create({ title: "需要保留的任务", createdBy: "u_alice" });
-    await alice.setSettings({ ...alice.getSettings(), activeProviderId: "deepseek" });
+    await alice.setSettings({
+      ...alice.getSettings(),
+      selection: { ...alice.getSettings().selection, defaultModel: "deepseek/deepseek-chat" },
+    });
     await alice.close();
 
     const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
@@ -172,7 +178,7 @@ describe("WorkspaceRegistry", () => {
       "需要保留的消息",
     );
     expect(restored.board.list().map((task) => task.title)).toContain("需要保留的任务");
-    expect(restored.getSettings().activeProviderId).toBe("deepseek");
+    expect(restored.getSettings().selection.defaultModel).toBe("deepseek/deepseek-chat");
     await reloaded.closeAll();
   });
 

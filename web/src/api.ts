@@ -9,19 +9,54 @@ import type {
   SessionArchiveSummary,
   TaskCard,
 } from "../../src/core/types";
+import type {
+  CronActiveHours,
+  CronJob,
+  CronJobState,
+  CronPayload,
+  CronRunRecord,
+  CronSchedule,
+} from "../../src/cron/types";
+import type { ProviderApi } from "../../src/model/types";
+
+export interface MaskedModel {
+  id: string;
+  name: string;
+  api?: ProviderApi;
+  contextWindow: number;
+  maxTokens: number;
+  reasoning: boolean;
+  input: string[];
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  status: string;
+}
 
 export interface MaskedProvider {
   id: string;
-  kind: "mock" | "openai";
+  api: ProviderApi;
   baseUrl?: string;
-  model: string;
+  auth: "api-key" | "none";
   hasApiKey: boolean;
+  apiKeyHint?: string;
+  headers?: Record<string, string>;
+  timeoutSeconds?: number;
+  maxTokens?: number;
+  models: MaskedModel[];
+}
+
+export interface ModelSelectionView {
+  defaultModel: string;
+  aliases: Record<string, string>;
+  fallbacks: string[];
+  modelParams: Record<string, Record<string, unknown>>;
+  params: Record<string, unknown>;
+  allow: string[];
 }
 
 export interface MaskedSettings {
   providers: MaskedProvider[];
-  activeProviderId: string;
-  limits: Partial<Limits>;
+  selection: ModelSelectionView;
+  limits: Limits;
 }
 
 export interface StateSnapshot {
@@ -371,6 +406,105 @@ export async function applyTemplate(
   });
 }
 
+/** 定时任务：定义 + 运行期状态 + 上一次运行，一次给全面板用。 */
+export interface CronJobView {
+  job: CronJob;
+  state: CronJobState;
+  lastRun?: CronRunRecord;
+}
+
+export interface CronStatusView {
+  total: number;
+  enabled: number;
+  running: number;
+  nextRunAtMs?: number;
+}
+
+export interface CronSnapshot {
+  jobs: CronJobView[];
+  status: CronStatusView;
+  limits: {
+    name: number;
+    description: number;
+    message: number;
+    argvItems: number;
+    argvItem: number;
+    jobsPerUser: number;
+    minEveryMs: number;
+  };
+}
+
+/** 新建与编辑共用：schedule/payload 直接是后端的归一化输入形状。 */
+export interface CronInput {
+  name?: string;
+  description?: string | null;
+  enabled?: boolean;
+  schedule?: CronSchedule;
+  payload?: CronPayload;
+  activeHours?: CronActiveHours | null;
+  deleteAfterRun?: boolean;
+}
+
+export async function fetchCrons(): Promise<CronSnapshot> {
+  return request<CronSnapshot>("/api/crons");
+}
+
+export async function createCron(input: CronInput): Promise<CronJobView> {
+  const body = await request<{ view: CronJobView }>("/api/crons", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return body.view;
+}
+
+export async function updateCron(jobId: string, input: CronInput): Promise<CronJobView> {
+  const body = await request<{ view: CronJobView }>(`/api/crons/${encodeURIComponent(jobId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+  return body.view;
+}
+
+export async function setCronEnabled(jobId: string, enabled: boolean): Promise<CronJobView> {
+  const body = await request<{ view: CronJobView }>(
+    `/api/crons/${encodeURIComponent(jobId)}/enabled`,
+    { method: "POST", body: JSON.stringify({ enabled }) },
+  );
+  return body.view;
+}
+
+/** 立刻试跑：默认等这一轮落账；wait=false 只发起，结果由 SSE 的 cron-run 事件带回。 */
+export async function runCronNow(
+  jobId: string,
+  options: { wait?: boolean } = {},
+): Promise<CronRunRecord | undefined> {
+  const body = await request<{ run?: CronRunRecord }>(
+    `/api/crons/${encodeURIComponent(jobId)}/run`,
+    { method: "POST", body: JSON.stringify({ wait: options.wait !== false }) },
+  );
+  return body.run;
+}
+
+export async function deleteCron(jobId: string): Promise<void> {
+  await request<{ removed: string }>(`/api/crons/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+  });
+}
+
+export interface CronRunPage {
+  entries: CronRunRecord[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export async function fetchCronRuns(query: { jobId?: string; limit?: number } = {}): Promise<CronRunPage> {
+  const params = new URLSearchParams();
+  if (query.jobId) params.set("job_id", query.jobId);
+  if (query.limit) params.set("limit", String(query.limit));
+  return request<CronRunPage>(`/api/crons/runs?${params.toString()}`);
+}
+
 export function fetchState(): Promise<StateSnapshot> {
   return request<StateSnapshot>("/api/state");
 }
@@ -663,9 +797,46 @@ export async function patchTask(taskId: string, patch: { status?: string }): Pro
   return body.task;
 }
 
+/** 供应商补丁：apiKey 省略即保持原值，清除密钥请调用 deleteProviderKey。 */
+export interface ProviderPatch {
+  id: string;
+  api?: ProviderApi;
+  baseUrl?: string;
+  apiKey?: string;
+  auth?: "api-key" | "none";
+  authHeader?: boolean;
+  headers?: Record<string, string>;
+  timeoutSeconds?: number;
+  maxTokens?: number;
+  params?: Record<string, unknown>;
+  models?: ModelPatch[];
+}
+
+export interface ModelPatch {
+  id: string;
+  name?: string;
+  api?: ProviderApi;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  input?: string[];
+  cost?: Partial<{ input: number; output: number; cacheRead: number; cacheWrite: number }>;
+  status?: string;
+}
+
+export interface SelectionPatch {
+  defaultModel?: string;
+  /** 传 null/空串表示删除该别名。 */
+  aliases?: Record<string, string | null>;
+  fallbacks?: string[];
+  allow?: string[];
+  params?: Record<string, unknown>;
+  modelParams?: Record<string, Record<string, unknown>>;
+}
+
 export async function saveSettings(patch: {
-  activeProviderId?: string;
-  providers?: Array<{ id: string; apiKey?: string; baseUrl?: string; model?: string }>;
+  providers?: ProviderPatch[];
+  selection?: SelectionPatch;
   /** 以存储单位提交（超时为毫秒），服务端按 LIMIT_FIELDS 区间校验。 */
   limits?: Partial<Limits>;
 }): Promise<MaskedSettings> {
@@ -674,6 +845,118 @@ export async function saveSettings(patch: {
     body: JSON.stringify(patch),
   });
   return body.settings;
+}
+
+export async function deleteProvider(providerId: string): Promise<MaskedSettings> {
+  const body = await request<{ settings: MaskedSettings }>(
+    `/api/settings/providers/${encodeURIComponent(providerId)}`,
+    { method: "DELETE" },
+  );
+  return body.settings;
+}
+
+export async function deleteProviderKey(providerId: string): Promise<MaskedSettings> {
+  const body = await request<{ settings: MaskedSettings }>(
+    `/api/settings/providers/${encodeURIComponent(providerId)}/key`,
+    { method: "DELETE" },
+  );
+  return body.settings;
+}
+
+export interface ModelCardView {
+  ref: string;
+  providerId: string;
+  id: string;
+  name: string;
+  api: ProviderApi;
+  contextWindow: number;
+  contextTokens: number;
+  maxTokens: number;
+  reasoning: boolean;
+  input: string[];
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  tiers?: Array<Record<string, unknown>>;
+  status: string;
+}
+
+export async function fetchModels(): Promise<{
+  defaultModel: string;
+  aliases: Record<string, string>;
+  models: ModelCardView[];
+}> {
+  return request("/api/models");
+}
+
+export interface CatalogSuggestion {
+  ref: string;
+  modelId: string;
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  input?: string[];
+  cost?: ModelPatch["cost"];
+}
+
+export async function fetchCatalogSuggestions(providerId: string): Promise<CatalogSuggestion[]> {
+  const body = await request<{ suggestions: CatalogSuggestion[] }>(
+    `/api/models/catalog?provider=${encodeURIComponent(providerId)}`,
+  );
+  return body.suggestions;
+}
+
+export interface ProbeResult {
+  providerId: string;
+  ref?: string;
+  status: "ok" | "auth" | "rate_limit" | "billing" | "timeout" | "format" | "unknown" | "no_model";
+  reasonCode?: string;
+  error?: string;
+  latencyMs?: number;
+  model?: { ref: string; name?: string };
+}
+
+export async function probeModel(input: {
+  ref?: string;
+  provider?: ProviderPatch;
+}): Promise<ProbeResult> {
+  return request("/api/models/probe", { method: "POST", body: JSON.stringify(input) });
+}
+
+export interface UsageSnapshotView {
+  days: number;
+  runs: number;
+  usage: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  costUsd: number;
+  byRef: Array<{
+    ref: string;
+    providerId: string;
+    modelId: string;
+    runs: number;
+    usage: { input: number; output: number; cacheRead: number; cacheWrite: number };
+    costUsd: number;
+  }>;
+  byDay: Array<{
+    day: string;
+    runs: number;
+    usage: { input: number; output: number; cacheRead: number; cacheWrite: number };
+    costUsd: number;
+  }>;
+}
+
+export async function fetchModelUsage(days: number): Promise<UsageSnapshotView> {
+  return request(`/api/models/usage?days=${days}`);
+}
+
+export async function setMemberModel(
+  memberId: string,
+  ref: string,
+  thinkingLevel?: string | null,
+): Promise<Member> {
+  const body = await request<{ member: Member }>(`/api/members/${memberId}/model`, {
+    method: "PUT",
+    body: JSON.stringify({ ref, ...(thinkingLevel === undefined ? {} : { thinkingLevel }) }),
+  });
+  return body.member;
 }
 
 export function subscribeEvents(

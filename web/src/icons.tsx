@@ -16,6 +16,7 @@ export type IconName =
   | "columns"
   | "book"
   | "template"
+  | "clock"
   | "chat"
   | "inspect"
   | "search"
@@ -97,6 +98,12 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
       <rect x="3.5" y="4" width="17" height="16" rx="2.5" />
       <path d="M3.5 9.5h17" />
       <path d="M9 9.5V20" />
+    </>
+  ),
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 7.5V12l3.5 2" />
     </>
   ),
   chat: (

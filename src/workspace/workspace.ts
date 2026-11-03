@@ -2,6 +2,10 @@ import { join } from "node:path";
 import { rm } from "node:fs/promises";
 import { ensureMainMember, Orchestrator } from "../agent/orchestrator";
 import { SessionArchives, summaryOf } from "../archive/session-archive";
+import { CronService } from "../cron/service";
+import { CronRunHistory } from "../cron/history";
+import { CronStore } from "../cron/store";
+import type { CronHost } from "../cron/host";
 import { loadSettings, saveSettings, type Settings } from "../core/settings";
 import type {
   Member,
@@ -11,7 +15,8 @@ import type {
   SessionArchiveSummary,
   TaskCard,
 } from "../core/types";
-import { SYSTEM_ID } from "../core/types";
+import { DEFAULT_MODEL_REF, SYSTEM_ID } from "../core/types";
+import { ModelUsageStore } from "../model/usage-store";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
 import { WorkspaceFiles } from "../files/workspace-files";
@@ -21,11 +26,23 @@ import { readJson, writeJsonAtomic } from "../store/persist";
 import { Workboard } from "../workboard/board";
 
 interface PersistedState {
-  members: Member[];
+  members: PersistedMember[];
   messages: RoomMessage[];
   seq: number;
   tasks: TaskCard[];
   mode?: RoomMode;
+}
+
+/** v3 及更早的成员档案用 `providerId`，v4 统一为 `modelRef`（`provider/model` 或别名）。 */
+type PersistedMember = Omit<Member, "modelRef"> & { modelRef?: string; providerId?: string };
+
+function hydrateMember(persisted: PersistedMember): Member {
+  const { providerId, modelRef, ...rest } = persisted;
+  return {
+    ...rest,
+    modelRef: modelRef ?? (providerId && providerId !== "default" ? providerId : DEFAULT_MODEL_REF),
+    status: persisted.status === "running" ? "idle" : persisted.status,
+  };
 }
 
 export interface WorkspaceOwner {
@@ -50,7 +67,9 @@ export class Workspace {
     private readonly settingsRef: { current: Settings },
     readonly memory: MemorySearchManager,
     readonly files: WorkspaceFiles,
+    readonly usage: ModelUsageStore,
     readonly archives: SessionArchives,
+    readonly cron: CronService,
   ) {}
 
   static async load(rootDir: string, owner: WorkspaceOwner, skills: SkillLibrary): Promise<Workspace> {
@@ -65,7 +84,7 @@ export class Workspace {
     if (state) {
       bus.hydrate({ seq: state.seq, messages: state.messages, mode: state.mode });
       for (const member of state.members) {
-        bus.addMember({ ...member, status: member.status === "running" ? "idle" : member.status });
+        bus.addMember(hydrateMember(member));
       }
       board.hydrate(state.tasks ?? []);
     }
@@ -84,6 +103,12 @@ export class Workspace {
     const memory = new MemorySearchManager({ workspaceDir: dir, bus });
     // 文件工作区独立于运行时数据：智能体与用户只经 files/ 交换文件。
     const files = new WorkspaceFiles(dir);
+    // 用量账本：按模型 × UTC 自然日聚合 token 与成本，供设置面板统计。
+    const usage = new ModelUsageStore(join(dir, "model-usage.json"));
+    // 定时任务：每个账号一个独立调度器（相当于 OpenClaw 的一个 storeKey），
+    // 作业定义、运行状态与运行历史都落在本账号目录里，删号随目录一起清掉。
+    const cronStore = new CronStore(dir);
+    const cronHistory = new CronRunHistory(join(dir, "cron-runs.json"));
     const orchestrator = new Orchestrator({
       bus,
       board,
@@ -92,7 +117,28 @@ export class Workspace {
       ownerId: owner.id,
       memory,
       files,
+      dataDir: dir,
+      usage,
+      onUsageRecord: (record) => bus.emit({ type: "model-usage", usage: record }),
     });
+    const cronHost: CronHost = {
+      ownerId: owner.id,
+      bus,
+      orchestrator,
+      getSettings: () => settingsRef.current,
+      commandCwd: files.rootDir,
+    };
+    const cron = new CronService({
+      store: cronStore,
+      history: cronHistory,
+      getHost: (ownerId) => (ownerId === owner.id ? cronHost : undefined),
+      onEvent: (event) => {
+        if (event.type === "job") bus.emit({ type: "cron-job", job: event.job, state: event.state });
+        else if (event.type === "job-removed") bus.emit({ type: "cron-job-removed", jobId: event.jobId });
+        else bus.emit({ type: "cron-run", run: event.run });
+      },
+    });
+    orchestrator.setCron(cron);
 
     const workspace = new Workspace(
       owner.id,
@@ -103,7 +149,9 @@ export class Workspace {
       settingsRef,
       memory,
       files,
+      usage,
       new SessionArchives(dir),
+      cron,
     );
     bus.subscribe((event) => {
       if (
@@ -127,11 +175,17 @@ export class Workspace {
     });
     board.subscribe(() => workspace.scheduleSave());
     await workspace.persist();
+    await cron.start();
     return workspace;
   }
 
   getSettings(): Settings {
     return this.settingsRef.current;
+  }
+
+  /** 工作区目录：`file:` 密钥引用与探针需要相对根目录。 */
+  get dirPath(): string {
+    return this.dir;
   }
 
   renameRoom(ownerDisplayName: string): void {
@@ -268,12 +322,15 @@ export class Workspace {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.cron.stop();
     this.orchestrator.stop();
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
     await this.writeState().catch(() => undefined);
+    await this.usage.flush().catch(() => undefined);
+    await this.cron.flush().catch(() => undefined);
   }
 }
 

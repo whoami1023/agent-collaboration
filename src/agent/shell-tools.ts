@@ -22,14 +22,14 @@ export interface ShellToolDeps {
   member: Member;
 }
 
-interface RunOptions {
+export interface RunOptions {
   cwd: string;
   timeoutMs: number;
   signal: AbortSignal;
   shell: boolean;
 }
 
-interface RunResult {
+export interface RunResult {
   code: number | null;
   signal: NodeJS.Signals | null;
   stdout: string;
@@ -76,7 +76,7 @@ function killTree(child: ChildProcess): void {
   }
 }
 
-function runProcess(command: string, args: string[], options: RunOptions): Promise<RunResult> {
+export function runProcess(command: string, args: string[], options: RunOptions): Promise<RunResult> {
   return new Promise((resolve) => {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];

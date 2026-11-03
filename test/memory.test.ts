@@ -6,7 +6,7 @@ import { RoomBus } from "../src/room/bus";
 import { Workboard } from "../src/workboard/board";
 import { Orchestrator, ensureMainMember } from "../src/agent/orchestrator";
 import { DEFAULT_LIMITS, USER_ID } from "../src/core/types";
-import { SETTINGS_VERSION, type Settings } from "../src/core/settings";
+import { defaultSettings, type Settings } from "../src/core/settings";
 import type { MockHandler } from "../src/provider/mock";
 import { SkillLibrary } from "../src/skills/library";
 import { tokenize, normalizeSearchTokens, bm25RankToScore, bm25RelevanceToScore } from "../src/memory/tokenize";
@@ -252,7 +252,7 @@ describe("MemorySearchManager 检索", () => {
       contextMode: "isolated",
       systemPrompt: "",
       brief: "负责检索资料并给出带出处的结论",
-      providerId: "demo",
+      modelRef: "demo/mock",
       createdAt: Date.now(),
       lastActiveAt: Date.now(),
     });
@@ -297,7 +297,7 @@ describe("MemorySearchManager 检索", () => {
         contextMode: "isolated",
         systemPrompt: "",
         brief: `${name}的职责`,
-        providerId: "demo",
+        modelRef: "demo/mock",
         createdAt: Date.now(),
         lastActiveAt: Date.now(),
       });
@@ -472,9 +472,8 @@ describe("运行时接线（workspace/orchestrator/member-runtime）", () => {
     const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
     await skills.init();
     const settings: Settings = {
-      settingsVersion: SETTINGS_VERSION,
-      providers: [{ id: "demo", kind: "mock", model: "mock" }],
-      activeProviderId: "demo",
+      ...defaultSettings(),
+      providers: [{ id: "demo", api: "mock", models: [{ id: "mock" }] }],
       limits: { ...DEFAULT_LIMITS, maxStepsPerRun: 4, runTimeoutMs: 10_000 },
     };
 

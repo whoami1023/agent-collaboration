@@ -68,6 +68,12 @@ const COMMAND_SECTION = `命令执行
 - 命令以服务进程权限运行，不会经过 shell 传递参数的部分只限脚本参数；执行前想清后果，不要运行来源不明的命令。
 - 执行后如实引用真实输出（退出码与关键日志）；失败就贴错误并说明下一步，不要编造运行结果。`;
 
+const CRON_SECTION = `定时任务
+- 用户提到「每天/每周/半小时后/到点再做…」这类延时或周期性要求，用 cron 工具建任务；绝不要在 run_command 里 sleep 或反复轮询来假装定时器。
+- 任务到点会把指令投进群并唤醒对应成员无人值守执行，最终回复就是交付物；一次运行只交一份结果，重复靠调度而不是靠你追问。
+- 无人值守运行里没有人在旁边澄清：写指令时要说清完成标准与卡住时该报告什么。
+- 结果与上次没有变化时，让那一轮回复整条只写 NO_REPLY，群里保持安静但照常记账。`;
+
 function formatSkills(skills: SkillSummary[]): string {
   if (skills.length === 0) return "- （暂无可用技能）";
   return skills
@@ -85,7 +91,8 @@ export function buildSystemPrompt(context: PromptContext): string {
     context.availableTools?.has("file_list") === true ? FILE_WORKSPACE_SECTION : "";
   const commandSection =
     context.availableTools?.has("run_command") === true ? COMMAND_SECTION : "";
-  return [base, memorySection.trim(), fileSection, commandSection]
+  const cronSection = context.availableTools?.has("cron") === true ? CRON_SECTION : "";
+  return [base, memorySection.trim(), fileSection, commandSection, cronSection]
     .filter((section) => section.length > 0)
     .join("\n\n");
 }

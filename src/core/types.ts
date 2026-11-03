@@ -1,6 +1,9 @@
+import type { CronJob, CronJobState, CronRunRecord } from "../cron/types";
+
 export const USER_ID = "user";
 export const SYSTEM_ID = "system";
-export const DEFAULT_PROVIDER_ID = "default";
+/** 成员未指定模型时的占位引用：跟随设置里的默认模型。 */
+export const DEFAULT_MODEL_REF = "default";
 
 export type MemberRole = "main" | "sub";
 export type MemberStatus = "idle" | "running" | "cancelled" | "error";
@@ -171,7 +174,17 @@ export interface Member {
   /** 引用「模板库」里的模板创建时记录的来源模板，用于成员列表展示与再编辑。 */
   templateKey?: string;
   templateTitle?: string;
-  providerId: string;
+  /** `provider/model`、别名或 "default"（跟随设置里的默认模型）。 */
+  modelRef: string;
+  /** 该成员的推理档位偏好；未设置则跟随模型默认。 */
+  thinkingLevel?:
+    | "off"
+    | "minimal"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | "max";
   createdAt: number;
   lastActiveAt: number;
 }
@@ -265,4 +278,25 @@ export type RoomEvent =
   | { type: "member-removed"; memberId: string }
   | { type: "task"; task: TaskCard }
   | { type: "run"; event: AgentEvent }
+  | { type: "model-usage"; usage: ModelUsageEvent }
+  | { type: "cron-job"; job: CronJob; state: CronJobState }
+  | { type: "cron-job-removed"; jobId: string }
+  | { type: "cron-run"; run: CronRunRecord }
   | { type: "notice"; text: string };
+
+/** token 计量口径：input 已扣除缓存命中，cacheRead/cacheWrite 单独计。 */
+export interface TokenUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+/** 一次运行结束后按模型上报的用量，供设置面板的用量统计实时刷新。 */
+export interface ModelUsageEvent {
+  ref: string;
+  providerId: string;
+  modelId: string;
+  usage: TokenUsage;
+  costUsd: number;
+}

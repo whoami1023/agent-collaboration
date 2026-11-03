@@ -6,7 +6,7 @@ import { RoomBus } from "../src/room/bus";
 import { Workboard } from "../src/workboard/board";
 import { Orchestrator, ensureMainMember } from "../src/agent/orchestrator";
 import { DEFAULT_LIMITS, type Limits, type PublicUser } from "../src/core/types";
-import { SETTINGS_VERSION, type Settings } from "../src/core/settings";
+import { defaultSettings, type Settings } from "../src/core/settings";
 import type { MockHandler } from "../src/provider/mock";
 import { SkillLibrary } from "../src/skills/library";
 
@@ -24,18 +24,23 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
   }
 }
 
-async function makeRig(handler: MockHandler, overrides: Partial<Limits> = {}) {
+async function makeRig(
+  handler: MockHandler,
+  overrides: Partial<Limits> = {},
+  options: { seedSkills?: boolean } = {},
+) {
   const bus = new RoomBus("room_test", "测试群");
   const board = new Workboard("room_test");
   ensureMainMember(bus);
   const dir = await mkdtemp(join(tmpdir(), "ac-collab-"));
   tempDirs.push(dir);
-  const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+  const skills = new SkillLibrary(join(dir, "skills.json"), {
+    seedShared: options.seedSkills ?? false,
+  });
   await skills.init();
   const settings: Settings = {
-    settingsVersion: SETTINGS_VERSION,
-    providers: [{ id: "demo", kind: "mock", model: "mock" }],
-    activeProviderId: "demo",
+    ...defaultSettings(),
+    providers: [{ id: "demo", api: "mock", models: [{ id: "mock" }] }],
     limits: { ...DEFAULT_LIMITS, maxStepsPerRun: 6, runTimeoutMs: 5000, ...overrides },
   };
   const orchestrator = new Orchestrator({
@@ -213,6 +218,42 @@ describe("group-chat collaboration", () => {
     const researcherMessages = bus.listMessages().filter((message) => message.senderId === researcher.id);
     expect(researcherMessages).toHaveLength(1);
     await waitFor(() => orchestrator.activeRuns === 0);
+  });
+
+  it("新建成员按功能描述挑技能：只启用对口的几个，而不是整个技能库", async () => {
+    const { bus, orchestrator, skills } = await makeRig(() => ({ text: "ok" }), {}, {
+      seedSkills: true,
+    });
+    const total = skills.listForAgent("u_test").length;
+
+    const member = await orchestrator.createMember({
+      name: "调研员",
+      description: "负责联网搜索资料，抓取网页正文，给出带引用的调研结论",
+    });
+
+    expect(member.skillNames).toBeDefined();
+    expect(member.skillNames!.length).toBeGreaterThan(0);
+    expect(member.skillNames!.length).toBeLessThan(total);
+    expect(member.skillNames).toEqual(expect.arrayContaining(["web-search", "web-fetch"]));
+    expect(bus.listMessages().at(-1)?.text).toContain("按功能描述启用了");
+  });
+
+  it("模板已经带好技能清单时不再自动挑；描述完全无关时保持不限技能", async () => {
+    const { bus, orchestrator, skills } = await makeRig(() => ({ text: "ok" }), {}, {
+      seedSkills: true,
+    });
+    const fromTemplate = await orchestrator.createMember({
+      name: "文档员",
+      description: "把草稿排版成 Word 交付件",
+      skillNames: ["docx-reader"],
+      template: { key: "doc-writer", title: "文档写手" },
+    });
+    expect(fromTemplate.skillNames).toEqual(["docx-reader"]);
+
+    expect(skills.listForAgent("u_test").length).toBeGreaterThan(0);
+    const odd = await orchestrator.createMember({ name: "盯梢员", description: "替我盯着咖啡机温度" });
+    expect(odd.skillNames).toBeUndefined();
+    expect(bus.listMessages().at(-1)?.text).toContain("没匹配到对口技能");
   });
 
   it("自由交流模式：成员报告不即时唤醒主智能体，安静后统一收集总结", async () => {

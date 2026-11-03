@@ -145,25 +145,30 @@ export function builtinCategoryOf(name: string): SkillCategory {
 }
 
 /**
+ * 分类关键词表：`inferSkillCategory` 与「按描述选技能」（skills/matching.ts）共用一份，
+ * 避免两处对同一个词给出不同归类。
+ */
+export const CATEGORY_MATCH_RULES: readonly [SkillCategory, RegExp][] = [
+  ["web", /\b(web|search|fetch|browse|crawl|scrap|url|http)\b|网页|搜索|抓取|联网|浏览器/],
+  ["data", /\b(data|sql|analytic|statistic|forecast|metric|kpi|dashboard|etl)\b|数据|统计|指标|报表|预测/],
+  [
+    "engineering",
+    /\b(code|debug|test|review|api|architect|refactor|deploy|performance)\b|代码|调试|测试|架构|接口|重构|部署/,
+  ],
+  ["design", /\b(design|diagram|figma|ui|ux|visual|a11y|accessibility)\b|设计|图表|可视化|无障碍|界面/],
+  ["product", /\b(prd|product|roadmap|user story|meeting)\b|需求|产品|用户故事|路线图|会议|纪要/],
+  ["research", /\b(research|arxiv|paper|cite|citation|competitive|summar)\b|调研|研究|论文|引用|竞品|摘要/],
+  ["planning", /\b(plan|brainstorm|retro|task|dispatch|workflow)\b|计划|拆解|头脑风暴|复盘|分工|流程/],
+  ["agent", /\b(skill|agent|prompt|role)\b|技能|智能体|角色|提示词/],
+];
+
+/**
  * 导入的 SKILL.md 常常没有 category：按名称与描述做保守归类，
  * 命中不了就归入「其他」，用户可在编辑里改。
  */
 export function inferSkillCategory(name: string, description: string): SkillCategory {
   const text = `${name} ${description}`.toLowerCase();
-  const rules: [SkillCategory, RegExp][] = [
-    ["web", /\b(web|search|fetch|browse|crawl|scrap|url|http)\b|网页|搜索|抓取|联网|浏览器/],
-    ["data", /\b(data|sql|analytic|statistic|forecast|metric|kpi|dashboard|etl)\b|数据|统计|指标|报表|预测/],
-    [
-      "engineering",
-      /\b(code|debug|test|review|api|architect|refactor|deploy|performance)\b|代码|调试|测试|架构|接口|重构|部署/,
-    ],
-    ["design", /\b(design|diagram|figma|ui|ux|visual|a11y|accessibility)\b|设计|图表|可视化|无障碍|界面/],
-    ["product", /\b(prd|product|roadmap|user story|meeting)\b|需求|产品|用户故事|路线图|会议|纪要/],
-    ["research", /\b(research|arxiv|paper|cite|citation|competitive|summar)\b|调研|研究|论文|引用|竞品|摘要/],
-    ["planning", /\b(plan|brainstorm|retro|task|dispatch|workflow)\b|计划|拆解|头脑风暴|复盘|分工|流程/],
-    ["agent", /\b(skill|agent|prompt|role)\b|技能|智能体|角色|提示词/],
-  ];
-  for (const [category, pattern] of rules) {
+  for (const [category, pattern] of CATEGORY_MATCH_RULES) {
     if (pattern.test(text)) return category;
   }
   return DEFAULT_SKILL_CATEGORY;

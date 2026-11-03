@@ -19,6 +19,7 @@
     "web:build": "vite build --config web/vite.config.ts"
   },
   "dependencies": {
+    "croner": "^11.0.0",
     "dompurify": "^3.4.17",
     "exceljs": "^4.4.0",
     "express": "^5.1.0",

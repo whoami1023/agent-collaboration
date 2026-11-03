@@ -1,10 +1,21 @@
 import type { LlmEvent, LlmMessage, LlmProvider, LlmRequest, ToolCall } from "./types";
+import { applyHeaders, composeSignal, postForStream, readSseLines } from "./http";
+import { isEmptyUsage, usageFromOpenAi } from "./openai-usage";
+import type { UsageTotals } from "../model/usage-cost";
 
 export interface OpenAiProviderOptions {
   id: string;
   baseUrl: string;
   apiKey: string;
   model: string;
+  /** 自定义请求头（provider 与模型级合并后传入）。 */
+  headers?: Record<string, string>;
+  /** 强制 `Authorization: Bearer`；某些网关要求把密钥放在别的头里时关掉。 */
+  authHeader?: boolean;
+  /** 单次请求的墙上时钟上限。 */
+  timeoutMs?: number;
+  /** 关闭后不再请求 stream_options.include_usage（少数网关会因此报错）。 */
+  includeUsage?: boolean;
 }
 
 interface OpenAiToolCallDelta {
@@ -21,7 +32,23 @@ interface OpenAiStreamChunk {
     };
     finish_reason?: string | null;
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
+  };
 }
+
+/** 这些字段由传输层自己拼装，用户参数不得覆盖。 */
+const RESERVED_BODY_KEYS = new Set([
+  "model",
+  "messages",
+  "stream",
+  "tools",
+  "tool_choice",
+  "max_tokens",
+  "stream_options",
+]);
 
 function toOpenAiMessage(message: LlmMessage): Record<string, unknown> {
   if (message.role === "assistant" && message.toolCalls?.length) {
@@ -51,27 +78,19 @@ function parseArgs(raw: string): Record<string, unknown> {
   }
 }
 
-async function* readSseLines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
-  const decoder = new TextDecoder();
-  let buffer = "";
-  const reader = body.getReader();
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let newline = buffer.indexOf("\n");
-      while (newline >= 0) {
-        const line = buffer.slice(0, newline).replace(/\r$/, "");
-        buffer = buffer.slice(newline + 1);
-        yield line;
-        newline = buffer.indexOf("\n");
-      }
-    }
-    if (buffer.trim()) yield buffer.replace(/\r$/, "");
-  } finally {
-    reader.releaseLock();
+export function buildOpenAiHeaders(
+  options: OpenAiProviderOptions,
+  request: LlmRequest,
+): Record<string, string> {
+  const headers: Record<string, string> = { "content-type": "application/json", accept: "text/event-stream" };
+  if (options.apiKey) headers.authorization = `Bearer ${options.apiKey}`;
+  applyHeaders(headers, options.headers);
+  applyHeaders(headers, request.headers);
+  if (options.authHeader === false) {
+    const keyName = Object.keys(headers).find((name) => name.toLowerCase() === "authorization");
+    if (keyName) delete headers[keyName];
   }
+  return headers;
 }
 
 export class OpenAiCompatibleProvider implements LlmProvider {
@@ -82,7 +101,8 @@ export class OpenAiCompatibleProvider implements LlmProvider {
   }
 
   async *stream(request: LlmRequest): AsyncIterable<LlmEvent> {
-    const url = `${this.options.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+    const baseUrl = (request.baseUrl ?? this.options.baseUrl).replace(/\/+$/, "");
+    const url = `${baseUrl}/chat/completions`;
     const toolDefs = request.tools.map((tool) => ({
       type: "function",
       function: {
@@ -96,30 +116,31 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       messages: request.messages.map(toOpenAiMessage),
       stream: true,
     };
+    for (const [key, value] of Object.entries(request.params ?? {})) {
+      if (RESERVED_BODY_KEYS.has(key) || value === undefined) continue;
+      body[key] = value;
+    }
     if (toolDefs.length > 0) {
       body.tools = toolDefs;
       body.tool_choice = "auto";
     }
-    if (request.temperature !== undefined) body.temperature = request.temperature;
-    if (request.maxTokens !== undefined) body.max_tokens = request.maxTokens;
+    const maxTokens = request.maxTokens ?? (body.max_tokens as number | undefined);
+    if (maxTokens !== undefined) body.max_tokens = maxTokens;
+    else delete body.max_tokens;
+    if (this.options.includeUsage !== false) body.stream_options = { include_usage: true };
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${this.options.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: request.signal ?? null,
+    const signal = composeSignal(request.signal, request.timeoutMs ?? this.options.timeoutMs);
+    const stream = await postForStream({
+      url,
+      headers: buildOpenAiHeaders(this.options, request),
+      body,
+      signal,
     });
-    if (!response.ok || !response.body) {
-      const detail = await response.text().catch(() => "");
-      throw new Error(`模型接口 ${response.status}：${detail.slice(0, 400)}`);
-    }
 
     const pending = new Map<number, { id: string; name: string; args: string }>();
     let stopReason: string | undefined;
-    for await (const line of readSseLines(response.body)) {
+    let usage: UsageTotals | undefined;
+    for await (const line of readSseLines(stream)) {
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trim();
       if (!data || data === "[DONE]") break;
@@ -129,6 +150,8 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       } catch {
         continue;
       }
+      const parsedUsage = usageFromOpenAi(chunk.usage);
+      if (parsedUsage && !isEmptyUsage(parsedUsage)) usage = parsedUsage;
       const choice = chunk.choices?.[0];
       if (!choice) continue;
       const content = choice.delta?.content;
@@ -150,6 +173,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         .map(([, value]) => ({ id: value.id, name: value.name, args: parseArgs(value.args) }));
       yield { type: "tool-calls", calls };
     }
+    if (usage) yield { type: "usage", usage };
     yield { type: "done", stopReason };
   }
 }

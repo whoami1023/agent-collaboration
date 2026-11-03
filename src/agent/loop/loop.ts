@@ -6,6 +6,7 @@
 // Adapted to this project's LlmProvider/LlmMessage seam.
 
 import type { LlmMessage, LlmProvider, ToolCall, ToolSchema } from "../../provider/types";
+import type { UsageTotals } from "../../model/usage-cost";
 import {
   applyContextBudget,
   type ContextBudgetConfig,
@@ -35,6 +36,15 @@ export interface LoopRetryConfig {
   jitter?: number | "full";
 }
 
+/** 每次请求都要带上的模型设置（已由分层参数合并算出）。 */
+export interface LoopRequestOptions {
+  params?: Record<string, unknown>;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  baseUrl?: string;
+  maxTokens?: number;
+}
+
 export interface LoopOptions {
   provider: LlmProvider;
   model: string;
@@ -43,6 +53,10 @@ export interface LoopOptions {
   tools: ToolImpl[];
   maxSteps: number;
   signal: AbortSignal;
+  /** 模型设置里合并出的请求参数（采样、请求头、超时、输出上限）。 */
+  request?: LoopRequestOptions;
+  /** 上游回流的 token 统计，每个模型调用一次（用于用量与成本记账）。 */
+  onUsage?: (usage: UsageTotals) => void;
   onDelta?: (text: string) => void;
   onToolCall?: (call: ToolCall) => void;
   onToolResult?: (call: ToolCall, result: string) => void;
@@ -311,6 +325,11 @@ async function streamAgentResponse(
         model: options.model,
         messages,
         tools: useTools ? options.tools.map((tool) => tool.schema) : [],
+        ...(options.request?.params ? { params: options.request.params } : {}),
+        ...(options.request?.headers ? { headers: options.request.headers } : {}),
+        ...(options.request?.timeoutMs !== undefined ? { timeoutMs: options.request.timeoutMs } : {}),
+        ...(options.request?.baseUrl ? { baseUrl: options.request.baseUrl } : {}),
+        ...(options.request?.maxTokens !== undefined ? { maxTokens: options.request.maxTokens } : {}),
         signal: streamController.signal,
       })) {
         if (event.type === "text") {
@@ -323,6 +342,8 @@ async function streamAgentResponse(
           options.onDelta?.(event.delta);
         } else if (event.type === "tool-calls") {
           calls.push(...event.calls);
+        } else if (event.type === "usage") {
+          options.onUsage?.(event.usage);
         } else if (event.type === "done") {
           finishReason = event.stopReason;
         }

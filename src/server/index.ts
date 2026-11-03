@@ -28,8 +28,9 @@ async function main(): Promise<void> {
   });
 
   const port = Number(process.env["PORT"] ?? 8788);
-  const server = app.listen(port, "127.0.0.1", () => {
-    console.log(`agent-collaboration 已启动：http://127.0.0.1:${port}`);
+  const host = process.env["HOST"] ?? "127.0.0.1";
+  const server = app.listen(port, host, () => {
+    console.log(`agent-collaboration 已启动：http://${host}:${port}`);
     console.log(
       auth.needsSetup()
         ? "尚未创建管理员账号，请在登录页完成初始化。"

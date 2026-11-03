@@ -14,7 +14,7 @@ function member(id: string, name: string): Member {
     controlScope: "none",
     contextMode: "isolated",
     systemPrompt: "",
-    providerId: "default",
+    modelRef: "default",
     createdAt: 0,
     lastActiveAt: 0,
   };

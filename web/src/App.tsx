@@ -37,11 +37,15 @@ import {
 } from "./layout";
 import SkillLibraryPanel from "./SkillLibrary";
 import TemplateLibraryPanel from "./TemplateLibrary";
+import CronPanel from "./CronPanel";
+import { ModelSettings } from "./ModelSettings";
 import {
   buildContextReport,
   buildHelpReport,
+  buildModelReport,
   buildStatusReport,
   getSlashQuery,
+  parseModelCommand,
   parseSlashCommand,
   suggestSlashCommands,
   type CommandData,
@@ -80,6 +84,7 @@ import {
   saveMemberSkills,
   saveSettings,
   sendMessage,
+  setMemberModel,
   setRoomMode,
   setupAdmin,
   startNewSession,
@@ -484,6 +489,9 @@ function RoomView({
     }
   });
   const [templatesOpen, setTemplatesOpen] = useState(false);
+  const [cronOpen, setCronOpen] = useState(false);
+  /** 定时任务事件到达时自增：面板据此重新拉取定义与状态，不重挂载（编辑器状态保留）。 */
+  const [cronTick, setCronTick] = useState(0);
   const [membersOpen, setMembersOpen] = useState(true);
   const [navOpen, setNavOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -783,6 +791,13 @@ function RoomView({
     const unsubscribe = subscribeEvents((event: RoomEvent) => {
       setState((current) => applyEvent(current, event));
       if (event.type === "messages-cleared") setRuns({});
+      if (
+        event.type === "cron-job" ||
+        event.type === "cron-job-removed" ||
+        event.type === "cron-run"
+      ) {
+        setCronTick((tick) => tick + 1);
+      }
       if (event.type === "session-archived" || event.type === "session-restored") void reloadSession();
       setRuns((current) => {
         if (event.type !== "run") return current;
@@ -827,10 +842,10 @@ function RoomView({
   }, [members]);
 
   const selectedMember = members.find((member) => member.id === selectedMemberId);
-  const inWarRoom = !skillsOpen && !templatesOpen && !newMemberOpen && !selectedMember;
-  /** 技能库 / 模板库 / 智能体文件 / 新建成员独占右侧整块区域：此时连作战室（群聊）一起收起。 */
+  const inWarRoom = !skillsOpen && !templatesOpen && !cronOpen && !newMemberOpen && !selectedMember;
+  /** 技能库 / 模板库 / 定时任务 / 智能体文件 / 新建成员独占右侧整块区域：此时连作战室（群聊）一起收起。 */
   const takeover =
-    skillsOpen || templatesOpen || newMemberOpen || Boolean(selectedMember);
+    skillsOpen || templatesOpen || cronOpen || newMemberOpen || Boolean(selectedMember);
   const panelVisible = boardOpen || takeover;
   const runningCount = members.filter((member) => member.status === "running").length;
   const workspaceFileCount =
@@ -1075,7 +1090,7 @@ function RoomView({
   }
 
   async function runSlashCommand(name: string, args: string) {
-    if (args && name !== "help") {
+    if (args && name !== "help" && name !== "model") {
       setCommandOutput({
         title: `/${name}`,
         body: `/${name} 不接受参数。用法：/${name}`,
@@ -1094,6 +1109,9 @@ function RoomView({
       case "stop":
         await handleStopAll();
         return;
+      case "model":
+        await handleModelCommand(args);
+        return;
       case "status":
         setCommandOutput({ title: "作战室状态", body: buildStatusReport(commandData()) });
         return;
@@ -1102,6 +1120,38 @@ function RoomView({
         return;
       default:
         setCommandOutput({ title: "可用命令", body: buildHelpReport() });
+    }
+  }
+
+  /**
+   * /model：不带参数就列清单；带模型引用时改主智能体或指定成员的 modelRef。
+   * 服务端会广播 member 事件，所以这里只发请求，成员状态由 SSE 收敛。
+   */
+  async function handleModelCommand(args: string) {
+    const plan = parseModelCommand(args, members);
+    if (plan.kind === "list" || !plan.memberId || !plan.ref) {
+      const report = buildModelReport(commandData());
+      setCommandOutput({ title: "模型", body: plan.error ? `${plan.error}\n\n${report}` : report });
+      return;
+    }
+    const target = members.find((member) => member.id === plan.memberId);
+    if (!target) {
+      setCommandOutput({ title: "模型", body: buildModelReport(commandData()) });
+      return;
+    }
+    setError(null);
+    try {
+      const updated = await setMemberModel(plan.memberId, plan.ref);
+      setCommandOutput({
+        title: "模型",
+        body: `已把 @${target.name} 的模型切换为 ${updated.modelRef}。下一轮回复开始生效，进行中的运行不受影响。`,
+      });
+    } catch (err) {
+      if (isUnauthorized(err)) {
+        onSessionLost();
+        return;
+      }
+      setCommandOutput({ title: "模型", body: `切换失败：${messageOf(err)}` });
     }
   }
 
@@ -1409,11 +1459,53 @@ function RoomView({
     return file.content;
   }
 
+  /**
+   * 成员可用的模型引用：`default`（跟随设置里的默认模型）、别名、以及各供应商已登记的模型。
+   */
+  const modelChoices = useMemo(() => {
+    const settings = state?.settings;
+    const choices: { ref: string; label: string }[] = [];
+    if (!settings) return choices;
+    choices.push({ ref: "default", label: `跟随默认（${settings.selection.defaultModel || "未配置"}）` });
+    for (const [alias, target] of Object.entries(settings.selection.aliases)) {
+      choices.push({ ref: alias, label: `别名 ${alias} → ${target}` });
+    }
+    for (const provider of settings.providers) {
+      for (const model of provider.models) {
+        const needsKey = provider.api !== "mock" && provider.auth === "api-key" && !provider.hasApiKey;
+        choices.push({
+          ref: `${provider.id}/${model.id}`,
+          label: `${provider.id}/${model.id}${model.contextWindow ? ` · ${Math.round(model.contextWindow / 1000)}k` : ""}${needsKey ? "（未配置密钥）" : ""}`,
+        });
+      }
+    }
+    return choices;
+  }, [state?.settings]);
+
+  async function handleSelectMemberModel(memberId: string, ref: string) {
+    const target = members.find((member) => member.id === memberId);
+    if (!target) return;
+    setError(null);
+    try {
+      await setMemberModel(memberId, ref);
+      // 主智能体跟随默认模型时，成员档案上写回真正的引用，界面才不会显示成空的 default。
+      const resolved = ref === "default" ? (state?.settings.selection.defaultModel ?? "default") : ref;
+      setCommandOutput({
+        title: "模型",
+        body: `已把 @${target.name} 的模型设为 ${ref}${ref === "default" ? `（当前解析为 ${resolved}）` : ""}。下一轮回复开始生效。`,
+      });
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    }
+  }
+
   function openAgentFiles(memberId: string) {
     setSelectedMemberId(memberId);
     setNewMemberOpen(false);
     setSkillsOpen(false);
     setTemplatesOpen(false);
+    setCronOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -1423,6 +1515,7 @@ function RoomView({
     setSelectedMemberId(null);
     setSkillsOpen(false);
     setTemplatesOpen(false);
+    setCronOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -1431,6 +1524,7 @@ function RoomView({
     setSkillsOpen(true);
     setNewMemberOpen(false);
     setTemplatesOpen(false);
+    setCronOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -1438,6 +1532,17 @@ function RoomView({
   function openTemplates() {
     setTemplatesOpen(true);
     setSkillsOpen(false);
+    setNewMemberOpen(false);
+    setCronOpen(false);
+    setSelectedMemberId(null);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
+  function openCron() {
+    setCronOpen(true);
+    setSkillsOpen(false);
+    setTemplatesOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setBoardOpen(true);
@@ -1448,6 +1553,7 @@ function RoomView({
   function goToWarRoom() {
     setSkillsOpen(false);
     setTemplatesOpen(false);
+    setCronOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setNavOpen(false);
@@ -1487,9 +1593,15 @@ function RoomView({
     return <div className="loading">正在进入 @{user.displayName} 的作战室…</div>;
   }
 
-  const activeProvider = state.settings.providers.find(
-    (provider) => provider.id === state.settings.activeProviderId,
+  const defaultRef = state.settings.selection.defaultModel;
+  const defaultProvider = state.settings.providers.find(
+    (provider) => provider.id === defaultRef.split("/")[0],
   );
+  const modelNeedsKey =
+    defaultProvider !== undefined &&
+    defaultProvider.api !== "mock" &&
+    defaultProvider.auth === "api-key" &&
+    !defaultProvider.hasApiKey;
 
   return (
     <div
@@ -1574,6 +1686,17 @@ function RoomView({
               <Icon name="template" />
               <span className="nav-label">模板库</span>
               <span className="nav-hint">引用模板生成成员</span>
+            </button>
+
+            <button
+              type="button"
+              className={`nav-item${cronOpen ? " active" : ""}`}
+              aria-pressed={cronOpen}
+              onClick={() => (cronOpen ? setCronOpen(false) : openCron())}
+            >
+              <Icon name="clock" />
+              <span className="nav-label">定时任务</span>
+              <span className="nav-hint">提醒 · 周期工作 · 无人值守</span>
             </button>
 
             <button
@@ -1790,7 +1913,7 @@ function RoomView({
         <header className="content-header">
           <div className="content-title">{state.room.name}</div>
           <span className="env-pill">
-            {activeProvider ? `${activeProvider.id} · ${activeProvider.model}` : "未配置模型"}
+            {defaultRef ? `${defaultRef}${modelNeedsKey ? "（未配置密钥）" : ""}` : "未配置模型"}
           </span>
           <div className="mode-switch" role="group" aria-label="任务完成模式">
             <button
@@ -2093,6 +2216,10 @@ function RoomView({
             }}
           />
         </aside>
+      ) : cronOpen ? (
+        <aside id="cron-panel" className="board-panel" aria-label="定时任务">
+          <CronPanel onClose={() => setCronOpen(false)} members={members} refreshToken={cronTick} />
+        </aside>
       ) : selectedMember ? (
         <aside id="agent-files-panel" className="board-panel" aria-label="智能体文件">
           <AgentFilesPanel
@@ -2101,6 +2228,8 @@ function RoomView({
             fileError={agentFileError}
             activePath={openFilePath}
             content={openFile}
+            modelChoices={modelChoices}
+            onSelectModel={handleSelectMemberModel}
             onSelectPath={setOpenFilePath}
             onRefresh={reloadAgentFiles}
             onSave={saveOpenFile}
@@ -2906,17 +3035,21 @@ function AgentFilesPanel({
   fileError,
   activePath,
   content,
+  modelChoices,
+  onSelectModel,
   onSelectPath,
   onRefresh,
   onSave,
   onLoadFull,
   onClose,
 }: {
-  member: { id: string; name: string; templateTitle?: string };
+  member: { id: string; name: string; modelRef: string; templateTitle?: string };
   files: AgentFileEntry[] | null;
   fileError: string | null;
   activePath: string | null;
   content: AgentFileContent | null;
+  modelChoices: { ref: string; label: string }[];
+  onSelectModel: (memberId: string, ref: string) => Promise<void>;
   onSelectPath: (path: string) => void;
   onRefresh: () => void;
   onSave: (path: string, text: string) => Promise<void>;
@@ -3121,6 +3254,22 @@ function AgentFilesPanel({
           </button>
         </div>
       </div>
+      {!showSkills && modelChoices.length > 0 && (
+        <div className="member-model-row">
+          <span className="section-label">模型</span>
+          <select
+            aria-label={`为 @${member.name} 选择模型`}
+            value={modelChoices.some((choice) => choice.ref === member.modelRef) ? member.modelRef : "default"}
+            onChange={(event) => void onSelectModel(member.id, event.target.value)}
+          >
+            {modelChoices.map((choice) => (
+              <option key={choice.ref} value={choice.ref}>
+                {choice.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       {!showSkills && (
         <div className="files-tabs" role="tablist" aria-label="文件列表">
           {files === null && !fileError && (
@@ -3377,7 +3526,8 @@ function NewMemberPanel({
       <div className="board-body">
         <p className="new-member-hint">
           新建一个子智能体加入成员列表。名字是群里 @ 它的引用；功能描述会写进它的默认智能体文件（SOUL.md
-          与 IDENTITY.md）。每个成员还拥有自己的 MEMORY.md 与 USER.md，记忆检索只在该成员自己的范围内命中；创建后都可在「智能体文件」里继续修改。
+          与 IDENTITY.md），并据此从技能库里挑几个对口技能启用（不会把整个技能库都塞给它）。每个成员还拥有自己的 MEMORY.md
+          与 USER.md，记忆检索只在该成员自己的范围内命中；创建后技能与档案都可在「智能体文件」里继续修改。
           想省事可以先到侧边栏「模板库」引用一个现成角色。
         </p>
         <form className="new-member-form" onSubmit={submit}>
@@ -3401,7 +3551,7 @@ function NewMemberPanel({
               placeholder="例如：负责检索资料并给出带出处的结论；不需要写代码，遇到需要动手的活就说明清楚交给别人。"
               onChange={(event) => setDescription(event.target.value)}
             />
-            <small className="form-note">据此生成 SOUL.md 与 IDENTITY.md，最多 800 字</small>
+            <small className="form-note">据此生成 SOUL.md 与 IDENTITY.md 并挑选对口技能，最多 800 字</small>
           </label>
           {error && (
             <p className="form-error" role="alert">
@@ -3895,7 +4045,7 @@ function SettingsDialog({
             {tab === "profile" && (
               <ProfileSection user={user} roomName={roomName} onUserUpdated={onUserUpdated} />
             )}
-            {tab === "model" && <ModelSection settings={settings} onSaved={onSettingsSaved} />}
+            {tab === "model" && <ModelSettings settings={settings} onSaved={onSettingsSaved} />}
             {tab === "limits" && <LimitsSection settings={settings} onSaved={onSettingsSaved} />}
             {tab === "appearance" && (
               <AppearanceSection theme={theme} onThemeChange={onThemeChange} />
@@ -4078,108 +4228,6 @@ function ProfileSection({
   );
 }
 
-function ModelSection({
-  settings,
-  onSaved,
-}: {
-  settings: MaskedSettings;
-  onSaved: (next: MaskedSettings) => void;
-}) {
-  const [providerId, setProviderId] = useState(settings.activeProviderId);
-  const provider = settings.providers.find((item) => item.id === providerId) ?? settings.providers[0];
-  const [apiKey, setApiKey] = useState("");
-  const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? "");
-  const [model, setModel] = useState(provider?.model ?? "");
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-
-  async function handleSave() {
-    if (!provider) return;
-    setBusy(true);
-    setMessage(null);
-    try {
-      const next = await saveSettings({
-        activeProviderId: providerId,
-        providers: [
-          {
-            id: provider.id,
-            ...(apiKey ? { apiKey } : {}),
-            ...(provider.kind === "openai" ? { baseUrl, model } : {}),
-          },
-        ],
-      });
-      onSaved(next);
-      setApiKey("");
-      setMessage("已保存，下一条消息生效");
-    } catch (err) {
-      setMessage(messageOf(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  if (!provider) return <p className="hint">没有可用的模型 provider。</p>;
-
-  return (
-    <div className="settings-form">
-      <div className="section-label">模型服务</div>
-      <label className="field">
-        <span>Provider</span>
-        <select
-          value={providerId}
-          onChange={(event) => {
-            const nextId = event.target.value;
-            setProviderId(nextId);
-            const next = settings.providers.find((item) => item.id === nextId);
-            setBaseUrl(next?.baseUrl ?? "");
-            setModel(next?.model ?? "");
-            setApiKey("");
-          }}
-        >
-          {settings.providers.map((item) => (
-            <option key={item.id} value={item.id}>
-              {item.id}（{item.kind === "mock" ? "演示桩" : "OpenAI 兼容"}）
-            </option>
-          ))}
-        </select>
-      </label>
-      {provider.kind === "openai" && (
-        <>
-          <label className="field">
-            <span>Base URL</span>
-            <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
-          </label>
-          <label className="field">
-            <span>模型</span>
-            <input value={model} onChange={(event) => setModel(event.target.value)} />
-          </label>
-          <label className="field">
-            <span>
-              API Key
-              {provider.hasApiKey ? <em>（已保存，留空保持不变）</em> : null}
-            </span>
-            <input
-              type="password"
-              value={apiKey}
-              placeholder="sk-…"
-              onChange={(event) => setApiKey(event.target.value)}
-            />
-          </label>
-        </>
-      )}
-      <div className="modal-actions">
-        <button className="btn primary" disabled={busy} onClick={() => void handleSave()}>
-          {busy ? "保存中…" : "保存"}
-        </button>
-        {message && <span className="form-note">{message}</span>}
-      </div>
-      <p className="hint">
-        Key 只保存在你自己的 data/workspaces 目录下（已 gitignore），其他账号看不到。演示桩模式不需要
-        Key。
-      </p>
-    </div>
-  );
-}
 
 /** 存储值 → 界面编辑值（`runTimeoutMs` 存毫秒、按秒编辑）。 */
 function limitToDisplay(value: number | undefined, field: LimitFieldSpec): number {

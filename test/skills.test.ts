@@ -51,7 +51,7 @@ const mainMember: Member = {
   controlScope: "children",
   contextMode: "isolated",
   systemPrompt: "",
-  providerId: "default",
+  modelRef: "default",
   createdAt: 0,
   lastActiveAt: 0,
 };

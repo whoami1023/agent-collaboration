@@ -1,5 +1,6 @@
 import {
   DEFAULT_LIMITS,
+  type Limits,
   type Member,
   type RoomMessage,
   type RoomMode,
@@ -24,6 +25,11 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
   { name: "clear", usage: "/clear", summary: "归档并清空作战室（聊天记录、任务卡、文件成果），可在右侧归档区恢复" },
   { name: "stop", usage: "/stop", summary: "中止当前作战室里所有正在运行的成员" },
   { name: "status", usage: "/status", summary: "查看成员、任务、模型与运行状态" },
+  {
+    name: "model",
+    usage: "/model [@成员] [模型引用]",
+    summary: "查看可选模型与成员当前模型；带引用即为该成员切换模型",
+  },
   {
     name: "context",
     usage: "/context",
@@ -151,10 +157,18 @@ export function buildStatusReport(data: CommandData): string {
     .map(([label, count]) => `${label} ${count}`);
 
   const settings = data.settings;
-  const provider = settings?.providers.find((item) => item.id === settings.activeProviderId);
-  const model = provider
-    ? `${provider.id} · ${provider.model}${provider.hasApiKey ? "" : "（未配置密钥）"}`
-    : (settings?.activeProviderId ?? "未配置");
+  const defaultRef = settings?.selection.defaultModel ?? "";
+  const defaultProvider = settings?.providers.find(
+    (item) => defaultRef.split("/")[0] === item.id,
+  );
+  const missingKey =
+    defaultProvider !== undefined &&
+    defaultProvider.api !== "mock" &&
+    defaultProvider.auth === "api-key" &&
+    !defaultProvider.hasApiKey;
+  const model = !defaultRef
+    ? "未配置"
+    : `${defaultRef}${missingKey ? "（未配置密钥）" : ""}`;
 
   const lines = [
     "作战室状态",
@@ -172,7 +186,7 @@ export function buildStatusReport(data: CommandData): string {
 }
 
 export function buildContextReport(data: CommandData): string {
-  const limits = data.settings?.limits ?? {};
+  const limits: Partial<Limits> = data.settings?.limits ?? {};
   const maxChars = numberOr(limits.maxRoomWindowChars, 12_000);
   const window = estimateWindow(data.messages, maxChars);
   const contextTokens = numberOr(limits.contextWindowTokens, 0);
@@ -198,6 +212,74 @@ export function buildContextReport(data: CommandData): string {
     "",
     "说明：字符与 token 为前端估算，实际上下文由服务端按运行时预算裁剪。",
   ].join("\n");
+}
+
+export interface ModelCommandPlan {
+  kind: "list" | "set";
+  /** 目标成员 id；`/model <ref>` 省略时落到主智能体。 */
+  memberId?: string;
+  ref?: string;
+  error?: string;
+}
+
+/**
+ * 解析 `/model` 的参数：
+ * `@成员名 <ref>` 或 `<成员名> <ref>` 改指定成员，单个 ref 改主智能体，空参数列清单。
+ */
+export function parseModelCommand(args: string, members: Member[]): ModelCommandPlan {
+  const text = args.trim();
+  if (!text) return { kind: "list" };
+  const [first, second, ...rest] = text.split(/\s+/);
+  const looksLikeRef = !rest.length && (first?.includes("/") || first === "default");
+  if (second === undefined || looksLikeRef) {
+    const ref = looksLikeRef ? first : text;
+    const main = members.find((member) => member.role === "main");
+    if (!main) return { kind: "list", error: "没有找到主智能体" };
+    return { kind: "set", memberId: main.id, ref };
+  }
+  const wanted = (first ?? "").replace(/^@/, "");
+  const target = members.find((member) => member.name.toLowerCase() === wanted.toLowerCase());
+  if (!target) return { kind: "list", error: `没有找到成员 @${wanted}` };
+  if (target.role === "main") return { kind: "list", error: "主智能体直接用 /model <模型引用>" };
+  return { kind: "set", memberId: target.id, ref: [second, ...rest].join(" ") };
+}
+
+/** `/model` 的清单：默认模型、可选引用、每个成员当前用哪个。 */
+export function buildModelReport(data: CommandData): string {
+  const settings = data.settings;
+  const lines = ["模型"];
+  if (!settings) {
+    lines.push("· 设置还没加载完，稍后再试");
+    return lines.join("\n");
+  }
+  lines.push(`· 默认：${settings.selection.defaultModel}`);
+  if (settings.selection.fallbacks.length > 0) {
+    lines.push(`· 备用：${settings.selection.fallbacks.join("、")}`);
+  }
+  const aliases = Object.entries(settings.selection.aliases);
+  if (aliases.length > 0) {
+    lines.push(`· 别名：${aliases.map(([key, value]) => `${key}→${value}`).join("、")}`);
+  }
+  for (const provider of settings.providers) {
+    if (provider.models.length === 0) {
+      lines.push(`· ${provider.id}：还没有登记模型`);
+      continue;
+    }
+    lines.push(
+      `· ${provider.id}（${provider.api}）：${provider.models
+        .map((model) =>
+          model.contextWindow ? `${model.id} · ${Math.round(model.contextWindow / 1000)}k` : model.id,
+        )
+        .join("、")}${provider.hasApiKey || provider.api === "mock" || provider.auth === "none" ? "" : "（未配置密钥）"}`,
+    );
+  }
+  lines.push(
+    `· 成员：${data.members
+      .map((member) => `${member.name}→${member.modelRef}`)
+      .join("、")}`,
+  );
+  lines.push("", "用法：/model <模型引用> 改主智能体；/model @成员 <模型引用> 改某个成员。");
+  return lines.join("\n");
 }
 
 export function buildHelpReport(): string {

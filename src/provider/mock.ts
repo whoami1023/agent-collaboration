@@ -18,10 +18,12 @@ function abortError(): Error {
 }
 
 export class MockProvider implements LlmProvider {
-  readonly id = "mock";
+  readonly id: string;
   private callCounter = 0;
 
-  constructor(private readonly handler: MockHandler) {}
+  constructor(private readonly handler: MockHandler, id = "mock") {
+    this.id = id;
+  }
 
   async *stream(request: LlmRequest): AsyncIterable<LlmEvent> {
     if (request.signal?.aborted) throw abortError();
@@ -33,6 +35,16 @@ export class MockProvider implements LlmProvider {
       yield { type: "text", delta: text.slice(index, index + 6) };
       await sleep(1);
     }
+    const promptChars = request.messages.reduce((total, message) => total + message.content.length, 0);
+    yield {
+      type: "usage",
+      usage: {
+        input: Math.ceil(promptChars / 4),
+        output: Math.ceil(text.length / 4),
+        cacheRead: 0,
+        cacheWrite: 0,
+      },
+    };
     if (turn.toolCalls?.length) {
       const calls = turn.toolCalls.map((call, index) => ({
         id: `call_${this.callCounter}_${index}`,

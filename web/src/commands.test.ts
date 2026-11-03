@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { Member, RoomMessage, TaskCard } from "../../src/core/types";
-import type { MaskedSettings } from "./api";
+import { DEFAULT_LIMITS, type Member, type RoomMessage, type TaskCard } from "../../src/core/types";
+import type { MaskedModel, MaskedSettings } from "./api";
 import {
   buildContextReport,
   buildHelpReport,
+  buildModelReport,
   buildStatusReport,
   getSlashQuery,
+  parseModelCommand,
   parseSlashCommand,
   SLASH_COMMANDS,
   suggestSlashCommands,
@@ -24,7 +26,7 @@ function member(status: Member["status"], name = "成员"): Member {
     controlScope: "children",
     contextMode: "isolated",
     systemPrompt: "",
-    providerId: "demo",
+    modelRef: "demo/mock",
     createdAt: 0,
     lastActiveAt: 0,
   };
@@ -63,13 +65,47 @@ function task(status: TaskCard["status"], title: string): TaskCard {
   };
 }
 
+function maskedModel(id: string, name: string, contextWindow: number): MaskedModel {
+  return {
+    id,
+    name,
+    contextWindow,
+    maxTokens: 8192,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    status: "available",
+  };
+}
+
 const settings: MaskedSettings = {
   providers: [
-    { id: "demo", kind: "mock", model: "mock", hasApiKey: false },
-    { id: "deepseek", kind: "openai", model: "deepseek-chat", hasApiKey: true },
+    {
+      id: "demo",
+      api: "mock",
+      auth: "none",
+      hasApiKey: false,
+      models: [maskedModel("mock", "演示桩", 0)],
+    },
+    {
+      id: "deepseek",
+      api: "openai-completions",
+      auth: "api-key",
+      baseUrl: "https://api.deepseek.com/v1",
+      hasApiKey: true,
+      models: [maskedModel("deepseek-chat", "DeepSeek Chat", 128_000)],
+    },
   ],
-  activeProviderId: "deepseek",
+  selection: {
+    defaultModel: "deepseek/deepseek-chat",
+    aliases: { deepseek: "deepseek/deepseek-chat" },
+    fallbacks: ["demo/mock"],
+    modelParams: {},
+    params: {},
+    allow: [],
+  },
   limits: {
+    ...DEFAULT_LIMITS,
     maxRoomWindowChars: 200,
     contextWindowTokens: 64_000,
     maxActiveTranscriptBytes: "2mb",
@@ -133,6 +169,7 @@ describe("斜杠命令解析", () => {
       "clear",
       "stop",
       "status",
+      "model",
       "context",
     ]);
   });
@@ -188,6 +225,56 @@ describe("命令提示", () => {
   });
 });
 
+describe("/model 解析", () => {
+  const main: Member = { ...member("idle", "主智能体"), role: "main" };
+  const sub: Member = member("idle", "调研员");
+
+  it("空参数只列清单", () => {
+    expect(parseModelCommand("", [main, sub])).toEqual({ kind: "list" });
+  });
+
+  it("单个模型引用落到主智能体", () => {
+    expect(parseModelCommand("deepseek/deepseek-chat", [main, sub])).toEqual({
+      kind: "set",
+      memberId: main.id,
+      ref: "deepseek/deepseek-chat",
+    });
+    expect(parseModelCommand("default", [main, sub])).toEqual({
+      kind: "set",
+      memberId: main.id,
+      ref: "default",
+    });
+  });
+
+  it("@成员名或成员名加引用落到该成员", () => {
+    expect(parseModelCommand("@调研员 deepseek-chat", [main, sub])).toMatchObject({
+      kind: "set",
+      memberId: sub.id,
+      ref: "deepseek-chat",
+    });
+    expect(parseModelCommand("调研员 deepseek-chat extra", [main, sub])).toMatchObject({
+      kind: "set",
+      memberId: sub.id,
+      ref: "deepseek-chat extra",
+    });
+  });
+
+  it("找不到成员、主智能体按成员指定、缺少主智能体都给出中文错误", () => {
+    expect(parseModelCommand("@不存在 demo/mock", [main, sub])).toMatchObject({
+      kind: "list",
+      error: "没有找到成员 @不存在",
+    });
+    expect(parseModelCommand("主智能体 demo/mock", [main, sub])).toMatchObject({
+      kind: "list",
+      error: "主智能体直接用 /model <模型引用>",
+    });
+    expect(parseModelCommand("demo/mock", [sub])).toMatchObject({
+      kind: "list",
+      error: "没有找到主智能体",
+    });
+  });
+});
+
 describe("命令报告", () => {
   it("/status 汇总成员、任务、模型与文件", () => {
     const report = buildStatusReport(data());
@@ -197,22 +284,60 @@ describe("命令报告", () => {
     expect(report).toContain("消息：已加载 2 条");
     expect(report).toContain("任务：2（待办 1 · 完成 1）");
     expect(report).toContain("文件工作区：3 个文件");
-    expect(report).toContain("模型：deepseek · deepseek-chat");
+    expect(report).toContain("模型：deepseek/deepseek-chat");
   });
 
   it("/status 标记未配置密钥，并按需展示异常成员", () => {
+    const noKey: MaskedSettings = {
+      ...settings,
+      providers: settings.providers.map((provider) =>
+        provider.id === "deepseek" ? { ...provider, hasApiKey: false } : provider,
+      ),
+    };
     const report = buildStatusReport(
       data({
         members: [member("error", "故障成员")],
         tasks: [],
-        settings: { ...settings, activeProviderId: "demo" },
+        settings: noKey,
         workspaceFileCount: null,
       }),
     );
     expect(report).toContain("成员：1（运行中 0 · 空闲 0 · 异常 1）");
     expect(report).toContain("任务：0");
     expect(report).not.toContain("文件工作区");
-    expect(report).toContain("模型：demo · mock（未配置密钥）");
+    expect(report).toContain("模型：deepseek/deepseek-chat（未配置密钥）");
+  });
+
+  it("/status 不把 mock 供应商标成缺密钥", () => {
+    const report = buildStatusReport(
+      data({ settings: { ...settings, selection: { ...settings.selection, defaultModel: "demo/mock" } } }),
+    );
+    expect(report).toContain("模型：demo/mock");
+    expect(report).not.toContain("demo/mock（未配置密钥）");
+  });
+
+  it("/model 列出默认、备用、别名、各供应商模型与成员归属", () => {
+    const report = buildModelReport(data());
+    expect(report).toContain("· 默认：deepseek/deepseek-chat");
+    expect(report).toContain("· 备用：demo/mock");
+    expect(report).toContain("· 别名：deepseek→deepseek/deepseek-chat");
+    expect(report).toContain("· demo（mock）：mock");
+    expect(report).toContain("· deepseek（openai-completions）：deepseek-chat · 128k");
+    expect(report).toContain("成员：主智能体→demo/mock、调研员→demo/mock");
+    expect(report).toContain("/model @成员 <模型引用>");
+  });
+
+  it("/model 标出未配置密钥的供应商，且设置缺失时给出提示", () => {
+    const noKey: MaskedSettings = {
+      ...settings,
+      providers: settings.providers.map((provider) =>
+        provider.id === "deepseek" ? { ...provider, hasApiKey: false } : provider,
+      ),
+    };
+    expect(buildModelReport(data({ settings: noKey }))).toContain(
+      "deepseek-chat · 128k（未配置密钥）",
+    );
+    expect(buildModelReport(data({ settings: null }))).toContain("设置还没加载完");
   });
 
   it("/context 估算群聊窗口并展示预算与运行限制", () => {
@@ -229,7 +354,7 @@ describe("命令报告", () => {
     const report = buildContextReport(
       data({
         messages: [message("第一条消息", 1), message("第二条消息", 2)],
-        settings: { ...settings, limits: { maxRoomWindowChars: 10 } },
+        settings: { ...settings, limits: { ...DEFAULT_LIMITS, maxRoomWindowChars: 10 } },
       }),
     );
     expect(report).toContain("最近 1 条");
@@ -245,5 +370,58 @@ describe("命令报告", () => {
     expect(help).toContain("/new 只把聊天记录与任务卡归档起来");
     expect(help).toContain("/clear 连文件成果一起归档");
     expect(help).toContain("都能在右侧「归档」恢复");
+  });
+});
+
+describe("/model 命令", () => {
+  const main: Member = { ...member("idle", "主智能体"), role: "main" };
+  const sub = member("idle", "调研员");
+
+  it("空参数只列清单，单个模型引用落到主智能体", () => {
+    expect(parseModelCommand("", [main, sub])).toEqual({ kind: "list" });
+    expect(parseModelCommand("deepseek/deepseek-chat", [main, sub])).toEqual({
+      kind: "set",
+      memberId: main.id,
+      ref: "deepseek/deepseek-chat",
+    });
+    expect(parseModelCommand("default", [main, sub])).toEqual({
+      kind: "set",
+      memberId: main.id,
+      ref: "default",
+    });
+  });
+
+  it("带成员名或 @成员名时改该成员，并保留多段模型引用", () => {
+    expect(parseModelCommand("@调研员 deepseek/deepseek-reasoner", [main, sub])).toEqual({
+      kind: "set",
+      memberId: sub.id,
+      ref: "deepseek/deepseek-reasoner",
+    });
+    expect(parseModelCommand("调研员 deepseek chat", [main, sub])).toEqual({
+      kind: "set",
+      memberId: sub.id,
+      ref: "deepseek chat",
+    });
+  });
+
+  it("成员不存在或想把引用直接给主智能体时给出错误", () => {
+    expect(parseModelCommand("不存在 deepseek/x", [main, sub]).error).toContain("没有找到成员");
+    expect(parseModelCommand("@主智能体 deepseek/x", [main, sub]).error).toContain(
+      "主智能体直接用 /model",
+    );
+  });
+
+  it("报告列出默认、备用、别名、各供应商模型与成员当前引用", () => {
+    const report = buildModelReport(data({ members: [main, sub] }));
+    expect(report).toContain("默认：deepseek/deepseek-chat");
+    expect(report).toContain("备用：demo/mock");
+    expect(report).toContain("别名：deepseek→deepseek/deepseek-chat");
+    expect(report).toContain("deepseek（openai-completions）：deepseek-chat · 128k");
+    expect(report).toContain("主智能体→demo/mock");
+    expect(report).toContain("用法：/model <模型引用> 改主智能体");
+  });
+
+  it("设置未加载时给出提示而不是崩溃", () => {
+    expect(buildModelReport(data({ settings: null }))).toContain("设置还没加载完");
   });
 });

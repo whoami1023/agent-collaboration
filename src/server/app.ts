@@ -2,11 +2,32 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { createReadStream, existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Member, TaskStatus } from "../core/types";
-import { maskSettings, mergeSettings, sanitizeLimits } from "../core/settings";
+import {
+  clearProviderKey,
+  maskSettings,
+  mergeSettings,
+  removeProvider,
+  sanitizeLimits,
+  type Settings,
+} from "../core/settings";
+import {
+  THINKING_LEVELS,
+  type ProviderConfig,
+  type ResolvedModel,
+} from "../model/types";
+import { listModelRefs, resolveModelChain } from "../model/refs";
+import { catalogSuggestions } from "../model/catalog";
+import { probeModel } from "../model/probe";
+import {
+  sanitizeProviderPatch,
+  sanitizeProvidersPatch,
+  sanitizeSelectionPatch,
+} from "../model/sanitize";
 import { AuthError, type AuthService, type PublicUser } from "../auth/auth-service";
 import { buildClearSessionCookie, buildSessionCookie, readSessionToken } from "../auth/cookies";
 import { SkillError, type SkillRecord, type SkillLibrary } from "../skills/library";
 import { TemplateError, type AgentTemplateRecord, type TemplateLibrary } from "../templates/template-library";
+import { CronError, CRON_LIMITS } from "../cron/normalize";
 import {
   DEFAULT_SKILL_CATEGORY,
   SKILL_CATEGORIES,
@@ -56,6 +77,23 @@ function contentDisposition(name: string, inline: boolean): string {
     (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`,
   );
   return `${inline ? "inline" : "attachment"}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
+/** 模型卡片对外展示：请求头可能含密钥引用，一律不外传。 */
+function publicModelCard(model: ResolvedModel): Omit<ResolvedModel, "headers"> {
+  const { headers: _headers, ...rest } = model;
+  return rest;
+}
+
+/** 保存选择层时校验默认模型、别名与备用链都能解析，避免运行时才炸。 */
+function assertSelectionUsable(settings: Settings): void {
+  resolveModelChain(settings, settings.selection.defaultModel);
+  for (const target of Object.values(settings.selection.aliases)) {
+    resolveModelChain(settings, target);
+  }
+  for (const target of settings.selection.fallbacks) {
+    resolveModelChain(settings, target);
+  }
 }
 
 export function createApp(deps: AppDeps): express.Express {
@@ -482,6 +520,75 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
+  // ------------------------------------------------------------ 定时任务（cron）
+  // 定义、运行期状态与运行历史都归当前账号的工作区；REST 面用用户权限，可以看到整个账号的任务。
+
+  app.get("/api/crons", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    res.json({
+      jobs: workspace.cron.listJobs(currentUser(res).id),
+      status: workspace.cron.status(currentUser(res).id),
+      limits: CRON_LIMITS,
+    });
+  });
+
+  app.get("/api/crons/runs", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const jobId = queryField(req, "job_id");
+    const limit = Number(queryField(req, "limit")) || undefined;
+    const offset = Number(queryField(req, "offset")) || undefined;
+    res.json(
+      workspace.cron.listRuns(currentUser(res).id, {
+        ...(jobId ? { jobId } : {}),
+        ...(limit ? { limit } : {}),
+        ...(offset ? { offset } : {}),
+      }),
+    );
+  });
+
+  app.post("/api/crons", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const job = await workspace.cron.createJob(currentUser(res).id, bodyOf(req));
+    res.status(201).json({ job, view: workspace.cron.getJob(currentUser(res).id, job.id) });
+  });
+
+  app.patch("/api/crons/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const userId = currentUser(res).id;
+    const job = await workspace.cron.updateJob(userId, String(req.params["id"] ?? ""), bodyOf(req));
+    res.json({ job, view: workspace.cron.getJob(userId, job.id) });
+  });
+
+  /** 只切启用开关：停用保留记录与历史，重新启用会清掉自动停用标记并按新调度武装。 */
+  app.post("/api/crons/:id/enabled", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const userId = currentUser(res).id;
+    const job = await workspace.cron.setEnabled(
+      userId,
+      String(req.params["id"] ?? ""),
+      bodyOf(req)["enabled"] === true,
+    );
+    res.json({ job, view: workspace.cron.getJob(userId, job.id) });
+  });
+
+  /** 立刻试跑一次：默认等这一轮落账再返回记录；wait=false 只发起，结果靠 SSE 的 cron-run 事件。 */
+  app.post("/api/crons/:id/run", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const run = await workspace.cron.runNow(currentUser(res).id, String(req.params["id"] ?? ""), {
+      wait: bodyOf(req)["wait"] !== false,
+    });
+    res.json({ run });
+  });
+
+  app.delete("/api/crons/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const removed = await workspace.cron.removeJob(
+      currentUser(res).id,
+      String(req.params["id"] ?? ""),
+    );
+    res.json({ removed: removed.id });
+  });
+
   app.post("/api/members", async (req: Request, res: Response) => {
     const body = bodyOf(req);
     const name = stringField(body, "name");
@@ -762,16 +869,152 @@ export function createApp(deps: AppDeps): express.Express {
   app.put("/api/settings", async (req: Request, res: Response) => {
     const workspace = await workspaceFor(res);
     try {
-      const body = bodyOf(req) as Parameters<typeof mergeSettings>[1];
-      const next = mergeSettings(workspace.getSettings(), {
-        ...body,
-        ...(body.limits === undefined ? {} : { limits: sanitizeLimits(body.limits) }),
+      const body = bodyOf(req);
+      const current = workspace.getSettings();
+      const providers =
+        body.providers !== undefined ? sanitizeProvidersPatch(body.providers) : undefined;
+      const selection =
+        body.selection !== undefined
+          ? sanitizeSelectionPatch(body.selection, current.selection)
+          : undefined;
+      const limits = body.limits !== undefined ? sanitizeLimits(body.limits) : undefined;
+      const next = mergeSettings(current, {
+        ...(providers ? { providers } : {}),
+        ...(selection ? { selection } : {}),
+        ...(limits ? { limits } : {}),
       });
+      // 默认模型 / 别名 / 备用链指向不存在的模型时立刻报错，避免运行时才炸。
+      assertSelectionUsable(next);
       await workspace.setSettings(next);
       res.json({ settings: maskSettings(next) });
     } catch (err) {
       res.status(400).json({ error: errorMessage(err) });
     }
+  });
+
+  app.delete("/api/settings/providers/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const providerId = String(req.params["id"] ?? "").trim();
+    if (!workspace.getSettings().providers.some((provider) => provider.id === providerId)) {
+      res.status(404).json({ error: "供应商不存在" });
+      return;
+    }
+    const next = removeProvider(workspace.getSettings(), providerId);
+    await workspace.setSettings(next);
+    res.json({ settings: maskSettings(next) });
+  });
+
+  // 清除已存密钥：面板上密钥输入框留空提交不会清除，必须走这个显式入口。
+  app.delete("/api/settings/providers/:id/key", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const providerId = String(req.params["id"] ?? "").trim();
+    if (!workspace.getSettings().providers.some((provider) => provider.id === providerId)) {
+      res.status(404).json({ error: "供应商不存在" });
+      return;
+    }
+    const next = clearProviderKey(workspace.getSettings(), providerId);
+    await workspace.setSettings(next);
+    res.json({ settings: maskSettings(next) });
+  });
+
+  // 可选模型清单（含目录解析后的窗口/输出上限与定价），供成员模型选择器和设置面板展示。
+  app.get("/api/models", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const settings = workspace.getSettings();
+    res.json({
+      defaultModel: settings.selection.defaultModel,
+      aliases: settings.selection.aliases,
+      models: listModelRefs(settings).map(publicModelCard),
+    });
+  });
+
+  // 内置模型目录建议：新增供应商时一键带出窗口、输出上限与定价。
+  app.get("/api/models/catalog", (req: Request, res: Response) => {
+    const provider = queryField(req, "provider").trim();
+    if (!provider) {
+      res.status(400).json({ error: "缺少 provider 参数" });
+      return;
+    }
+    res.json({
+      suggestions: catalogSuggestions(provider).map(({ ref, row }) => ({
+        ref,
+        modelId: ref.slice(provider.length + 1),
+        ...row,
+      })),
+    });
+  });
+
+  // 测试连接：ref 为已保存的模型引用；provider 允许直接测面板里未保存的表单配置。
+  app.post("/api/models/probe", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    const ref = typeof body.ref === "string" ? body.ref.trim() : "";
+    const temp = body.provider;
+    if (!ref && (!temp || typeof temp !== "object")) {
+      res.status(400).json({ error: "请提供 ref 或 provider" });
+      return;
+    }
+    let providerPatch: Partial<ProviderConfig> & { id: string } | undefined;
+    try {
+      providerPatch = temp
+        ? sanitizeProviderPatch(temp)
+        : undefined;
+    } catch (err) {
+      res.status(400).json({ error: errorMessage(err) });
+      return;
+    }
+    try {
+      const result = await probeModel(
+        { ...(ref ? { ref } : {}), ...(providerPatch ? { provider: providerPatch } : {}) },
+        { settings: workspace.getSettings(), dataDir: workspace.dirPath },
+      );
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: errorMessage(err) });
+    }
+  });
+
+  app.get("/api/models/usage", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const rawDays = Number(req.query.days);
+    const days = Number.isFinite(rawDays) ? Math.max(1, Math.min(120, Math.floor(rawDays))) : 7;
+    const providerId = typeof req.query.providerId === "string" ? req.query.providerId : undefined;
+    res.json(await workspace.usage.snapshot({ days, ...(providerId ? { providerId } : {}) }));
+  });
+
+  // 成员级模型：`provider/model`、别名或 default（跟随设置里的默认模型）。
+  app.put("/api/members/:id/model", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const member = workspace.bus.getMember(String(req.params["id"] ?? ""));
+    if (!member) {
+      res.status(404).json({ error: "成员不存在" });
+      return;
+    }
+    const body = bodyOf(req);
+    const modelRef = typeof body.ref === "string" ? body.ref.trim() : "";
+    if (!modelRef) {
+      res.status(400).json({ error: "ref 不能为空" });
+      return;
+    }
+    const level = body.thinkingLevel;
+    if (level !== undefined && level !== null && !THINKING_LEVELS.includes(level as never)) {
+      res.status(400).json({ error: "thinkingLevel 只支持 off、minimal、low、medium、high、xhigh、max" });
+      return;
+    }
+    try {
+      // 校验引用可解析（存在、未被允许列表排除），再落到成员档案上。
+      resolveModelChain(workspace.getSettings(), modelRef);
+    } catch (err) {
+      res.status(400).json({ error: errorMessage(err) });
+      return;
+    }
+    // 原对象就地更新：MemberRuntime 缓存的引用与总线上的成员是同一条记录。
+    member.modelRef = modelRef;
+    if (level === null || level === undefined) delete member.thinkingLevel;
+    else member.thinkingLevel = level as Member["thinkingLevel"];
+    workspace.bus.updateMember(member);
+    await workspace.persist();
+    res.json({ member });
   });
 
   if (existsSync(deps.webDist)) {
@@ -791,7 +1034,12 @@ export function createApp(deps: AppDeps): express.Express {
       res.status(err.status).json({ error: err.message });
       return;
     }
-    if (err instanceof AuthError || err instanceof SkillError || err instanceof TemplateError) {
+    if (
+      err instanceof AuthError ||
+      err instanceof SkillError ||
+      err instanceof TemplateError ||
+      err instanceof CronError
+    ) {
       const retryAfterMs = err instanceof AuthError ? err.retryAfterMs : undefined;
       if (retryAfterMs) {
         res.setHeader("retry-after", String(Math.ceil(retryAfterMs / 1000)));

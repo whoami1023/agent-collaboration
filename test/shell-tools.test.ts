@@ -35,7 +35,7 @@ const member: Member = {
   controlScope: "none",
   contextMode: "isolated",
   systemPrompt: "",
-  providerId: "p1",
+  modelRef: "default",
   createdAt: 0,
   lastActiveAt: 0,
 };

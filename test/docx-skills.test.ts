@@ -9,7 +9,7 @@ import { Orchestrator, ensureMainMember } from "../src/agent/orchestrator";
 import { RoomBus } from "../src/room/bus";
 import { Workboard } from "../src/workboard/board";
 import { DEFAULT_LIMITS, type Member, type PublicUser } from "../src/core/types";
-import { SETTINGS_VERSION, type Settings } from "../src/core/settings";
+import { defaultSettings, type Settings } from "../src/core/settings";
 import { BUILTIN_SHARED_SKILLS, BUILTIN_SKILLS_VERSION } from "../src/skills/builtin";
 import { builtinCategoryOf } from "../src/skills/categories";
 import { SkillLibrary } from "../src/skills/library";
@@ -225,7 +225,7 @@ describe("预装的 Word 技能能直接被智能体调用", () => {
     controlScope: "none",
     contextMode: "isolated",
     systemPrompt: "",
-    providerId: "p1",
+    modelRef: "demo/mock",
     createdAt: 0,
     lastActiveAt: 0,
   };
@@ -316,9 +316,8 @@ describe("预装的 Word 技能能直接被智能体调用", () => {
       const board = new Workboard("room_docx");
       ensureMainMember(bus);
       const settings: Settings = {
-        settingsVersion: SETTINGS_VERSION,
-        providers: [{ id: "demo", kind: "mock", model: "mock" }],
-        activeProviderId: "demo",
+        ...defaultSettings(),
+        providers: [{ id: "demo", api: "mock", models: [{ id: "mock" }] }],
         limits: { ...DEFAULT_LIMITS, maxStepsPerRun: 8, runTimeoutMs: 60_000 },
       };
       const orchestrator = new Orchestrator({

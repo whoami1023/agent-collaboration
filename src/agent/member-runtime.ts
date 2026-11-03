@@ -4,29 +4,53 @@ import { newId } from "../core/ids";
 import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
 import type { LlmMessage } from "../provider/types";
-import { resolveProvider, type ProviderDeps } from "../provider/registry";
+import {
+  resolveModelRuntime,
+  type ModelTransport,
+  type RuntimeDeps as ModelRuntimeDeps,
+} from "../model/registry";
+import { addUsage, calculateUsageCost, emptyUsage, type UsageTotals } from "../model/usage-cost";
+import type { ModelUsageStore } from "../model/usage-store";
 import type { SkillLibrary } from "../skills/library";
 import { selectSkillsForMember } from "../skills/selection";
 import type { MemorySearchManager } from "../memory/manager";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import { resolveTriggerRecall } from "../memory/recall";
 import { runAgentLoop } from "./loop";
+import { CRON_SENDER_ID } from "../cron/types";
+import type { CronService } from "../cron/service";
+import { resolveSilentReply } from "../cron/run-prompt";
 import { DEFAULT_COMPACTION_SETTINGS } from "./context/compaction";
 import { resolveMaxActiveTranscriptBytes, type TranscriptByteCompactionLatch } from "./context/bounded-context";
 import type { ContextBudgetConfig } from "./context/budget";
 import { buildTools } from "./tools";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
 
+export interface MemberUsageRecord {
+  ref: string;
+  providerId: string;
+  modelId: string;
+  usage: UsageTotals;
+  costUsd: number;
+}
+
 export interface RuntimeDeps {
   bus: RoomBus;
   board: Workboard;
-  getProviderDeps(): ProviderDeps;
+  /** 模型设置解析所需的当前设置（含 mock handler 与工作区目录）。 */
+  getModelDeps(): ModelRuntimeDeps;
   getLimits(): Limits;
   skills: SkillLibrary;
   ownerId: string;
+  /** 本账号的定时任务调度器；成员用它给自己和用户建任务。 */
+  getCron?(): CronService | undefined;
   memory?: MemorySearchManager;
   files?: WorkspaceFiles;
+  /** 用量账本；未提供时只不发事件，不落盘。 */
+  usage?: ModelUsageStore;
   onFinished?(memberId: string): void;
+  /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
+  onUsageRecord?(record: MemberUsageRecord): void;
 }
 
 function isAbort(err: unknown): boolean {
@@ -113,6 +137,9 @@ export class MemberRuntime {
     this.setStatus("running");
     this.emit({ type: "run-start", runId, memberId: this.member.id });
 
+    // 运行中止或报错时也要把已产生的 token 用量入账，所以记账函数声明在 try 外。
+    let flushUsage: () => void = () => {};
+
     try {
       const taskTitles = new Map<string, string>();
       for (const task of board.list()) {
@@ -132,6 +159,7 @@ export class MemberRuntime {
         board,
         skills: this.deps.skills,
         userId: this.deps.ownerId,
+        getCron: () => this.deps.getCron?.(),
         ...(this.deps.memory ? { memory: this.deps.memory } : {}),
         ...(this.deps.files ? { files: this.deps.files } : {}),
       });
@@ -170,12 +198,57 @@ export class MemberRuntime {
             `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(member, trigger, bus.roomMode)}`,
         },
       ];
-      const { provider, model } = resolveProvider(this.member.providerId, this.deps.getProviderDeps());
+      const transport = resolveModelRuntime(
+        member.modelRef,
+        {
+          ...this.deps.getModelDeps(),
+          ...(member.thinkingLevel ? { thinkingLevel: member.thinkingLevel } : {}),
+        },
+        (from, to, error) =>
+          this.notice(`模型 ${from} 调用失败（${error}），本轮改用备用模型 ${to}`),
+      );
+      const modelsByRef = new Map<string, ModelTransport["model"]>();
+      for (const candidate of [transport.chain.primary, ...transport.chain.fallbacks]) {
+        modelsByRef.set(candidate.ref, candidate);
+      }
+      const usageByRef = new Map<string, { usage: UsageTotals; costUsd: number }>();
+      const collectUsage = (usage: UsageTotals): void => {
+        const ref = transport.activeRef() || transport.model.ref;
+        const model = modelsByRef.get(ref) ?? transport.model;
+        const previous = usageByRef.get(ref) ?? { usage: emptyUsage(), costUsd: 0 };
+        usageByRef.set(ref, {
+          usage: addUsage(previous.usage, usage),
+          costUsd: previous.costUsd + calculateUsageCost(model, usage),
+        });
+      };
+      flushUsage = (): void => {
+        for (const [ref, entry] of usageByRef) {
+          const model = modelsByRef.get(ref) ?? transport.model;
+          this.deps.usage?.record({
+            ref,
+            providerId: model.providerId,
+            modelId: model.id,
+            usage: entry.usage,
+            costUsd: entry.costUsd,
+          });
+          this.deps.onUsageRecord?.({
+            ref,
+            providerId: model.providerId,
+            modelId: model.id,
+            usage: entry.usage,
+            costUsd: entry.costUsd,
+          });
+        }
+        usageByRef.clear();
+      };
 
+      // 上下文预算优先用模型目录里的窗口，设置里的全局值只作为没有目录信息时的兜底。
+      const contextWindowTokens =
+        transport.model.contextTokens > 0
+          ? Math.min(transport.model.contextTokens, limits.contextWindowTokens ?? Number.POSITIVE_INFINITY)
+          : limits.contextWindowTokens;
       const budget: ContextBudgetConfig = {
-        ...(limits.contextWindowTokens && limits.contextWindowTokens > 0
-          ? { contextWindowTokens: limits.contextWindowTokens }
-          : {}),
+        ...(contextWindowTokens && contextWindowTokens > 0 ? { contextWindowTokens } : {}),
         ...(resolveMaxActiveTranscriptBytes(limits.maxActiveTranscriptBytes) !== undefined
           ? { maxActiveTranscriptBytes: resolveMaxActiveTranscriptBytes(limits.maxActiveTranscriptBytes) }
           : {}),
@@ -183,8 +256,10 @@ export class MemberRuntime {
       };
 
       const result = await runAgentLoop({
-        provider,
-        model,
+        provider: transport.provider,
+        model: transport.model.id,
+        request: transport.request,
+        onUsage: collectUsage,
         system,
         messages,
         tools,
@@ -232,7 +307,14 @@ export class MemberRuntime {
         return;
       }
 
-      if (result.text) {
+      // 定时任务的静默交付（OpenClaw 的 NO_REPLY）：整条回复只是静默标记时群里不发这条消息，
+      // 但终局事件仍带原文，让 CronService 照常记账。
+      const silent =
+        !!result.text &&
+        trigger.senderId === CRON_SENDER_ID &&
+        resolveSilentReply(result.text).quiet;
+
+      if (result.text && !silent) {
         const message = bus.append({
           senderId: this.member.id,
           senderName: this.member.name,
@@ -248,7 +330,7 @@ export class MemberRuntime {
         if (trigger.taskId) board.linkMessage(trigger.taskId, message.id);
         this.emit({ type: "run-final", runId, memberId: this.member.id, text: result.text });
       } else {
-        this.emit({ type: "run-final", runId, memberId: this.member.id, text: "" });
+        this.emit({ type: "run-final", runId, memberId: this.member.id, text: result.text ?? "" });
       }
       if (result.maxStepsReached) {
         this.notice(
@@ -282,6 +364,7 @@ export class MemberRuntime {
       this.notice(`@${this.member.name} 运行失败：${detail}`);
       this.setStatus("error");
     } finally {
+      flushUsage();
       clearTimeout(timeout);
       this.controller = null;
       this.silentAbort = false;

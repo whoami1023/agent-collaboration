@@ -12,6 +12,8 @@ import { formatRoomWindow } from "./prompts";
 import { buildWebTools, type WebToolOptions } from "../web/tools";
 import { buildFileTools } from "./file-tools";
 import { buildShellTools } from "./shell-tools";
+import { buildCronTools } from "./cron-tools";
+import type { CronService } from "../cron/service";
 
 export interface ToolDeps {
   bus: RoomBus;
@@ -22,6 +24,8 @@ export interface ToolDeps {
   files?: WorkspaceFiles;
   /** 联网工具注入点：单测可替换 fetch/DNS，生产环境留空走真实网络。 */
   web?: WebToolOptions;
+  /** 定时任务服务：工作区加载后才有；未接上时智能体看不到 cron 工具。 */
+  getCron?: () => CronService | undefined;
 }
 
 const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done", "failed"];
@@ -278,6 +282,12 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
 
   // 联网检索与正文抓取：内置共享技能 web-search / web-fetch / web-browse 的执行底座。
   tools.push(...buildWebTools(deps.web));
+
+  // 定时任务：调度器由工作区注入，未接上时这个工具压根不出现在清单里。
+  const cron = deps.getCron?.();
+  if (cron) {
+    tools.push(...buildCronTools({ cron, bus: deps.bus, member, ownerId: deps.userId }));
+  }
 
   return tools;
 }

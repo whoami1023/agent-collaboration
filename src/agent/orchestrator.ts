@@ -1,15 +1,21 @@
 import type { Limits, Member, RoomMessage, RoomMode } from "../core/types";
-import { DEFAULT_PROVIDER_ID, SYSTEM_ID, USER_ID } from "../core/types";
+import { DEFAULT_MODEL_REF, SYSTEM_ID, USER_ID } from "../core/types";
 import type { Settings } from "../core/settings";
+import type { ModelUsageStore } from "../model/usage-store";
+import type { MemberUsageRecord } from "./member-runtime";
 import { newId } from "../core/ids";
 import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
 import { decideWakes } from "../room/wake";
 import type { SkillLibrary } from "../skills/library";
+import { selectSkillsForText } from "../skills/matching";
 import type { MemberProfileHints } from "../memory/bootstrap-files";
 import type { MemorySearchManager } from "../memory/manager";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import { MemberRuntime } from "./member-runtime";
+import { CRON_SENDER_ID } from "../cron/types";
+import type { CronTurnOutcome } from "../cron/types";
+import type { CronService } from "../cron/service";
 import type { MockHandler } from "../provider/mock";
 import { resolveSpawnAdmission, countChildren } from "./spawn/spawn-plan";
 import { reserveChildAdmissionSlot } from "./spawn/child-admission";
@@ -24,6 +30,10 @@ export interface OrchestratorDeps {
   mockHandler?: MockHandler;
   memory?: MemorySearchManager;
   files?: WorkspaceFiles;
+  /** 解析 `file:` 密钥引用的工作区目录。 */
+  dataDir?: string;
+  usage?: ModelUsageStore;
+  onUsageRecord?(record: MemberUsageRecord): void;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -40,7 +50,7 @@ export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
     controlScope: "children",
     contextMode: "isolated",
     systemPrompt: "",
-    providerId: DEFAULT_PROVIDER_ID,
+    modelRef: DEFAULT_MODEL_REF,
     createdAt: Date.now(),
     lastActiveAt: Date.now(),
   };
@@ -64,6 +74,8 @@ export class Orchestrator {
   /** 自由交流模式的汇总定时器与最后一次成员报告。 */
   private collectorTimer: NodeJS.Timeout | null = null;
   private collectorDue: RoomMessage | null = null;
+  /** 定时任务调度器：宿主需要编排器，所以由工作区在两边都建好之后回灌。 */
+  private cronService?: CronService;
 
   constructor(private readonly deps: OrchestratorDeps) {
     deps.bus.subscribe((event) => {
@@ -99,6 +111,94 @@ export class Orchestrator {
 
   cancelMember(memberId: string): boolean {
     return this.runtimes.get(memberId)?.cancel() ?? false;
+  }
+
+  /** 工作区建好调度器之后回灌：成员工具通过它读写本账号的定时任务。 */
+  setCron(cron: CronService): void {
+    this.cronService = cron;
+  }
+
+  /**
+   * 定时任务的群聊入口（OpenClaw cron → agent session 投递的本项目等价物）：
+   * 把无人值守指令作为系统消息发进群，唤醒目标成员，并观测它这一轮的终局事件作为运行结果。
+   * 指令本身不来自用户，所以走 senderKind=system —— 不会被常规的唤醒规则二次广播。
+   */
+  async runScheduledTurn(params: {
+    text: string;
+    targetMemberId?: string;
+    timeoutMs?: number;
+  }): Promise<CronTurnOutcome> {
+    const bus = this.deps.bus;
+    const requested = params.targetMemberId ? bus.getMember(params.targetMemberId) : undefined;
+    const target = requested ?? bus.listMembers().find((member) => member.role === "main");
+    if (!target) return { status: "no-target", text: "", error: "作战室里没有可唤醒的成员" };
+    if (target.status === "cancelled") {
+      return { status: "no-target", text: "", memberId: target.id, error: `成员 @${target.name} 已取消运行` };
+    }
+    const message = bus.append({
+      senderId: CRON_SENDER_ID,
+      senderName: "定时任务",
+      senderKind: "system",
+      kind: "system",
+      text: params.text,
+      mentions: [target.id],
+      depthTurn: 0,
+    });
+    const timeoutMs =
+      params.timeoutMs && params.timeoutMs > 0
+        ? params.timeoutMs
+        : this.deps.getSettings().limits.runTimeoutMs + 30_000;
+    return await this.observeScheduledRun(target.id, message, timeoutMs);
+  }
+
+  /** 观测被唤醒成员的终局事件：已经在跑的运行会被 steering 接住，其收尾同样算这次投递的结果。 */
+  private observeScheduledRun(
+    memberId: string,
+    trigger: RoomMessage,
+    timeoutMs: number,
+  ): Promise<CronTurnOutcome> {
+    const startedRuns = new Set<string>();
+    const wasRunning = this.runtimes.get(memberId)?.isRunning === true;
+    return new Promise<CronTurnOutcome>((resolve) => {
+      let settled = false;
+      const finish = (outcome: CronTurnOutcome) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsubscribe();
+        resolve(outcome);
+      };
+      const unsubscribe = this.deps.bus.subscribe((event) => {
+        if (settled || event.type !== "run") return;
+        const run = event.event;
+        if (run.memberId !== memberId) return;
+        if (run.type === "run-start") {
+          startedRuns.add(run.runId);
+          return;
+        }
+        if (run.type === "run-final") {
+          if (!wasRunning && !startedRuns.has(run.runId)) return;
+          finish({ status: "ok", text: run.text, memberId });
+          return;
+        }
+        if (run.type === "run-error") {
+          finish({ status: "error", text: "", memberId, error: run.error });
+          return;
+        }
+        if (run.type === "run-aborted") {
+          finish({ status: "aborted", text: "", memberId, error: "本次运行被中止" });
+        }
+      });
+      const timer = setTimeout(() => {
+        finish({
+          status: "timeout",
+          text: "",
+          memberId,
+          error: `本次定时运行超过 ${Math.round(timeoutMs / 1000)} 秒没有回音`,
+        });
+      }, timeoutMs);
+      this.wake(memberId, trigger);
+    });
   }
 
   /** 切换作战室的任务完成模式；模式随群聊状态持久化，下一条消息与下一次运行立即生效。 */
@@ -183,13 +283,26 @@ export class Orchestrator {
     if (!admission.ok) throw new Error(admission.error);
 
     try {
-      const allowed = new Set(
-        this.deps.skills.listForAgent(this.deps.ownerId).map((skill) => skill.name),
-      );
+      const usable = this.deps.skills
+        .listForAgent(this.deps.ownerId)
+        .map((skill) => ({
+          name: skill.name,
+          description: skill.description,
+          category: skill.category,
+        }));
+      const allowed = new Set(usable.map((skill) => skill.name));
       // 模板里的技能可能已被删除或属于别人：只带过去当前可用的，剩下的不阻塞创建。
-      const skillNames = (input.skillNames ?? [])
+      const explicit = (input.skillNames ?? [])
         .map((name) => name.trim().toLowerCase())
         .filter((name, index, all) => allowed.has(name) && all.indexOf(name) === index);
+      // 新建成员只给了一句功能描述时，按描述挑几个对口技能，而不是把整个技能库塞给它：
+      // 技能越多，智能体越容易在无关的说明书上浪费上下文，也越容易误用工具。
+      const autoSkillNames =
+        explicit.length === 0 && !input.template
+          ? selectSkillsForText(description, usable)
+          : [];
+      const skillNames = explicit.length > 0 ? explicit : autoSkillNames;
+      const autoChose = explicit.length === 0 && !input.template;
       const member: Member = {
         id: newId("m"),
         roomId: bus.roomId,
@@ -206,7 +319,7 @@ export class Orchestrator {
         ...(input.template
           ? { templateKey: input.template.key, templateTitle: input.template.title }
           : {}),
-        providerId: DEFAULT_PROVIDER_ID,
+        modelRef: DEFAULT_MODEL_REF,
         createdAt: Date.now(),
         lastActiveAt: Date.now(),
       };
@@ -224,7 +337,9 @@ export class Orchestrator {
           ? `已按模板「${input.template.title}」创建成员 @${member.name}${
               skillNames.length > 0 ? `，可用技能 ${skillNames.length} 个` : ""
             }。`
-          : `已创建成员 @${member.name}：${description}`,
+          : autoChose && skillNames.length === 0
+            ? `已创建成员 @${member.name}：${description}\n描述里没匹配到对口技能，暂时不限技能（可用技能 ${usable.length} 个）；想收紧到某几个，在成员的「智能体文件 · 技能」里勾选。`
+            : `已创建成员 @${member.name}：${description}\n按功能描述启用了 ${skillNames.length} 个技能：${skillNames.join("、")}。可在成员的「智能体文件 · 技能」里增减。`,
       });
       return member;
     } finally {
@@ -380,15 +495,19 @@ export class Orchestrator {
       runtime = new MemberRuntime(member, {
         bus: deps.bus,
         board: deps.board,
-        getProviderDeps: () => ({
+        getModelDeps: () => ({
           settings: deps.getSettings(),
           ...(deps.mockHandler ? { mockHandler: deps.mockHandler } : {}),
+          ...(deps.dataDir ? { dataDir: deps.dataDir } : {}),
         }),
         getLimits: () => deps.getSettings().limits,
         skills: deps.skills,
         ownerId: deps.ownerId,
+        getCron: () => this.cronService,
         ...(deps.memory ? { memory: deps.memory } : {}),
         ...(deps.files ? { files: deps.files } : {}),
+        ...(deps.usage ? { usage: deps.usage } : {}),
+        ...(deps.onUsageRecord ? { onUsageRecord: deps.onUsageRecord } : {}),
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });
       this.runtimes.set(member.id, runtime);
