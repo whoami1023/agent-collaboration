@@ -3258,6 +3258,137 @@ body.pane-dragging * {
   min-width: 140px;
 }
 
+/* 常用配置保持简短，高级能力按需展开。 */
+.model-quick {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+
+.model-quick .modal-actions {
+  padding-top: 2px;
+}
+
+.model-add-provider,
+.model-advanced {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+
+.model-add-provider > summary,
+.model-advanced > summary {
+  padding: 11px 14px;
+  color: var(--text-strong);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+
+.model-add-provider[open] > summary,
+.model-advanced[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.model-add-provider[open] {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 14px;
+}
+
+.model-add-provider > :not(summary),
+.model-advanced > :not(summary) {
+  margin-right: 14px;
+  margin-left: 14px;
+}
+
+.model-advanced[open] {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-bottom: 16px;
+}
+
+.model-advanced[open] > :nth-child(2) {
+  margin-top: 14px;
+}
+
+.model-presets {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.preset-card {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-strong);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.16s var(--ease), background 0.16s var(--ease);
+}
+
+.preset-card:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.preset-card strong {
+  color: var(--text-strong);
+  font-size: var(--text-sm);
+}
+
+.preset-card span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preset-card:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.model-custom-provider {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.model-mock-note {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--accent-subtle);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+}
+
+.model-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.model-table-wrap .model-table {
+  min-width: 900px;
+}
+
 .model-table {
   width: 100%;
   border-collapse: collapse;
@@ -4861,7 +4992,9 @@ body.pane-dragging * {
   }
 
   .profile-meta,
-  .field-row {
+  .field-row,
+  .model-presets,
+  .model-custom-provider {
     grid-template-columns: 1fr;
   }
 

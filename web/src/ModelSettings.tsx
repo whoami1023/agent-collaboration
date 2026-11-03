@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
+  CatalogSuggestion,
   MaskedProvider,
   MaskedSettings,
   ModelPatch,
@@ -15,7 +16,6 @@ import {
   probeModel,
   saveSettings,
 } from "./api";
-import type { CatalogSuggestion } from "./api";
 
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -28,6 +28,22 @@ const API_LABELS: Record<string, string> = {
 };
 
 const MODEL_STATUSES = ["available", "deprecated", "disabled"];
+
+/**
+ * 预设供应商：让「选一个服务商就能用」变成一步操作。
+ * 选择预设后自动带出 baseUrl 与常用模型，用户只需填 API Key。
+ */
+const PROVIDER_PRESETS: Array<{
+  id: string;
+  label: string;
+  baseUrl: string;
+  models: string[];
+}> = [
+  { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"] },
+  { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", models: ["gpt-4o-mini", "gpt-4o", "o4-mini"] },
+  { id: "moonshot", label: "Moonshot (Kimi)", baseUrl: "https://api.moonshot.cn/v1", models: ["moonshot-v1-8k"] },
+  { id: "zhipu", label: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", models: ["glm-4"] },
+];
 
 /** 表单里的草稿：数字统一用字符串存，提交时再解析，输入过程不会被四舍五入打断。 */
 interface ModelDraft {
@@ -75,6 +91,19 @@ function providerToDraft(provider: MaskedProvider): ProviderDraft {
     timeoutSeconds: provider.timeoutSeconds ? String(provider.timeoutSeconds) : "",
     maxTokens: provider.maxTokens ? String(provider.maxTokens) : "",
     models: provider.models.map(modelToDraft),
+  };
+}
+
+function blankModel(id = ""): ModelDraft {
+  return {
+    id,
+    name: "",
+    contextWindow: "",
+    maxTokens: "",
+    reasoning: false,
+    status: "available",
+    costInput: "",
+    costOutput: "",
   };
 }
 
@@ -158,14 +187,22 @@ export function ModelSettings({
   const [newProviderId, setNewProviderId] = useState("");
   const [suggestion, setSuggestion] = useState("");
   const [suggestions, setSuggestions] = useState<CatalogSuggestion[]>([]);
+  // 简单表单里「默认模型」与「API Key」就地编辑，保存时一起提交。
+  const [defaultModel, setDefaultModel] = useState(settings.selection.defaultModel);
+  const [apiKey, setApiKey] = useState("");
 
   // 切换供应商或保存后回到服务端快照，避免草稿停留在旧值上。
   useEffect(() => {
     const current = settings.providers.find((item) => item.id === selectedId);
     setDraft(current ? providerToDraft(current) : null);
+    setApiKey("");
     setProbe(null);
     setNote(null);
   }, [selectedId, settings]);
+
+  useEffect(() => {
+    setDefaultModel(settings.selection.defaultModel);
+  }, [settings.selection.defaultModel]);
 
   useEffect(() => {
     if (!provider || provider.api === "mock") {
@@ -193,51 +230,50 @@ export function ModelSettings({
     return refs;
   }, [settings.providers]);
 
-  if (!provider || !draft) {
-    return (
-      <div className="settings-form">
-        <div className="section-label">模型服务</div>
-        <p className="hint">还没有供应商。填一个 id（如 <code>deepseek</code>）新建一个。</p>
-        <div className="field-row">
-          <input
-            value={newProviderId}
-            placeholder="新供应商 id（字母、数字、点、下划线、连字符）"
-            onChange={(event) => setNewProviderId(event.target.value)}
-          />
-          <button
-            className="btn primary"
-            type="button"
-            onClick={() => void handleCreate()}
-          >
-            新建供应商
-          </button>
-        </div>
-        {error && <p className="form-error">{error}</p>}
-      </div>
-    );
-
-    async function handleCreate() {
-      const id = newProviderId.trim();
-      if (!id) {
-        setError("请填写供应商 id");
-        return;
-      }
-      setBusy(true);
-      setError(null);
-      try {
-        onSaved(await saveSettings({ providers: [{ id, api: "openai-completions", models: [] }] }));
-        setSelectedId(id);
-        setNewProviderId("");
-      } catch (err) {
-        setError(messageOf(err));
-      } finally {
-        setBusy(false);
-      }
+  async function handleCreate(id: string): Promise<void> {
+    const trimmed = id.trim();
+    if (!trimmed) {
+      setError("请填写供应商 id");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      onSaved(await saveSettings({ providers: [{ id: trimmed, api: "openai-completions", models: [] }] }));
+      setSelectedId(trimmed);
+      setNewProviderId("");
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
     }
   }
 
-  const editorDraft = draft;
-  const patched = settings.providers.find((item) => item.id === editorDraft.id) ?? provider;
+  /** 从预设新建供应商：自动带出 baseUrl 与常用模型。 */
+  async function handleApplyPreset(preset: (typeof PROVIDER_PRESETS)[number]): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      onSaved(
+        await saveSettings({
+          providers: [
+            {
+              id: preset.id,
+              api: "openai-completions",
+              baseUrl: preset.baseUrl,
+              models: preset.models.map((modelId) => ({ id: modelId })),
+            },
+          ],
+        }),
+      );
+      setSelectedId(preset.id);
+      setNewProviderId("");
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   function updateModel(index: number, patch: Partial<ModelDraft>): void {
     setDraft((current) =>
@@ -255,8 +291,17 @@ export function ModelSettings({
     setError(null);
     setNote(null);
     try {
-      onSaved(await saveSettings({ providers: [draftToPatch(editorDraft)] }));
+      const providerPatch = draftToPatch(editorDraft);
+      // 简单表单里的 API Key 就地并入供应商补丁（留空则保持原值）。
+      if (apiKey.trim()) providerPatch.apiKey = apiKey.trim();
+      onSaved(
+        await saveSettings({
+          providers: [providerPatch],
+          selection: { defaultModel: defaultModel.trim() || undefined },
+        }),
+      );
       setDraft((current) => (current ? { ...current, apiKey: "" } : current));
+      setApiKey("");
       setNote("已保存，下一条消息生效");
     } catch (err) {
       setError(messageOf(err));
@@ -270,7 +315,9 @@ export function ModelSettings({
     setError(null);
     setProbe(null);
     try {
-      setProbe(await probeModel({ provider: draftToPatch(editorDraft) }));
+      const patch = draftToPatch(editorDraft);
+      if (apiKey.trim()) patch.apiKey = apiKey.trim();
+      setProbe(await probeModel({ provider: patch }));
     } catch (err) {
       setError(messageOf(err));
     } finally {
@@ -331,9 +378,46 @@ export function ModelSettings({
     setSuggestion("");
   }
 
+  if (!provider || !draft) {
+    return (
+      <div className="settings-form model-settings">
+        <div className="section-label">模型服务</div>
+        <p className="hint">还没有供应商。选一个预设一键接入，或填一个 id 新建。</p>
+        <PresetButtons busy={busy} onPick={(preset) => void handleApplyPreset(preset)} />
+        <div className="field-row">
+          <input
+            value={newProviderId}
+            placeholder="自定义供应商 id（字母、数字、点、下划线、连字符）"
+            onChange={(event) => setNewProviderId(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void handleCreate(newProviderId);
+              }
+            }}
+          />
+          <button
+            className="btn primary"
+            type="button"
+            onClick={() => void handleCreate(newProviderId)}
+          >
+            新建供应商
+          </button>
+        </div>
+        {error && <p className="form-error">{error}</p>}
+      </div>
+    );
+  }
+
+  const editorDraft = draft;
+  const patched = settings.providers.find((item) => item.id === editorDraft.id) ?? provider;
+
   return (
     <div className="settings-form model-settings">
       <div className="section-label">模型服务</div>
+      <p className="hint">选择服务商，填写密钥并选择默认模型即可开始；其余选项已收进高级设置。</p>
+
+      {/* 供应商切换标签 */}
       <div className="model-provider-tabs">
         {settings.providers.map((item) => (
           <button
@@ -346,68 +430,41 @@ export function ModelSettings({
             {item.models.length === 0 ? "（无模型）" : ""}
           </button>
         ))}
-        <input
-          className="model-new-provider"
-          value={newProviderId}
-          placeholder="新建供应商 id"
-          onChange={(event) => setNewProviderId(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              const id = newProviderId.trim();
-              if (!id) return;
-              void saveSettings({ providers: [{ id, api: "openai-completions", models: [] }] })
-                .then((next) => {
-                  onSaved(next);
-                  setSelectedId(id);
-                  setNewProviderId("");
-                })
-                .catch((err) => setError(messageOf(err)));
-            }
-          }}
-        />
-        <button
-          type="button"
-          className="btn sm"
-          disabled={busy || !newProviderId.trim()}
-          onClick={() => {
-            const id = newProviderId.trim();
-            if (!id) return;
-            void saveSettings({ providers: [{ id, api: "openai-completions", models: [] }] })
-              .then((next) => {
-                onSaved(next);
-                setSelectedId(id);
-                setNewProviderId("");
-              })
-              .catch((err) => setError(messageOf(err)));
-          }}
-        >
-          新建
-        </button>
       </div>
 
-      <div className="field-row">
-        <label className="field">
-          <span>供应商 id</span>
-          <input value={draft.id} disabled />
-        </label>
-        <label className="field">
-          <span>接口类型</span>
-          <select
-            value={draft.api}
-            onChange={(event) => setDraft({ ...draft, api: event.target.value })}
+      <details className="model-add-provider">
+        <summary>添加供应商</summary>
+        <p className="hint">选择预设会自动填入接口地址和常用模型，也可以创建自定义供应商。</p>
+        <PresetButtons busy={busy} onPick={(preset) => void handleApplyPreset(preset)} />
+        <div className="field-row model-custom-provider">
+          <input
+            value={newProviderId}
+            placeholder="自定义供应商 id，如 ollama"
+            aria-label="自定义供应商 id"
+            onChange={(event) => setNewProviderId(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void handleCreate(newProviderId);
+              }
+            }}
+          />
+          <button
+            className="btn"
+            type="button"
+            disabled={busy || !newProviderId.trim()}
+            onClick={() => void handleCreate(newProviderId)}
           >
-            {Object.entries(API_LABELS).map(([value, label]) => (
-              <option key={value} value={value}>
-                {label}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
+            创建自定义供应商
+          </button>
+        </div>
+      </details>
 
-      {draft.api !== "mock" && (
-        <>
+      {/* ===== 简单表单：选服务商 → 填 Key → 选默认模型 → 保存 ===== */}
+      <div className="model-quick">
+        {draft.api === "mock" ? (
+          <p className="model-mock-note">演示模式无需接口地址或 API Key，可直接用于体验协作流程。</p>
+        ) : (
           <div className="field-row">
             <label className="field">
               <span>Base URL</span>
@@ -418,262 +475,328 @@ export function ModelSettings({
               />
             </label>
             <label className="field">
-              <span>鉴权方式</span>
-              <select
-                value={draft.auth}
-                onChange={(event) =>
-                  setDraft({ ...draft, auth: event.target.value as "api-key" | "none" })
-                }
-              >
-                <option value="api-key">API Key</option>
-                <option value="none">无需鉴权（本地服务）</option>
-              </select>
-            </label>
-          </div>
-          <div className="field-row">
-            <label className="field">
-              <span>
-                超时（秒）
-                <em>1-3600，留空用默认</em>
-              </span>
-              <input
-                value={draft.timeoutSeconds}
-                inputMode="numeric"
-                onChange={(event) => setDraft({ ...draft, timeoutSeconds: event.target.value })}
-              />
-            </label>
-            <label className="field">
-              <span>
-                最大输出 tokens
-                <em>供应商级上限</em>
-              </span>
-              <input
-                value={draft.maxTokens}
-                inputMode="numeric"
-                onChange={(event) => setDraft({ ...draft, maxTokens: event.target.value })}
-              />
-            </label>
-          </div>
-          {draft.auth === "api-key" && (
-            <label className="field">
               <span>
                 API Key
                 <em>
                   {patched.hasApiKey
                     ? `已保存：${patched.apiKeyHint ?? "自定义密钥"}；留空保持不变`
-                    : "支持明文、env:变量名、file:相对路径"}
+                    : "支持明文或 env:变量名"}
                 </em>
               </span>
               <input
-                value={draft.apiKey}
+                type="password"
+                autoComplete="off"
+                value={apiKey}
                 placeholder="sk-… 或 env:DEEPSEEK_API_KEY"
-                onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })}
+                onChange={(event) => setApiKey(event.target.value)}
               />
             </label>
-          )}
-          {draft.auth === "api-key" && patched.hasApiKey && (
-            <button type="button" className="btn sm ghost danger" disabled={busy} onClick={() => void handleClearKey()}>
-              清除已保存密钥
-            </button>
-          )}
-        </>
-      )}
+          </div>
+        )}
 
-      <div className="section-label">模型目录</div>
-      <p className="hint">
-        留空窗口/输出/价格时按内置目录取值（DeepSeek、GPT、Qwen 等已收录），目录里没有才需要手填。
-      </p>
-      {suggestions.length > 0 && (
-        <div className="field-row">
-          <select value={suggestion} onChange={(event) => setSuggestion(event.target.value)}>
-            <option value="">从内置目录添加模型…</option>
-            {suggestions.map((item) => (
-              <option key={item.ref} value={item.ref}>
-                {item.ref}
-                {item.contextWindow ? `（${formatTokens(item.contextWindow)}）` : ""}
-              </option>
+        <label className="field">
+          <span>
+            默认模型
+            <em>成员选择「跟随默认」时使用；也可用 /model 命令临时改</em>
+          </span>
+          <select value={defaultModel} onChange={(event) => setDefaultModel(event.target.value)}>
+            {!allRefs.includes(defaultModel) && <option value={defaultModel}>{defaultModel}</option>}
+            {settings.providers.map((item) => (
+              <optgroup key={item.id} label={item.id}>
+                {item.models.map((model) => {
+                  const ref = `${item.id}/${model.id}`;
+                  return (
+                    <option key={ref} value={ref} disabled={model.status === "disabled"}>
+                      {model.name || model.id}
+                      {model.status !== "available" ? `（${model.status}）` : ""}
+                    </option>
+                  );
+                })}
+              </optgroup>
             ))}
           </select>
-          <button
-            type="button"
-            className="btn sm"
-            disabled={!suggestion || draft.models.some((model) => model.id === suggestion.split("/").slice(1).join("/"))}
-            onClick={() => addModelFromCatalog(suggestion)}
-          >
-            添加
+        </label>
+
+        <div className="modal-actions">
+          <button className="btn primary" disabled={busy} type="button" onClick={() => void handleSave()}>
+            {busy ? "处理中…" : "保存并应用"}
+          </button>
+          <button className="btn" disabled={busy} type="button" onClick={() => void handleProbe()}>
+            测试连接
           </button>
         </div>
-      )}
-      <table className="model-table">
-        <thead>
-          <tr>
-            <th>模型 id</th>
-            <th>名称</th>
-            <th>上下文</th>
-            <th>最大输出</th>
-            <th>推理</th>
-            <th>输入价 $/M</th>
-            <th>输出价 $/M</th>
-            <th>状态</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {draft.models.map((model, index) => (
-            <tr key={`${model.id}-${index}`}>
-              <td>
-                <input
-                  value={model.id}
-                  onChange={(event) => updateModel(index, { id: event.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  value={model.name}
-                  placeholder={model.id}
-                  onChange={(event) => updateModel(index, { name: event.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  value={model.contextWindow}
-                  inputMode="numeric"
-                  placeholder="目录默认"
-                  onChange={(event) => updateModel(index, { contextWindow: event.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  value={model.maxTokens}
-                  inputMode="numeric"
-                  placeholder="目录默认"
-                  onChange={(event) => updateModel(index, { maxTokens: event.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  type="checkbox"
-                  checked={model.reasoning}
-                  onChange={(event) => updateModel(index, { reasoning: event.target.checked })}
-                />
-              </td>
-              <td>
-                <input
-                  value={model.costInput}
-                  inputMode="decimal"
-                  placeholder="0"
-                  onChange={(event) => updateModel(index, { costInput: event.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  value={model.costOutput}
-                  inputMode="decimal"
-                  placeholder="0"
-                  onChange={(event) => updateModel(index, { costOutput: event.target.value })}
-                />
-              </td>
-              <td>
-                <select
-                  value={model.status}
-                  onChange={(event) => updateModel(index, { status: event.target.value })}
-                >
-                  {MODEL_STATUSES.map((status) => (
-                    <option key={status} value={status}>
-                      {status}
-                    </option>
-                  ))}
-                </select>
-              </td>
-              <td>
-                <button
-                  type="button"
-                  className="btn sm ghost danger"
-                  onClick={() =>
-                    setDraft({ ...draft, models: draft.models.filter((_, i) => i !== index) })
-                  }
-                >
-                  删除
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <button
-        type="button"
-        className="btn sm"
-        onClick={() =>
-          setDraft({
-            ...draft,
-            models: [
-              ...draft.models,
-              {
-                id: "",
-                name: "",
-                contextWindow: "",
-                maxTokens: "",
-                reasoning: false,
-                status: "available",
-                costInput: "",
-                costOutput: "",
-              },
-            ],
-          })
-        }
-      >
-        添加空模型
-      </button>
-
-      <div className="modal-actions">
-        <button className="btn primary" disabled={busy} type="button" onClick={() => void handleSave()}>
-          {busy ? "处理中…" : "保存供应商"}
-        </button>
-        <button className="btn" disabled={busy} type="button" onClick={() => void handleProbe()}>
-          测试连接
-        </button>
-        <button className="btn ghost danger" disabled={busy} type="button" onClick={() => void handleDeleteProvider()}>
-          删除供应商
-        </button>
+        {probe && (
+          <p className={probe.status === "ok" ? "form-note" : "form-error"}>
+            {PROBE_LABELS[probe.status]}
+            {probe.ref ? ` · ${probe.ref}` : ""}
+            {probe.latencyMs !== undefined ? ` · ${Math.round(probe.latencyMs)} ms` : ""}
+            {probe.error ? ` · ${probe.error}` : ""}
+          </p>
+        )}
+        {note && <p className="form-note">{note}</p>}
+        {error && <p className="form-error">{error}</p>}
       </div>
-      {probe && (
-        <p className={probe.status === "ok" ? "form-note" : "form-error"}>
-          {PROBE_LABELS[probe.status]}
-          {probe.ref ? ` · ${probe.ref}` : ""}
-          {probe.latencyMs !== undefined ? ` · ${Math.round(probe.latencyMs)} ms` : ""}
-          {probe.error ? ` · ${probe.error}` : ""}
-        </p>
-      )}
-      {note && <p className="form-note">{note}</p>}
-      {error && <p className="form-error">{error}</p>}
 
-      <SelectionSection
-        settings={settings}
-        refs={allRefs}
-        onSaved={onSaved}
-        busy={busy}
-        setBusy={setBusy}
-      />
-      <UsageSection />
+      {/* ===== 高级设置：折叠起来，日常不用管 ===== */}
+      <details className="model-advanced">
+        <summary>高级设置（接口类型 · 鉴权 · 模型目录 · 别名与备用 · 用量）</summary>
+
+        <div className="field-row">
+          <label className="field">
+            <span>接口类型</span>
+            <select
+              value={draft.api}
+              onChange={(event) => setDraft({ ...draft, api: event.target.value })}
+            >
+              {Object.entries(API_LABELS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>鉴权方式</span>
+            <select
+              value={draft.auth}
+              onChange={(event) =>
+                setDraft({ ...draft, auth: event.target.value as "api-key" | "none" })
+              }
+            >
+              <option value="api-key">API Key</option>
+              <option value="none">无需鉴权（本地服务）</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="field-row">
+          <label className="field">
+            <span>
+              超时（秒）
+              <em>1-3600，留空用默认</em>
+            </span>
+            <input
+              value={draft.timeoutSeconds}
+              inputMode="numeric"
+              onChange={(event) => setDraft({ ...draft, timeoutSeconds: event.target.value })}
+            />
+          </label>
+          <label className="field">
+            <span>
+              最大输出 tokens
+              <em>供应商级上限</em>
+            </span>
+            <input
+              value={draft.maxTokens}
+              inputMode="numeric"
+              onChange={(event) => setDraft({ ...draft, maxTokens: event.target.value })}
+            />
+          </label>
+        </div>
+
+        {patched.hasApiKey && (
+          <button
+            type="button"
+            className="btn sm ghost danger"
+            disabled={busy}
+            onClick={() => void handleClearKey()}
+          >
+            清除已保存密钥
+          </button>
+        )}
+
+        <div className="section-label">模型目录</div>
+        <p className="hint">
+          留空窗口/输出/价格时按内置目录取值（DeepSeek、GPT、Qwen 等已收录），目录里没有才需要手填。
+        </p>
+        {suggestions.length > 0 && (
+          <div className="field-row">
+            <select value={suggestion} onChange={(event) => setSuggestion(event.target.value)}>
+              <option value="">从内置目录添加模型…</option>
+              {suggestions.map((item) => (
+                <option key={item.ref} value={item.ref}>
+                  {item.ref}
+                  {item.contextWindow ? `（${formatTokens(item.contextWindow)}）` : ""}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="btn sm"
+              disabled={
+                !suggestion ||
+                draft.models.some((model) => model.id === suggestion.split("/").slice(1).join("/"))
+              }
+              onClick={() => addModelFromCatalog(suggestion)}
+            >
+              添加
+            </button>
+          </div>
+        )}
+        <div className="model-table-wrap">
+          <table className="model-table">
+            <thead>
+              <tr>
+                <th>模型 id</th>
+              <th>名称</th>
+              <th>上下文</th>
+              <th>最大输出</th>
+              <th>推理</th>
+              <th>输入价 $/M</th>
+              <th>输出价 $/M</th>
+              <th>状态</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {draft.models.map((model, index) => (
+              <tr key={`${model.id}-${index}`}>
+                <td>
+                  <input
+                    value={model.id}
+                    onChange={(event) => updateModel(index, { id: event.target.value })}
+                  />
+                </td>
+                <td>
+                  <input
+                    value={model.name}
+                    placeholder={model.id}
+                    onChange={(event) => updateModel(index, { name: event.target.value })}
+                  />
+                </td>
+                <td>
+                  <input
+                    value={model.contextWindow}
+                    inputMode="numeric"
+                    placeholder="目录默认"
+                    onChange={(event) => updateModel(index, { contextWindow: event.target.value })}
+                  />
+                </td>
+                <td>
+                  <input
+                    value={model.maxTokens}
+                    inputMode="numeric"
+                    placeholder="目录默认"
+                    onChange={(event) => updateModel(index, { maxTokens: event.target.value })}
+                  />
+                </td>
+                <td>
+                  <input
+                    type="checkbox"
+                    checked={model.reasoning}
+                    onChange={(event) => updateModel(index, { reasoning: event.target.checked })}
+                  />
+                </td>
+                <td>
+                  <input
+                    value={model.costInput}
+                    inputMode="decimal"
+                    placeholder="0"
+                    onChange={(event) => updateModel(index, { costInput: event.target.value })}
+                  />
+                </td>
+                <td>
+                  <input
+                    value={model.costOutput}
+                    inputMode="decimal"
+                    placeholder="0"
+                    onChange={(event) => updateModel(index, { costOutput: event.target.value })}
+                  />
+                </td>
+                <td>
+                  <select
+                    value={model.status}
+                    onChange={(event) => updateModel(index, { status: event.target.value })}
+                  >
+                    {MODEL_STATUSES.map((status) => (
+                      <option key={status} value={status}>
+                        {status}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td>
+                  <button
+                    type="button"
+                    className="btn sm ghost danger"
+                    onClick={() =>
+                      setDraft({ ...draft, models: draft.models.filter((_, i) => i !== index) })
+                    }
+                  >
+                    删除
+                  </button>
+                </td>
+              </tr>
+            ))}
+            </tbody>
+          </table>
+        </div>
+        <button
+          type="button"
+          className="btn sm"
+          onClick={() => setDraft({ ...draft, models: [...draft.models, blankModel()] })}
+        >
+          添加空模型
+        </button>
+
+        <SelectionSection
+          settings={settings}
+          onSaved={onSaved}
+          busy={busy}
+          setBusy={setBusy}
+        />
+        <UsageSection />
+
+        <div className="modal-actions">
+          <button className="btn primary" disabled={busy} type="button" onClick={() => void handleSave()}>
+            {busy ? "处理中…" : "保存供应商"}
+          </button>
+          <button className="btn ghost danger" disabled={busy} type="button" onClick={() => void handleDeleteProvider()}>
+            删除供应商
+          </button>
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function PresetButtons({
+  onPick,
+  busy = false,
+}: {
+  onPick: (preset: (typeof PROVIDER_PRESETS)[number]) => void;
+  busy?: boolean;
+}) {
+  return (
+    <div className="model-presets">
+      {PROVIDER_PRESETS.map((preset) => (
+        <button
+          key={preset.id}
+          type="button"
+          className="preset-card"
+          disabled={busy}
+          onClick={() => onPick(preset)}
+        >
+          <strong>{preset.label}</strong>
+          <span>{preset.baseUrl.replace(/^https?:\/\//, "")}</span>
+        </button>
+      ))}
     </div>
   );
 }
 
 function SelectionSection({
   settings,
-  refs,
   onSaved,
   busy,
   setBusy,
 }: {
   settings: MaskedSettings;
-  refs: string[];
   onSaved: (next: MaskedSettings) => void;
   busy: boolean;
   setBusy: (value: boolean) => void;
 }) {
   const selection = settings.selection;
-  const [defaultModel, setDefaultModel] = useState(selection.defaultModel);
   const [fallbacks, setFallbacks] = useState(selection.fallbacks.join(", "));
   const [allow, setAllow] = useState(selection.allow.join(", "));
   const [aliases, setAliases] = useState<Array<{ key: string; value: string }>>(
@@ -683,7 +806,6 @@ function SelectionSection({
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setDefaultModel(selection.defaultModel);
     setFallbacks(selection.fallbacks.join(", "));
     setAllow(selection.allow.join(", "));
     setAliases(Object.entries(selection.aliases).map(([key, value]) => ({ key, value })));
@@ -700,11 +822,12 @@ function SelectionSection({
         .filter(Boolean);
     const patch: { selection: Parameters<typeof saveSettings>[0]["selection"] } = {
       selection: {
-        defaultModel: defaultModel.trim(),
         fallbacks: split(fallbacks),
         allow: split(allow),
         aliases: Object.fromEntries(
-          aliases.filter((alias) => alias.key.trim()).map((alias) => [alias.key.trim(), alias.value.trim()]),
+          aliases
+            .filter((alias) => alias.key.trim())
+            .map((alias) => [alias.key.trim(), alias.value.trim()]),
         ),
       },
     };
@@ -720,21 +843,7 @@ function SelectionSection({
 
   return (
     <>
-      <div className="section-label">默认模型与别名</div>
-      <label className="field">
-        <span>
-          默认模型
-          <em>成员选择「跟随默认」时使用；也可用 /model 命令临时改</em>
-        </span>
-        <select value={defaultModel} onChange={(event) => setDefaultModel(event.target.value)}>
-          {refs.length === 0 && <option value={defaultModel}>{defaultModel}</option>}
-          {refs.map((ref) => (
-            <option key={ref} value={ref}>
-              {ref}
-            </option>
-          ))}
-        </select>
-      </label>
+      <div className="section-label">备用模型与别名</div>
       <label className="field">
         <span>
           备用模型
