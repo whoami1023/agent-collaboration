@@ -19,6 +19,32 @@ export type UserRole = "admin" | "user";
  * - free：成员之间可直接 @ 讨论，安静下来后由主智能体统一收集并总结（对应 collector 语义）。
  */
 export type RoomMode = "delegate" | "free";
+/**
+ * 房间类型：
+ * - warroom：账号绑定的作战室（`room_main`），成员名册就是账号的成员池，任务与归档都以它为主；
+ * - group：「群聊区」里自建的群聊，只能从成员池拉人进来讨论，界面与作战室一致。
+ */
+export type RoomKind = "warroom" | "group";
+
+/** 房间清单（`rooms.json`）里持久化的一条房间档案。 */
+export interface RoomDescriptor {
+  id: string;
+  kind: RoomKind;
+  name: string;
+  topic?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 房间清单对外的一行：附带实时人数、消息量与模式，供侧边栏群聊列表展示。 */
+export interface RoomInfo extends RoomDescriptor {
+  mode: RoomMode;
+  memberIds: string[];
+  memberCount: number;
+  messageCount: number;
+  taskCount: number;
+  runningCount: number;
+}
 
 export interface PublicUser {
   id: string;
@@ -237,6 +263,8 @@ export interface SessionArchiveSummary {
   id: string;
   createdAt: number;
   roomName: string;
+  /** 归档来自哪间房；老归档没有这个字段，读取时按作战室处理。 */
+  roomId?: string;
   messageCount: number;
   taskCount: number;
   fileCount: number;
@@ -282,7 +310,9 @@ export type RoomEvent =
   | { type: "cron-job"; job: CronJob; state: CronJobState }
   | { type: "cron-job-removed"; jobId: string }
   | { type: "cron-run"; run: CronRunRecord }
-  | { type: "notice"; text: string };
+  | { type: "notice"; text: string }
+  /** 房间被新建、改名或删除时广播：前端据此重拉群聊列表。 */
+  | { type: "rooms-changed"; roomId: string };
 
 /** token 计量口径：input 已扣除缓存命中，cacheRead/cacheWrite 单独计。 */
 export interface TokenUsage {

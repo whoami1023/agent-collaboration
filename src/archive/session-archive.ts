@@ -30,6 +30,8 @@ const ARCHIVE_ID_RE = /^arch_[0-9a-f]{12}$/;
 
 export interface CaptureInput {
   roomName: string;
+  /** 归档来自哪间房（作战室或群聊区里的某个群）；列表按它过滤，恢复也放回对应房间。 */
+  roomId?: string;
   seq: number;
   messages: RoomMessage[];
   tasks: TaskCard[];
@@ -104,6 +106,8 @@ export class SessionArchives {
         id: manifest.id,
         createdAt: manifest.createdAt,
         roomName: manifest.roomName,
+        // 老归档没有这个字段：读取时不写它，调用方按作战室处理。
+        ...(typeof manifest.roomId === "string" ? { roomId: manifest.roomId } : {}),
         messageCount: manifest.messageCount,
         taskCount: manifest.taskCount,
         fileCount: manifest.fileCount,
@@ -145,6 +149,7 @@ export class SessionArchives {
       id,
       createdAt,
       roomName: input.roomName,
+      ...(input.roomId ? { roomId: input.roomId } : {}),
       messageCount: input.messages.length,
       taskCount: input.tasks.length,
       fileCount: files.length,

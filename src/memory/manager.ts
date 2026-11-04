@@ -276,6 +276,8 @@ function countOccurrences(haystack: string, needle: string): number {
 export interface MemorySearchManagerOptions {
   workspaceDir: string;
   bus: RoomBus;
+  /** 「群聊区」里另开的房间：转录一并进 sessions 语料。 */
+  extraBuses?(): RoomBus[];
   settings?: MemorySearchSettings;
   /** null = FTS-only（对应 OpenClaw provider "none" 哨兵）。 */
   embeddingProvider?: MemoryEmbeddingProvider | null;
@@ -306,6 +308,12 @@ export class MemorySearchManager {
 
   markDirty(): void {
     this.dirty = true;
+  }
+
+  /** 进 sessions 语料的房间总线：作战室在前，群聊区里的群按打开顺序跟上。 */
+  private sessionBuses(): RoomBus[] {
+    const extra = this.options.extraBuses?.() ?? [];
+    return [this.options.bus, ...extra.filter((bus) => bus.roomId !== this.options.bus.roomId)];
   }
 
   getSettings(): MemorySearchSettings {
@@ -358,18 +366,23 @@ export class MemorySearchManager {
     this.fileStates = nextStates;
     this.memoryMtimes = nextMtimes;
 
-    const messages = this.options.bus.listMessages(SESSION_MAX_MESSAGES);
-    const nextSessionState = {
-      count: messages.length,
-      maxTs: messages.reduce((max, message) => Math.max(max, message.ts), 0),
-      bytes: this.sessionBytesOf(messages),
-    };
     const sessionMtimes = new Map<string, number>();
-    // 适配：内存索引每次重建都完整收录当前群聊窗口（OpenClaw 的 delta 门控服务于
+    let nextSessionState = { count: 0, maxTs: 0, bytes: 0 };
+    // 适配：内存索引每次重建都完整收录各房间的群聊窗口（OpenClaw 的 delta 门控服务于
     // 昂贵的外部 embedding 批量计费，本地哈希投影无需增量）。
-    if (nextSessionState.count > 0) {
-      const roomPath = `sessions/${this.options.bus.roomId}.md`;
-      sessionMtimes.set(roomPath, nextSessionState.maxTs);
+    // 作战室之外，「群聊区」的每间群聊都单独成一份 sessions/<roomId>.md 语料，
+    // 所以在群里讨论过的结论也能被 memory_search 命中。
+    for (const bus of this.sessionBuses()) {
+      const messages = bus.listMessages(SESSION_MAX_MESSAGES);
+      if (messages.length === 0) continue;
+      const maxTs = messages.reduce((max, message) => Math.max(max, message.ts), 0);
+      nextSessionState = {
+        count: nextSessionState.count + messages.length,
+        maxTs: Math.max(nextSessionState.maxTs, maxTs),
+        bytes: nextSessionState.bytes + this.sessionBytesOf(messages),
+      };
+      const roomPath = `sessions/${bus.roomId}.md`;
+      sessionMtimes.set(roomPath, maxTs);
       const lines: string[] = [];
       const lineMap: number[] = [];
       for (const message of messages) {
@@ -388,7 +401,7 @@ export class MemorySearchManager {
         path: roomPath,
         absPath: roomPath,
         hash: hashText(content),
-        mtimeMs: nextSessionState.maxTs,
+        mtimeMs: maxTs,
       };
       const chunks = chunkMarkdown(content, this.settings.chunking);
       remapChunkLines(chunks, lineMap);

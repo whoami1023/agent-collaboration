@@ -72,7 +72,15 @@ async function openEvents(auth: string): Promise<SseCapture> {
           if (!line.startsWith("data: ")) continue;
           // 心跳与非 JSON 帧不属于本测试关心的事件。
           try {
-            capture.events.push(JSON.parse(line.slice(6)) as Record<string, unknown>);
+            const payload = JSON.parse(line.slice(6)) as Record<string, unknown>;
+            // SSE 帧带上了 roomId（一个连接喂所有房间），断言只看事件本体。
+            const event =
+              typeof payload["roomId"] === "string" &&
+              payload["event"] &&
+              typeof payload["event"] === "object"
+                ? (payload["event"] as Record<string, unknown>)
+                : payload;
+            capture.events.push(event);
           } catch {
             /* ignore */
           }

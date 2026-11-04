@@ -38,7 +38,9 @@ import { resolveSkillSelection } from "../skills/selection";
 import { MAX_UPLOAD_BYTES, WorkspaceFileError } from "../files/workspace-files";
 import { summaryOf } from "../archive/session-archive";
 import { buildRichPreview } from "../files/rich-preview";
-import type { Workspace, WorkspaceRegistry } from "../workspace/workspace";
+import { RoomError, roomIdFromQuery } from "../room/registry";
+import type { RoomInstance, Workspace, WorkspaceRegistry } from "../workspace/workspace";
+import type { RoomInfo } from "../core/types";
 
 export interface AppDeps {
   auth: AuthService;
@@ -160,6 +162,30 @@ export function createApp(deps: AppDeps): express.Express {
   const currentUser = (res: Response): PublicUser => res.locals["user"] as PublicUser;
   const workspaceFor = (res: Response): Promise<Workspace> =>
     deps.workspaces.get(currentUser(res));
+
+  /** `?room=` 定位到某间房（缺省就是作战室，所以旧的调用一律不用改）。 */
+  const roomScope = async (
+    req: Request,
+    res: Response,
+  ): Promise<{ workspace: Workspace; room: RoomInstance } | null> => {
+    const workspace = await workspaceFor(res);
+    try {
+      return { workspace, room: workspace.room(roomIdFromQuery(req.query["room"])) };
+    } catch (err) {
+      res
+        .status(err instanceof RoomError ? err.status : 400)
+        .json({ error: errorMessage(err) });
+      return null;
+    }
+  };
+
+  const roomView = (room: RoomInstance) => ({
+    id: room.bus.roomId,
+    name: room.bus.roomName,
+    kind: room.descriptor.kind,
+    ...(room.descriptor.topic ? { topic: room.descriptor.topic } : {}),
+    mode: room.bus.roomMode,
+  });
 
   const skillView = (record: SkillRecord) => {
     const owner = record.ownerId
@@ -428,15 +454,102 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
-  app.get("/api/state", async (_req: Request, res: Response) => {
-    const workspace = await workspaceFor(res);
+  app.get("/api/state", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
     res.json({
-      room: { id: workspace.bus.roomId, name: workspace.bus.roomName, mode: workspace.bus.roomMode },
-      members: workspace.bus.listMembers(),
-      messages: workspace.bus.listMessages(300),
-      tasks: workspace.board.list(),
-      settings: maskSettings(workspace.getSettings()),
+      room: roomView(scope.room),
+      members: scope.room.bus.listMembers(),
+      messages: scope.room.bus.listMessages(300),
+      tasks: scope.room.board.list(),
+      settings: maskSettings(scope.workspace.getSettings()),
     });
+  });
+
+  // 房间列表：作战室排在最前，其后是「群聊区」里自建的每间群聊。
+  app.get("/api/rooms", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    res.json({ rooms: workspace.listRooms() });
+  });
+
+  /** 群聊区面板要按成员池勾选，但页面当前看的可能是某间群聊：单独给一份池名单。 */
+  app.get("/api/members", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    res.json({ members: workspace.listPoolMembers() });
+  });
+
+  /** 某间房间的花名册：作战室即成员池。 */
+  app.get("/api/rooms/:id/members", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json({ members: workspace.room(String(req.params["id"] ?? "")).bus.listMembers() });
+    } catch (err) {
+      res.status(err instanceof RoomError ? err.status : 400).json({ error: errorMessage(err) });
+    }
+  });
+
+  /** 开一间群聊：名称必填、可选主题，memberIds 从成员池里拉人（主智能体默认在场）。 */
+  app.post("/api/rooms", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      const room = await workspace.createRoom({
+        name: bodyOf(req)["name"],
+        topic: bodyOf(req)["topic"],
+        memberIds: bodyOf(req)["memberIds"],
+      });
+      res.status(201).json({ room });
+    } catch (err) {
+      res.status(err instanceof RoomError ? err.status : 400).json({ error: errorMessage(err) });
+    }
+  });
+
+  app.patch("/api/rooms/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      const room = await workspace.updateRoom(String(req.params["id"] ?? ""), {
+        ...(req.body && "name" in req.body ? { name: bodyOf(req)["name"] } : {}),
+        ...(req.body && "topic" in req.body ? { topic: bodyOf(req)["topic"] } : {}),
+      });
+      res.json({ room });
+    } catch (err) {
+      res.status(err instanceof RoomError ? err.status : 400).json({ error: errorMessage(err) });
+    }
+  });
+
+  /** 删除群聊：转录与房间档案一起清掉；成员池、文件工作区与智能体记忆都不动。 */
+  app.delete("/api/rooms/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json(await workspace.deleteRoom(String(req.params["id"] ?? "")));
+    } catch (err) {
+      res.status(err instanceof RoomError ? err.status : 400).json({ error: errorMessage(err) });
+    }
+  });
+
+  /** 拉成员进群。 */
+  app.post("/api/rooms/:id/members", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      const result = await workspace.inviteMember(
+        String(req.params["id"] ?? ""),
+        stringField(bodyOf(req), "memberId"),
+      );
+      res.status(201).json({ room: result.room, member: result.member });
+    } catch (err) {
+      res.status(err instanceof RoomError ? err.status : 400).json({ error: errorMessage(err) });
+    }
+  });
+
+  /** 把成员移出某间群聊（它在作战室和其他群里照旧）。 */
+  app.delete("/api/rooms/:id/members/:memberId", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const memberId = String(req.params["memberId"] ?? "");
+    try {
+      const room = await workspace.kickMember(String(req.params["id"] ?? ""), memberId);
+      res.json({ removed: memberId, room });
+    } catch (err) {
+      res.status(err instanceof RoomError ? err.status : 400).json({ error: errorMessage(err) });
+    }
   });
 
   // 作战室任务完成模式：delegate（主智能体委派） / free（成员自由交流，主智能体收集总结）。
@@ -446,12 +559,11 @@ export function createApp(deps: AppDeps): express.Express {
       res.status(400).json({ error: "mode 必须是 delegate 或 free" });
       return;
     }
-    const workspace = await workspaceFor(res);
-    workspace.setRoomMode(mode);
-    await workspace.persist();
-    res.json({
-      room: { id: workspace.bus.roomId, name: workspace.bus.roomName, mode: workspace.bus.roomMode },
-    });
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    scope.workspace.setRoomMode(mode, scope.room.bus.roomId);
+    await scope.workspace.persistRoom(scope.room.bus.roomId);
+    res.json({ room: roomView(scope.room) });
   });
 
   app.get("/api/events", async (req: Request, res: Response) => {
@@ -463,11 +575,12 @@ export function createApp(deps: AppDeps): express.Express {
       connection: "keep-alive",
     });
     res.write(": connected\n\n");
-    const send = (event: unknown) => {
-      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    // 每帧都带上 roomId：一个连接要同时喂作战室和「群聊区」里的所有群，
+    // 前端按当前房间过滤，别的房间靠它来刷新群聊列表上的人数与消息数。
+    const send = (roomId: string, event: unknown) => {
+      res.write(`data: ${JSON.stringify({ roomId, event })}\n\n`);
     };
-    const unsubscribeBus = workspace.bus.subscribe(send);
-    const unsubscribeBoard = workspace.board.subscribe(send);
+    const unsubscribeRooms = workspace.subscribeRooms(send);
     const open = streams.get(user.id) ?? new Set<Response>();
     open.add(res);
     streams.set(user.id, open);
@@ -475,8 +588,7 @@ export function createApp(deps: AppDeps): express.Express {
     heartbeat.unref();
     req.on("close", () => {
       clearInterval(heartbeat);
-      unsubscribeBus();
-      unsubscribeBoard();
+      unsubscribeRooms();
       open.delete(res);
       if (open.size === 0) streams.delete(user.id);
       res.end();
@@ -489,31 +601,35 @@ export function createApp(deps: AppDeps): express.Express {
       res.status(400).json({ error: "消息不能为空" });
       return;
     }
-    const workspace = await workspaceFor(res);
+    const scope = await roomScope(req, res);
+    if (!scope) return;
     try {
-      const message = workspace.orchestrator.sendUserMessage(text);
+      const message = scope.room.orchestrator.sendUserMessage(text);
       res.status(201).json({ message });
     } catch (err) {
       res.status(400).json({ error: errorMessage(err) });
     }
   });
 
-  // /clear：静默中止在跑的成员，把群聊记录、任务卡与 files/ 成果整体归档，再清空作战室并落盘。
+  // /clear：静默中止本房间在跑的成员，把群聊记录与任务卡归档，再清空这间房并落盘。
   // 智能体长期记忆与成员档案不进归档、也不受影响；恢复入口在 /api/archives。
-  app.delete("/api/messages", async (_req: Request, res: Response) => {
-    const workspace = await workspaceFor(res);
-    res.json(await workspace.clearRoomSession());
+  app.delete("/api/messages", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    res.json(await scope.workspace.clearRoomSession(scope.room.bus.roomId));
   });
 
   // /new：开一个新会话——群聊记录与任务卡归档（可恢复），文件工作区、成员与智能体记忆都留在原地。
-  app.post("/api/session/new", async (_req: Request, res: Response) => {
-    const workspace = await workspaceFor(res);
-    res.json(await workspace.newSession());
+  app.post("/api/session/new", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    res.json(await scope.workspace.newSession(scope.room.bus.roomId));
   });
 
-  app.get("/api/archives", async (_req: Request, res: Response) => {
-    const workspace = await workspaceFor(res);
-    res.json({ archives: await workspace.archives.list() });
+  app.get("/api/archives", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    res.json({ archives: await scope.workspace.listArchivesForRoom(scope.room.bus.roomId) });
   });
 
   app.get("/api/archives/:id", async (req: Request, res: Response) => {
@@ -525,11 +641,15 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
-  // 恢复一份归档：当前内容会先自动存成新归档，因此这一步不会丢任何东西。
+  // 恢复一份归档：当前内容会先自动存成新归档，因此这一步不会丢任何东西。恢复放回 `?room=` 指定的房间。
   app.post("/api/archives/:id/restore", async (req: Request, res: Response) => {
-    const workspace = await workspaceFor(res);
+    const scope = await roomScope(req, res);
+    if (!scope) return;
     try {
-      const result = await workspace.restoreArchive(String(req.params["id"] ?? ""));
+      const result = await scope.workspace.restoreArchive(
+        String(req.params["id"] ?? ""),
+        scope.room.bus.roomId,
+      );
       res.json({
         archive: summaryOf(result.archive),
         autoArchived: result.autoArchived,
@@ -634,14 +754,16 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
-  app.post("/api/members/cancel-all", async (_req: Request, res: Response) => {
-    const workspace = await workspaceFor(res);
-    res.json({ cancelled: workspace.orchestrator.stopAllRuns() });
+  app.post("/api/members/cancel-all", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    res.json({ cancelled: scope.room.orchestrator.stopAllRuns() });
   });
 
   app.post("/api/members/:id/cancel", async (req: Request, res: Response) => {
-    const workspace = await workspaceFor(res);
-    const cancelled = workspace.orchestrator.cancelMember(String(req.params["id"] ?? ""));
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    const cancelled = scope.room.orchestrator.cancelMember(String(req.params["id"] ?? ""));
     res.json({ cancelled });
   });
 
@@ -649,6 +771,8 @@ export function createApp(deps: AppDeps): express.Express {
     const workspace = await workspaceFor(res);
     try {
       const member = await workspace.orchestrator.removeMember(String(req.params["id"] ?? ""));
+      // 成员池里删掉的人，也要从各间群聊的花名册里退出。
+      await workspace.dropMemberFromRooms(member.id);
       res.json({ removed: member.id });
     } catch (err) {
       const message = errorMessage(err);
@@ -894,6 +1018,8 @@ export function createApp(deps: AppDeps): express.Express {
     if (selection === undefined) delete member.skillNames;
     else member.skillNames = selection;
     workspace.bus.updateMember(member);
+    await workspace.propagateMember(member.id);
+    await workspace.persist();
     // 技能授权变了：成员能力档案里的「技能」一行要跟着刷新，面板才不会显示旧白名单。
     await workspace.memory.syncTeamFile();
     res.json(memberSkillsView(member, userId));
@@ -906,9 +1032,10 @@ export function createApp(deps: AppDeps): express.Express {
       res.status(400).json({ error: "title 不能为空" });
       return;
     }
-    const workspace = await workspaceFor(res);
+    const scope = await roomScope(req, res);
+    if (!scope) return;
     try {
-      const task = workspace.board.create({
+      const task = scope.room.board.create({
         title,
         ...(typeof body["detail"] === "string" ? { detail: body["detail"] } : {}),
         createdBy: currentUser(res).id,
@@ -922,9 +1049,10 @@ export function createApp(deps: AppDeps): express.Express {
 
   app.patch("/api/tasks/:id", async (req: Request, res: Response) => {
     const body = bodyOf(req);
-    const workspace = await workspaceFor(res);
+    const scope = await roomScope(req, res);
+    if (!scope) return;
     try {
-      const task = workspace.board.update(String(req.params["id"] ?? ""), {
+      const task = scope.room.board.update(String(req.params["id"] ?? ""), {
         ...(typeof body["status"] === "string" ? { status: body["status"] as TaskStatus } : {}),
         ...(typeof body["title"] === "string" ? { title: body["title"] } : {}),
         ...(typeof body["detail"] === "string" ? { detail: body["detail"] } : {}),
@@ -1084,6 +1212,8 @@ export function createApp(deps: AppDeps): express.Express {
     if (level === null || level === undefined) delete member.thinkingLevel;
     else member.thinkingLevel = level as Member["thinkingLevel"];
     workspace.bus.updateMember(member);
+    // 各群聊里的副本跟着换模型，否则同一个成员在群里和作战室用的不是同一个脑子。
+    await workspace.propagateMember(member.id);
     await workspace.persist();
     res.json({ member });
   });
@@ -1109,6 +1239,7 @@ export function createApp(deps: AppDeps): express.Express {
       err instanceof AuthError ||
       err instanceof SkillError ||
       err instanceof TemplateError ||
+      err instanceof RoomError ||
       err instanceof CronError
     ) {
       const retryAfterMs = err instanceof AuthError ? err.retryAfterMs : undefined;

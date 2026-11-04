@@ -38,6 +38,7 @@ import {
 import SkillLibraryPanel from "./SkillLibrary";
 import TemplateLibraryPanel from "./TemplateLibrary";
 import CronPanel from "./CronPanel";
+import RoomsPanel from "./RoomsPanel";
 import { ModelSettings } from "./ModelSettings";
 import {
   buildContextReport,
@@ -52,6 +53,8 @@ import {
 } from "./commands";
 import {
   ApiError,
+  MAIN_ROOM_ID,
+  activeRoom,
   cancelAllMembers,
   cancelMember,
   clearMessages,
@@ -70,21 +73,26 @@ import {
   fetchMemberFiles,
   fetchMemberSkills,
   fetchMemberTemplateDraft,
+  fetchRooms,
   fetchState,
   fetchWorkspaceFile,
   fetchWorkspaceFiles,
   fetchWorkspaceRichPreview,
+  inviteRoomMember,
+  kickRoomMember,
   listUsers,
   loginUser,
   logoutUser,
   patchTask,
   removeMember,
   resetUserPassword,
+  restoreActiveRoom,
   restoreArchive,
   saveMemberFile,
   saveMemberSkills,
   saveSettings,
   sendMessage,
+  setActiveRoom,
   setMemberModel,
   setRoomMode,
   setupAdmin,
@@ -98,6 +106,8 @@ import {
   type MaskedSettings,
   type MemberSkillsView,
   type MemberTemplateDraft,
+  type RoomFrame,
+  type RoomInfo,
   type StateSnapshot,
   type WorkspaceFileContent,
   type WorkspaceFileEntry,
@@ -506,6 +516,17 @@ function RoomView({
       return false;
     }
   });
+  const [roomsOpen, setRoomsOpen] = useState(false);
+  const [roomsTab, setRoomsTab] = useState<"list" | "members">("list");
+  const [rooms, setRooms] = useState<RoomInfo[] | null>(null);
+  /** 当前所在房间：页面所有按房间走的请求都跟着它换 `?room=`（见 api.ts 的 withRoom）。 */
+  const [activeRoomId, setActiveRoomIdState] = useState(() => {
+    try {
+      return restoreActiveRoom(localStorage.getItem("ac_room"));
+    } catch {
+      return restoreActiveRoom(null);
+    }
+  });
   const [templatesOpen, setTemplatesOpen] = useState(false);
   /** 成员导出的模板草稿：非空时模板库面板直接打开新建表单并预填（用后即清）。 */
   const [memberTemplateDraft, setMemberTemplateDraft] = useState<{
@@ -761,6 +782,31 @@ function RoomView({
     await refreshArchives();
   }, [onSessionLost, refreshArchives]);
 
+  /** 拉房间清单；当前停留的群聊被删（或换了账号残留了旧 ID）时回落到作战室。 */
+  const refreshRooms = useCallback(async () => {
+    try {
+      const list = await fetchRooms();
+      setRooms(list);
+      if (activeRoom() !== MAIN_ROOM_ID && !list.some((room) => room.id === activeRoom())) {
+        await enterRoom(MAIN_ROOM_ID);
+      }
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    }
+  }, [onSessionLost]);
+
+  /** 群聊区改动了房间（新建/改名/删群/拉人/移人）：列表与当前视图一起刷新。 */
+  const syncRoomView = useCallback(async () => {
+    await refreshRooms();
+    try {
+      setState(await fetchState());
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    }
+  }, [refreshRooms, onSessionLost]);
+
   useEffect(() => {
     if (!openArchiveId) {
       setArchiveDetail(null);
@@ -811,7 +857,25 @@ function RoomView({
         });
     };
 
-    const unsubscribe = subscribeEvents((event: RoomEvent) => {
+    const unsubscribe = subscribeEvents((frame: RoomFrame) => {
+      const event = frame.event;
+      if (event.type === "rooms-changed") void refreshRooms();
+      // 消息、任务卡、成员进出会改变群聊卡片上的统计；其余事件（运行增量等）不重拉列表。
+      const affectsRoomStats =
+        event.type === "message" ||
+        event.type === "messages-cleared" ||
+        event.type === "task" ||
+        event.type === "tasks-cleared" ||
+        event.type === "member" ||
+        event.type === "member-removed" ||
+        event.type === "session-archived" ||
+        event.type === "session-restored";
+      // 别的房间的事件只用来刷新群聊列表上的统计，不碰当前房间的聊天与运行态。
+      if (frame.roomId !== activeRoom()) {
+        if (affectsRoomStats) void refreshRooms();
+        return;
+      }
+      if (affectsRoomStats) void refreshRooms();
       setState((current) => applyEvent(current, event));
       if (event.type === "messages-cleared") setRuns({});
       if (
@@ -847,7 +911,12 @@ function RoomView({
       alive = false;
       unsubscribe();
     };
-  }, [onSessionLost, reloadSession]);
+  }, [onSessionLost, reloadSession, refreshRooms]);
+
+  // 房间清单与状态快照各自独立：群聊区、侧边栏计数与「返回作战室」都靠它。
+  useEffect(() => {
+    void refreshRooms();
+  }, [refreshRooms]);
 
   const messages = state?.messages ?? [];
   const members = state?.members ?? [];
@@ -865,10 +934,20 @@ function RoomView({
   }, [members]);
 
   const selectedMember = members.find((member) => member.id === selectedMemberId);
-  const inWarRoom = !skillsOpen && !templatesOpen && !cronOpen && !newMemberOpen && !selectedMember;
-  /** 技能库 / 模板库 / 定时任务 / 智能体文件 / 新建成员独占右侧整块区域：此时连作战室（群聊）一起收起。 */
+  const inWarRoom =
+    !skillsOpen && !roomsOpen && !templatesOpen && !cronOpen && !newMemberOpen && !selectedMember;
+  /** 技能库 / 群聊区 / 模板库 / 定时任务 / 智能体文件 / 新建成员独占右侧整块区域：此时连聊天一起收起。 */
   const takeover =
-    skillsOpen || templatesOpen || cronOpen || newMemberOpen || Boolean(selectedMember);
+    skillsOpen ||
+    roomsOpen ||
+    templatesOpen ||
+    cronOpen ||
+    newMemberOpen ||
+    Boolean(selectedMember);
+  const isGroupRoom = state?.room.kind === "group";
+  /** 文案里的房间称呼：作战室或本群。 */
+  const roomLabel = isGroupRoom ? "本群" : "作战室";
+  const groupRooms = (rooms ?? []).filter((room) => room.kind === "group");
   const panelVisible = boardOpen || takeover;
   const runningCount = members.filter((member) => member.status === "running").length;
   const workspaceFileCount =
@@ -1220,7 +1299,9 @@ function RoomView({
     const runningNote =
       runningCount > 0 ? `\n\n正在运行的 ${runningCount} 个智能体会先被中止本轮回复。` : "";
     const confirmed = window.confirm(
-      `确定清空当前作战室吗？聊天记录、任务卡与文件工作区里的成果会整体归档，随时可以在右侧「归档」里恢复。${runningNote}\n\n智能体记忆（MEMORY.md、USER.md、memory/）与成员档案不进归档，也不受影响。`,
+      isGroupRoom
+        ? `确定清空${roomLabel}吗？聊天记录与任务卡会归档，随时可以在右侧「归档」里恢复。${runningNote}\n\n文件工作区是全账号共享的，不会被搬走；智能体记忆与成员档案也不受影响。`
+        : `确定清空当前作战室吗？聊天记录、任务卡与文件工作区里的成果会整体归档，随时可以在右侧「归档」里恢复。${runningNote}\n\n智能体记忆（MEMORY.md、USER.md、memory/）与成员档案不进归档，也不受影响。`,
     );
     if (!confirmed) return;
     setClearingChat(true);
@@ -1231,9 +1312,12 @@ function RoomView({
         current ? { ...current, messages: [], tasks: [] } : current,
       );
       setRuns({});
-      // 文件工作区里的顶层成果被整体移进了归档，当前打开的预览也不再存在。
-      closeWorkspacePreview();
-      await Promise.all([refreshArchives(), refreshWorkspaceFiles()]);
+      // 作战室的顶层成果被整体移进了归档，当前打开的预览也不再存在；群聊不动文件工作区。
+      if (!isGroupRoom) closeWorkspacePreview();
+      await Promise.all([
+        refreshArchives(),
+        isGroupRoom ? Promise.resolve(null) : refreshWorkspaceFiles(),
+      ]);
       if (result.archived) {
         // 刚存好的归档直接展开，用户一眼能看到自己清掉了什么。
         setRightTab("archives");
@@ -1241,12 +1325,12 @@ function RoomView({
       }
       setChatNotice(
         result.archived
-          ? `已归档 ${result.archived.messageCount} 条消息、${result.archived.taskCount} 张任务卡、${
-              result.archived.fileCount
-            } 个文件${
+          ? `已归档 ${result.archived.messageCount} 条消息、${result.archived.taskCount} 张任务卡${
+              result.archived.fileCount > 0 ? `、${result.archived.fileCount} 个文件` : ""
+            }${
               result.cancelled > 0 ? `，并中止了 ${result.cancelled} 个正在运行的成员` : ""
-            }；作战室已清空，可在右侧「归档」恢复。`
-          : "作战室本来就是空的，没有生成归档。",
+            }；${roomLabel}已清空，可在右侧「归档」恢复。`
+          : `${roomLabel}本来就是空的，没有生成归档。`,
       );
     } catch (err) {
       if (isUnauthorized(err)) onSessionLost();
@@ -1259,7 +1343,7 @@ function RoomView({
   async function handleRestoreArchive(archive: SessionArchiveSummary) {
     if (restoringArchive) return;
     const confirmed = window.confirm(
-      `恢复这份归档？会放回 ${archive.messageCount} 条消息、${archive.taskCount} 张任务卡、${archive.fileCount} 个文件。\n\n当前作战室的内容先自动存成一份新归档，所以这一步不会丢东西。`,
+      `恢复这份归档？会放回 ${archive.messageCount} 条消息、${archive.taskCount} 张任务卡、${archive.fileCount} 个文件。\n\n${roomLabel}当前的内容会先自动存成一份新归档，所以这一步不会丢东西。`,
     );
     if (!confirmed) return;
     setRestoringArchive(true);
@@ -1383,6 +1467,24 @@ function RoomView({
         return copy;
       });
       if (selectedMemberId === member.id) setSelectedMemberId(null);
+    } catch (err) {
+      setError(messageOf(err));
+    }
+  }
+
+  /** 群聊里的「移除」只摘本群花名册：成员池、作战室与其他群都不动。 */
+  async function handleKickMember(member: Member) {
+    const roomId = state?.room.id;
+    if (!roomId) return;
+    const confirmed = window.confirm(
+      `把 @${member.name} 移出本群？\n\n历史消息会保留，它在作战室与其他群聊里不受影响。`,
+    );
+    if (!confirmed) return;
+    setError(null);
+    try {
+      await kickRoomMember(roomId, member.id);
+      await reloadSession();
+      void refreshRooms();
     } catch (err) {
       setError(messageOf(err));
     }
@@ -1531,6 +1633,7 @@ function RoomView({
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setRoomsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -1541,6 +1644,7 @@ function RoomView({
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setRoomsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -1550,6 +1654,7 @@ function RoomView({
     setNewMemberOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setRoomsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
   }
@@ -1559,6 +1664,7 @@ function RoomView({
     setSkillsOpen(false);
     setNewMemberOpen(false);
     setCronOpen(false);
+    setRoomsOpen(false);
     setSelectedMemberId(null);
     setBoardOpen(true);
     setNavOpen(false);
@@ -1582,16 +1688,62 @@ function RoomView({
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setNewMemberOpen(false);
+    setRoomsOpen(false);
     setSelectedMemberId(null);
     setBoardOpen(true);
     setNavOpen(false);
   }
 
-  /** 作战室＝聊天本身：收起右侧的技能库/智能体文件，把焦点还给输入框。 */
-  function goToWarRoom() {
+  /** 群聊区面板：列表或花名册，两个标签共用同一个右侧区域。 */
+  function openRooms(tab: "list" | "members") {
+    setRoomsTab(tab);
+    setRoomsOpen(true);
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setNewMemberOpen(false);
+    setSelectedMemberId(null);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
+  /**
+   * 进入某间房：切换 api 层的当前房间（后续请求都会带 `?room=`），
+   * 再以服务端为准重拉状态。房间没变时只把焦点还给输入框。
+   */
+  async function enterRoom(roomId: string) {
+    if (roomId === activeRoom()) {
+      goToRoom();
+      return;
+    }
+    setActiveRoom(roomId);
+    setActiveRoomIdState(roomId);
+    try {
+      localStorage.setItem("ac_room", roomId);
+    } catch {
+      // storage can be unavailable in private mode
+    }
+    setRoomsOpen(false);
+    setSkillsOpen(false);
+    setTemplatesOpen(false);
+    setCronOpen(false);
+    setNewMemberOpen(false);
+    setSelectedMemberId(null);
+    setOpenArchiveId(null);
+    setArchiveDetail(null);
+    setCommandOutput(null);
+    setChatNotice(null);
+    setError(null);
+    await reloadSession();
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
+  /** 聊天本身：收起右侧的技能库/群聊区/智能体文件，把焦点还给输入框。 */
+  function goToRoom() {
+    setSkillsOpen(false);
+    setTemplatesOpen(false);
+    setCronOpen(false);
+    setRoomsOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setNavOpen(false);
@@ -1686,10 +1838,10 @@ function RoomView({
 
           <button
             type="button"
-            className={`room-entry${inWarRoom ? " active" : ""}`}
-            aria-pressed={inWarRoom}
-            title="回到群聊与任务看板"
-            onClick={goToWarRoom}
+            className={`room-entry${!isGroupRoom && inWarRoom ? " active" : ""}`}
+            aria-pressed={!isGroupRoom && inWarRoom}
+            title="回到作战室"
+            onClick={() => void enterRoom(MAIN_ROOM_ID)}
           >
             <span className="room-entry-icon">
               <Icon name="chat" size={15} />
@@ -1698,8 +1850,42 @@ function RoomView({
               <strong>作战室</strong>
               <small>{user.displayName} 的群聊 · 任务看板</small>
             </span>
-            {runningCount > 0 && <span className="room-entry-live">{runningCount} 运行中</span>}
+            {!isGroupRoom && runningCount > 0 && (
+              <span className="room-entry-live">{runningCount} 运行中</span>
+            )}
           </button>
+
+          {isGroupRoom && (
+            <button
+              type="button"
+              className={`room-entry current${inWarRoom ? " active" : ""}`}
+              aria-pressed={inWarRoom}
+              title="回到当前群聊"
+              onClick={goToRoom}
+            >
+              <span className="room-entry-icon">
+                <Icon name="users" size={15} />
+              </span>
+              <span className="room-entry-text">
+                <strong>{state.room.name}</strong>
+                <small>{state.room.topic || "群聊"} · 与作战室同一套界面</small>
+              </span>
+              {runningCount > 0 && <span className="room-entry-live">{runningCount} 运行中</span>}
+            </button>
+          )}
+
+          <div className="sidebar-quick">
+            <button
+              type="button"
+              className={`nav-item${newMemberOpen ? " active" : ""}`}
+              aria-pressed={newMemberOpen}
+              onClick={() => (newMemberOpen ? setNewMemberOpen(false) : openNewMember())}
+            >
+              <Icon name="plus" />
+              <span className="nav-label">新建成员</span>
+              <span className="nav-hint">按描述生成档案</span>
+            </button>
+          </div>
 
           <div className="nav-section">工作区</div>
 
@@ -1739,13 +1925,13 @@ function RoomView({
 
             <button
               type="button"
-              className={`nav-item${newMemberOpen ? " active" : ""}`}
-              aria-pressed={newMemberOpen}
-              onClick={() => (newMemberOpen ? setNewMemberOpen(false) : openNewMember())}
+              className={`nav-item${roomsOpen ? " active" : ""}`}
+              aria-pressed={roomsOpen}
+              onClick={() => (roomsOpen ? setRoomsOpen(false) : openRooms("list"))}
             >
-              <Icon name="plus" />
-              <span className="nav-label">新建成员</span>
-              <span className="nav-hint">按描述生成档案</span>
+              <Icon name="users" />
+              <span className="nav-label">群聊区</span>
+              <span className="nav-count">{groupRooms.length}</span>
             </button>
 
             <button
@@ -1755,7 +1941,7 @@ function RoomView({
               onClick={() => setMembersOpen((open) => !open)}
             >
               <Icon name="users" />
-              <span className="nav-label">成员</span>
+              <span className="nav-label">{isGroupRoom ? "群成员" : "成员"}</span>
               <span className="nav-count">{members.length}</span>
               <span className={`chevron${membersOpen ? " up" : ""}`}>
                 <Icon name="chevron" />
@@ -1764,6 +1950,19 @@ function RoomView({
           </nav>
           {membersOpen && (
             <ul className="member-list">
+            {isGroupRoom && (
+              <li className="member-invite-row">
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => openRooms("members")}
+                  title="从成员池拉人进这个群"
+                >
+                  <Icon name="plus" size={13} />
+                  拉成员进群
+                </button>
+              </li>
+            )}
             {members.map((member) => (
               <li key={member.id} className={`member-row${selectedMemberId === member.id ? " active" : ""}`}>
                 <span className="member-avatar">
@@ -1809,9 +2008,11 @@ function RoomView({
                   <button
                     type="button"
                     className="btn icon ghost danger member-remove"
-                    aria-label={`移除成员 @${member.name}`}
-                    title="移除成员"
-                    onClick={() => void handleRemoveMember(member)}
+                    aria-label={`${isGroupRoom ? "移出群聊" : "移除成员"} @${member.name}`}
+                    title={isGroupRoom ? "移出群聊（成员池与其他群不受影响）" : "移除成员"}
+                    onClick={() =>
+                      void (isGroupRoom ? handleKickMember(member) : handleRemoveMember(member))
+                    }
                   >
                     <Icon name="trash" />
                   </button>
@@ -1949,7 +2150,26 @@ function RoomView({
 
       <main className="content">
         <header className="content-header">
-          <div className="content-title">{state.room.name}</div>
+          <div className="content-title">
+            {state.room.name}
+            {isGroupRoom && <span className="room-kind-pill">群聊</span>}
+          </div>
+          {isGroupRoom && state.room.topic && (
+            <span className="room-head-topic" title={state.room.topic}>
+              {state.room.topic}
+            </span>
+          )}
+          {isGroupRoom && (
+            <button
+              type="button"
+              className="btn ghost sm room-back"
+              title="回到作战室"
+              onClick={() => void enterRoom(MAIN_ROOM_ID)}
+            >
+              <Icon name="back" size={13} />
+              <span>作战室</span>
+            </button>
+          )}
           <span className="env-pill">
             {defaultRef ? `${defaultRef}${modelNeedsKey ? "（未配置密钥）" : ""}` : "未配置模型"}
           </span>
@@ -1979,12 +2199,25 @@ function RoomView({
               className="btn ghost board-toggle"
               aria-pressed
               aria-controls="skills-panel"
-              title="关闭技能库，回到作战室"
+              title="关闭技能库，回到聊天"
               onClick={() => setSkillsOpen(false)}
             >
               <Icon name="book" />
               <span>技能库</span>
               <span className="chip">共享 · 个人</span>
+            </button>
+          ) : roomsOpen ? (
+            <button
+              type="button"
+              className="btn ghost board-toggle"
+              aria-pressed
+              aria-controls="rooms-panel"
+              title="关闭群聊区，回到聊天"
+              onClick={() => setRoomsOpen(false)}
+            >
+              <Icon name="users" />
+              <span>群聊区</span>
+              <span className="chip">{groupRooms.length}</span>
             </button>
           ) : templatesOpen ? (
             <button
@@ -2267,6 +2500,17 @@ function RoomView({
         <aside id="skills-panel" className="board-panel" aria-label="技能库">
           <SkillLibraryPanel onClose={() => setSkillsOpen(false)} />
         </aside>
+      ) : roomsOpen ? (
+        <aside id="rooms-panel" className="board-panel" aria-label="群聊区">
+          <RoomsPanel
+            rooms={rooms}
+            activeRoomId={activeRoomId}
+            initialTab={roomsTab}
+            onClose={() => setRoomsOpen(false)}
+            onEnter={(roomId) => void enterRoom(roomId)}
+            onChanged={syncRoomView}
+          />
+        </aside>
       ) : templatesOpen ? (
         <aside id="templates-panel" className="board-panel" aria-label="模板库">
           <TemplateLibraryPanel
@@ -2310,6 +2554,22 @@ function RoomView({
             onClose={() => setNewMemberOpen(false)}
             onCreated={(member) => {
               setNewMemberOpen(false);
+              // 在群聊里新建成员：顺手拉进本群，省得再回群聊区操作一次。
+              if (isGroupRoom && state) {
+                void (async () => {
+                  try {
+                    await inviteRoomMember(state.room.id, member.id);
+                    await reloadSession();
+                    void refreshRooms();
+                    setChatNotice(`已把 @${member.name} 拉进本群，@ 它就能派活。`);
+                  } catch (err) {
+                    if (isUnauthorized(err)) onSessionLost();
+                    else setError(messageOf(err));
+                  }
+                  openAgentFiles(member.id);
+                })();
+                return;
+              }
               openAgentFiles(member.id);
             }}
           />

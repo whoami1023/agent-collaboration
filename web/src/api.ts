@@ -3,6 +3,8 @@ import type {
   Member,
   PublicUser,
   RoomEvent,
+  RoomInfo,
+  RoomKind,
   RoomMessage,
   RoomMode,
   SessionArchiveDetail,
@@ -18,6 +20,8 @@ import type {
   CronSchedule,
 } from "../../src/cron/types";
 import type { ProviderApi } from "../../src/model/types";
+
+export type { RoomInfo, RoomKind, RoomMode };
 
 export interface MaskedModel {
   id: string;
@@ -60,7 +64,7 @@ export interface MaskedSettings {
 }
 
 export interface StateSnapshot {
-  room: { id: string; name: string; mode: RoomMode };
+  room: { id: string; name: string; kind: RoomKind; topic?: string; mode: RoomMode };
   members: Member[];
   messages: RoomMessage[];
   tasks: TaskCard[];
@@ -69,6 +73,36 @@ export interface StateSnapshot {
 
 export interface BootstrapInfo {
   needsSetup: boolean;
+}
+
+/** 作战室的房间 ID：与 src/room/registry.ts 里的常量一致（前端不能引服务端模块）。 */
+export const MAIN_ROOM_ID = "room_main";
+
+/**
+ * 当前正在看的房间。「群聊区」里进入哪间群，这里就是哪间：
+ * 所有按房间走的路由都自动带上 `?room=`，页面其余部分（聊天、看板、归档）因此和作战室完全同一套界面。
+ */
+let activeRoomId = MAIN_ROOM_ID;
+
+export function activeRoom(): string {
+  return activeRoomId;
+}
+
+/** 恢复上次停留的房间；形状不对一律回落到作战室。 */
+export function restoreActiveRoom(value: string | null | undefined): string {
+  activeRoomId = typeof value === "string" && /^room_[0-9a-f]{12}$/.test(value) ? value : MAIN_ROOM_ID;
+  return activeRoomId;
+}
+
+export function setActiveRoom(roomId: string): string {
+  activeRoomId = roomId || MAIN_ROOM_ID;
+  return activeRoomId;
+}
+
+/** 给按房间走的路径追加 `?room=`：作战室保持原样，请求 URL 与旧版一致。 */
+function withRoom(path: string, roomId = activeRoomId): string {
+  if (roomId === MAIN_ROOM_ID) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}room=${encodeURIComponent(roomId)}`;
 }
 
 export class ApiError extends Error {
@@ -527,21 +561,89 @@ export async function fetchCronRuns(query: { jobId?: string; limit?: number } = 
 }
 
 export function fetchState(): Promise<StateSnapshot> {
-  return request<StateSnapshot>("/api/state");
+  return request<StateSnapshot>(withRoom("/api/state"));
 }
 
-export async function setRoomMode(
-  mode: RoomMode,
-): Promise<{ id: string; name: string; mode: RoomMode }> {
-  const body = await request<{ room: { id: string; name: string; mode: RoomMode } }>("/api/room", {
-    method: "PATCH",
-    body: JSON.stringify({ mode }),
+/** 房间列表：作战室在第一间，其后是「群聊区」里自建的每间群聊。 */
+export async function fetchRooms(): Promise<RoomInfo[]> {
+  const body = await request<{ rooms: RoomInfo[] }>("/api/rooms");
+  return body.rooms;
+}
+
+/** 成员池（作战室的花名册）：群聊区拉人时按这份名单勾选。 */
+export async function fetchPoolMembers(): Promise<Member[]> {
+  const body = await request<{ members: Member[] }>("/api/members");
+  return body.members;
+}
+
+/** 某间房间当前的花名册。 */
+export async function fetchRoomMembers(roomId: string): Promise<Member[]> {
+  const body = await request<{ members: Member[] }>(
+    `/api/rooms/${encodeURIComponent(roomId)}/members`,
+  );
+  return body.members;
+}
+
+export async function createRoom(input: {
+  name: string;
+  topic?: string;
+  memberIds?: string[];
+}): Promise<RoomInfo> {
+  const body = await request<{ room: RoomInfo }>("/api/rooms", {
+    method: "POST",
+    body: JSON.stringify(input),
   });
   return body.room;
 }
 
+export async function updateRoom(
+  roomId: string,
+  patch: { name?: string; topic?: string },
+): Promise<RoomInfo> {
+  const body = await request<{ room: RoomInfo }>(`/api/rooms/${encodeURIComponent(roomId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+  return body.room;
+}
+
+export async function deleteRoom(roomId: string): Promise<string> {
+  const body = await request<{ removed: string }>(`/api/rooms/${encodeURIComponent(roomId)}`, {
+    method: "DELETE",
+  });
+  return body.removed;
+}
+
+export async function inviteRoomMember(
+  roomId: string,
+  memberId: string,
+): Promise<{ room: RoomInfo; member: Member }> {
+  return request<{ room: RoomInfo; member: Member }>(
+    `/api/rooms/${encodeURIComponent(roomId)}/members`,
+    { method: "POST", body: JSON.stringify({ memberId }) },
+  );
+}
+
+export async function kickRoomMember(roomId: string, memberId: string): Promise<RoomInfo> {
+  const body = await request<{ removed: string; room: RoomInfo }>(
+    `/api/rooms/${encodeURIComponent(roomId)}/members/${encodeURIComponent(memberId)}`,
+    { method: "DELETE" },
+  );
+  return body.room;
+}
+
+export async function setRoomMode(
+  mode: RoomMode,
+): Promise<{ id: string; name: string; kind: RoomKind; mode: RoomMode }> {
+  const body = await request<{ room: { id: string; name: string; kind: RoomKind; mode: RoomMode } }>(
+    withRoom("/api/room"),
+    { method: "PATCH", body: JSON.stringify({ mode }) },
+  );
+  return body.room;
+}
+
 export async function sendMessage(text: string): Promise<RoomMessage> {
-  const body = await request<{ message: RoomMessage }>("/api/messages", {
+  const body = await request<{ message: RoomMessage }>(withRoom("/api/messages"), {
     method: "POST",
     body: JSON.stringify({ text }),
   });
@@ -558,15 +660,17 @@ export interface SessionResetResult {
 
 /** /clear：中止在跑的成员，把群聊记录、任务卡与文件成果归档后清空作战室。 */
 export function clearMessages(): Promise<SessionResetResult> {
-  return request<SessionResetResult>("/api/messages", { method: "DELETE" });
+  return request<SessionResetResult>(withRoom("/api/messages"), { method: "DELETE" });
 }
 
 /** /new：归档聊天记录与任务卡后开一个新会话；文件工作区、成员与智能体记忆都保留。 */
 export function startNewSession(): Promise<SessionResetResult> {
-  return request<SessionResetResult>("/api/session/new", { method: "POST" });
+  return request<SessionResetResult>(withRoom("/api/session/new"), { method: "POST" });
 }
 
-export async function fetchArchives(): Promise<SessionArchiveSummary[]> {  const body = await request<{ archives: SessionArchiveSummary[] }>("/api/archives");
+/** 归档列表按房间过滤：恢复时要能把内容放回原来那间房。 */
+export async function fetchArchives(): Promise<SessionArchiveSummary[]> {
+  const body = await request<{ archives: SessionArchiveSummary[] }>(withRoom("/api/archives"));
   return body.archives;
 }
 
@@ -591,7 +695,7 @@ export function restoreArchive(id: string): Promise<{
     restoredFiles: string[];
     conflicts: string[];
     cancelled: number;
-  }>(`/api/archives/${encodeURIComponent(id)}/restore`, { method: "POST" });
+  }>(withRoom(`/api/archives/${encodeURIComponent(id)}/restore`), { method: "POST" });
 }
 
 export async function deleteArchive(id: string): Promise<string> {
@@ -602,16 +706,17 @@ export async function deleteArchive(id: string): Promise<string> {
 }
 
 export async function cancelAllMembers(): Promise<number> {
-  const body = await request<{ cancelled: number }>("/api/members/cancel-all", {
+  const body = await request<{ cancelled: number }>(withRoom("/api/members/cancel-all"), {
     method: "POST",
   });
   return body.cancelled;
 }
 
 export async function cancelMember(memberId: string): Promise<boolean> {
-  const body = await request<{ cancelled: boolean }>(`/api/members/${memberId}/cancel`, {
-    method: "POST",
-  });
+  const body = await request<{ cancelled: boolean }>(
+    withRoom(`/api/members/${memberId}/cancel`),
+    { method: "POST" },
+  );
   return body.cancelled;
 }
 
@@ -803,7 +908,7 @@ export async function saveMemberSkills(
 }
 
 export async function createTask(title: string): Promise<TaskCard> {
-  const body = await request<{ task: TaskCard }>("/api/tasks", {
+  const body = await request<{ task: TaskCard }>(withRoom("/api/tasks"), {
     method: "POST",
     body: JSON.stringify({ title }),
   });
@@ -811,7 +916,7 @@ export async function createTask(title: string): Promise<TaskCard> {
 }
 
 export async function patchTask(taskId: string, patch: { status?: string }): Promise<TaskCard> {
-  const body = await request<{ task: TaskCard }>(`/api/tasks/${taskId}`, {
+  const body = await request<{ task: TaskCard }>(withRoom(`/api/tasks/${taskId}`), {
     method: "PATCH",
     body: JSON.stringify(patch),
   });
@@ -980,14 +1085,21 @@ export async function setMemberModel(
   return body.member;
 }
 
+/** 一帧 SSE：事件本身 + 它来自哪间房。一个连接要喂作战室和「群聊区」里所有的群。 */
+export interface RoomFrame {
+  roomId: string;
+  event: RoomEvent;
+}
+
 export function subscribeEvents(
-  onEvent: (event: RoomEvent) => void,
+  onFrame: (frame: RoomFrame) => void,
   onError?: () => void,
 ): () => void {
   const source = new EventSource("/api/events");
   source.onmessage = (event) => {
     try {
-      onEvent(JSON.parse(event.data) as RoomEvent);
+      const frame = JSON.parse(event.data) as RoomFrame;
+      if (frame && typeof frame.roomId === "string" && frame.event) onFrame(frame);
     } catch {
       // ignore malformed frames
     }

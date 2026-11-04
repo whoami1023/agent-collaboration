@@ -106,6 +106,11 @@ export class RoomBus {
     return this.messages.slice(-limit);
   }
 
+  /** 房间里的消息总条数（含被窗口截断前保留的全部历史）：群聊列表要显示它。 */
+  get messageCount(): number {
+    return this.messages.length;
+  }
+
   /** 清空聊天记录：保留 seq 单调递增，避免旧事件与新一轮消息的序号混淆。 */
   clearMessages(): number {
     const cleared = this.messages.length;
