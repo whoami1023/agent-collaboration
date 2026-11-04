@@ -244,7 +244,8 @@ export class Orchestrator {
   /**
    * 用户在「新建成员」面板直接创建子智能体：名字 + 功能描述（可来自模板库）。
    * 与 spawn 共用准入规则（成员数上限、命名与重名校验），但不派发任务，
-   * 只生成成员与其默认档案（agents/<id>/SOUL.md、IDENTITY.md），等主智能体或用户 @ 它。
+   * 只生成成员与其默认档案（agents/<id>/SOUL.md、IDENTITY.md），并把它的职责与技能记入
+   * 主智能体的成员能力档案 TEAM.md，等主智能体或用户 @ 它。
    */
   async createMember(input: {
     name: string;
@@ -328,18 +329,22 @@ export class Orchestrator {
         ...input.profile,
         sourceTemplate: input.template?.title ?? input.profile?.sourceTemplate,
       });
+      // 把新成员的能力与技能写进主智能体的 TEAM.md，主智能体分派前就知道它能做什么。
+      await this.deps.memory?.syncTeamFile();
       bus.append({
         senderId: SYSTEM_ID,
         senderName: "系统",
         senderKind: "system",
         kind: "system",
-        text: input.template
-          ? `已按模板「${input.template.title}」创建成员 @${member.name}${
-              skillNames.length > 0 ? `，可用技能 ${skillNames.length} 个` : ""
-            }。`
-          : autoChose && skillNames.length === 0
-            ? `已创建成员 @${member.name}：${description}\n描述里没匹配到对口技能，暂时不限技能（可用技能 ${usable.length} 个）；想收紧到某几个，在成员的「智能体文件 · 技能」里勾选。`
-            : `已创建成员 @${member.name}：${description}\n按功能描述启用了 ${skillNames.length} 个技能：${skillNames.join("、")}。可在成员的「智能体文件 · 技能」里增减。`,
+        text: `${
+          input.template
+            ? `已按模板「${input.template.title}」创建成员 @${member.name}${
+                skillNames.length > 0 ? `，可用技能 ${skillNames.length} 个` : ""
+              }。`
+            : autoChose && skillNames.length === 0
+              ? `已创建成员 @${member.name}：${description}\n描述里没匹配到对口技能，暂时不限技能（可用技能 ${usable.length} 个）；想收紧到某几个，在成员的「智能体文件 · 技能」里勾选。`
+              : `已创建成员 @${member.name}：${description}\n按功能描述启用了 ${skillNames.length} 个技能：${skillNames.join("、")}。可在成员的「智能体文件 · 技能」里增减。`
+        }\n它的职责与可用技能已写入主智能体工作区根部的 TEAM.md，分派任务前先看那份成员能力档案。`,
       });
       return member;
     } finally {
@@ -369,6 +374,7 @@ export class Orchestrator {
 
     bus.removeMember(memberId);
     await this.deps.memory?.removeMemberProfile(memberId);
+    await this.deps.memory?.syncTeamFile();
     bus.append({
       senderId: SYSTEM_ID,
       senderName: "系统",

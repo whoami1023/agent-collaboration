@@ -3186,7 +3186,7 @@ function AgentFilesPanel({
       const view = await saveMemberSkills(member.id, skillDraft);
       setSkillView(view);
       setSkillDraft(view.enabled);
-      setSkillNotice("已保存，从该智能体下一次运行开始生效");
+      setSkillNotice("已保存，从该智能体下一次运行开始生效；主智能体 TEAM.md 里的技能一行同步更新");
     } catch (err) {
       setSkillError(
         err instanceof ApiError && err.status === 404
@@ -3502,8 +3502,8 @@ function AgentFilesPanel({
           <p className="files-empty">{fileError}</p>
         ) : (
           <p className="files-empty">
-            这个工作区还没有可读的智能体文件。首次加载会自动生成 MEMORY.md、USER.md、SOUL.md
-            与 IDENTITY.md 模板；若被删除，重新打开房间会再次补齐。
+            这个工作区还没有可读的智能体文件。首次加载会自动生成 MEMORY.md、USER.md、SOUL.md、IDENTITY.md
+            模板与成员能力档案 TEAM.md；若被删除，重新打开房间会再次补齐。
           </p>
         )}
       </div>
@@ -3570,7 +3570,7 @@ function NewMemberPanel({
       <div className="board-body">
         <p className="new-member-hint">
           新建一个子智能体加入成员列表。名字是群里 @ 它的引用；功能描述会写进它的默认智能体文件（SOUL.md
-          与 IDENTITY.md），并据此从技能库里挑几个对口技能启用（不会把整个技能库都塞给它）。每个成员还拥有自己的 MEMORY.md
+          与 IDENTITY.md），同时记入主智能体的成员能力档案 TEAM.md，主智能体据此决定把活派给谁；技能按描述从技能库里挑几个对口的启用（不会把整个技能库都塞给它）。每个成员还拥有自己的 MEMORY.md
           与 USER.md，记忆检索只在该成员自己的范围内命中；创建后技能与档案都可在「智能体文件」里继续修改。
           想省事可以先到侧边栏「模板库」引用一个现成角色。
         </p>
@@ -3595,7 +3595,7 @@ function NewMemberPanel({
               placeholder="例如：负责检索资料并给出带出处的结论；不需要写代码，遇到需要动手的活就说明清楚交给别人。"
               onChange={(event) => setDescription(event.target.value)}
             />
-            <small className="form-note">据此生成 SOUL.md 与 IDENTITY.md 并挑选对口技能，最多 800 字</small>
+            <small className="form-note">据此生成 SOUL.md、IDENTITY.md 与主智能体的 TEAM.md 能力档案，并挑选对口技能，最多 800 字</small>
           </label>
           {error && (
             <p className="form-error" role="alert">

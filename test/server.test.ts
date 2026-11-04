@@ -757,6 +757,15 @@ describe("成员 API：新建成员与智能体文件编辑", () => {
       `agents/${memberId}/IDENTITY.md`,
     ]);
 
+    // 主智能体这边同时多出/更新了一份成员能力档案 TEAM.md。
+    const mainList = await call("/api/members/m_main/files", { cookie });
+    expect(
+      (mainList.body["files"] as Array<Record<string, unknown>>).map((file) => file["path"]),
+    ).toContain("TEAM.md");
+    const team = await call("/api/members/m_main/files/content?path=TEAM.md&full=1", { cookie });
+    expect(String(team.body["content"])).toContain("## @调研员");
+    expect(String(team.body["content"])).toContain("- 能力：负责检索资料并给出带出处的结论");
+
     const soulPath = `agents/${memberId}/SOUL.md`;
     const detail = await call(
       `/api/members/${memberId}/files/content?path=${encodeURIComponent(soulPath)}`,
@@ -884,6 +893,13 @@ describe("成员技能授权 API", () => {
     });
     expect(saved.status).toBe(200);
     expect(saved.body["enabled"]).toEqual(["research-brief"]);
+
+    // 技能授权变了要同步反映到主智能体的成员能力档案里。
+    const teamFile = await call(`/api/members/m_main/files/content?path=${encodeURIComponent("TEAM.md")}&full=1`, {
+      cookie,
+    });
+    expect(teamFile.status).toBe(200);
+    expect(String(teamFile.body["content"])).toContain("- 技能：research-brief");
 
     const state = await call("/api/state", { cookie });
     const updated = (state.body["members"] as Array<Record<string, unknown>>).find(
@@ -1483,6 +1499,9 @@ describe("成员 API：移除成员", () => {
     expect(String(messages.at(-1)?.["text"])).toContain("@资料员");
 
     expect((await call(`/api/members/${memberId}/files`, { cookie })).status).toBe(404);
+    // 成员能力档案里对应段落跟着删掉。
+    const team = await call("/api/members/m_main/files/content?path=TEAM.md&full=1", { cookie });
+    expect(String(team.body["content"])).not.toContain("## @资料员");
   });
 
   it("主智能体不能移除，未知成员 404，未登录 401", async () => {

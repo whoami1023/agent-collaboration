@@ -43,6 +43,7 @@ import {
 } from "./project-ranking";
 import type { MemorySource, TemporalDecayConfig } from "./temporal-decay";
 import { applyTemporalDecayToHybridResults } from "./temporal-decay";
+import { readTeamFileForPrompt, syncTeamFile, TEAM_FILE_NAME } from "./team-file";
 import {
   bm25RelevanceToScore,
   literalSearchMatcher,
@@ -935,7 +936,7 @@ export class MemorySearchManager {
   }
 
   /**
-   * Web 端「智能体文件」面板清单：记忆语料 + 身份/性格文件，按 bootstrap 顺序排列。
+   * Web 端「智能体文件」面板清单：记忆语料 + 身份/性格/成员能力档案，按 bootstrap 顺序排列。
    * 选中子成员时改列它自己的档案（agents/<id>/），主智能体维持工作区根部的文件。
    */
   async listAgentFiles(
@@ -999,6 +1000,24 @@ export class MemorySearchManager {
     await fs.rm(dir, { recursive: true, force: true });
   }
 
+  /**
+   * 重建主智能体的 TEAM.md（成员能力档案）：新建/移除成员、调整技能授权后各调一次，
+   * 群加载时也调一次补齐老工作区。以总线当前成员名单为准，用户手改过的段落保持原样。
+   */
+  async syncTeamFile(): Promise<void> {
+    const members = this.options.bus.listMembers();
+    const main = members.find((member) => member.role === "main");
+    await syncTeamFile(this.options.workspaceDir, members, {
+      roomName: this.options.bus.roomName,
+      mainAgentName: main?.name ?? "主智能体",
+    });
+  }
+
+  /** 主智能体系统提示词用的能力档案正文；文件缺失或读失败时不注入。 */
+  async readTeamFile(): Promise<string | undefined> {
+    return readTeamFileForPrompt(this.options.workspaceDir).catch(() => undefined);
+  }
+
   private async listMemberAgentFiles(
     memberId: string,
   ): Promise<Array<{ path: string; sizeBytes: number; updatedAt: number }>> {
@@ -1035,7 +1054,7 @@ export class MemorySearchManager {
     return this.readWithin(
       relPath,
       isAgentFileAllowed,
-      `只允许读写 MEMORY.md、USER.md、SOUL.md、IDENTITY.md、memory/ 或 agents/<id>/ 下的文件：${relPath}`,
+      `只允许读写 ${AGENT_FILE_REFUSAL_HINT} 下的文件：${relPath}`,
       options?.full ? { from: 1, lines: Number.MAX_SAFE_INTEGER, full: true } : undefined,
     );
   }
@@ -1056,7 +1075,7 @@ export class MemorySearchManager {
     const workspaceRoot = path.resolve(this.options.workspaceDir);
     const absPath = path.resolve(workspaceRoot, normalized);
     if (!isAgentFileAllowed(absPath, workspaceRoot)) {
-      throw new Error(`只允许读写 MEMORY.md、USER.md、SOUL.md、IDENTITY.md、memory/ 或 agents/<id>/ 下的文件：${relPath}`);
+      throw new Error(`只允许读写 ${AGENT_FILE_REFUSAL_HINT} 下的文件：${relPath}`);
     }
     const rel = path.relative(workspaceRoot, absPath).replaceAll("\\", "/");
     // 白名单已确认在可写范围内，父目录缺失（如新建 memory/ 文件）时补建。
@@ -1172,8 +1191,14 @@ function isMemoryRootPath(absPath: string, workspaceRoot: string): boolean {
   );
 }
 
-/** 不属于检索语料、但属于智能体档案的工作区文件（性格与身份）。 */
-const NON_MEMORY_AGENT_FILES: readonly string[] = ["SOUL.md", "IDENTITY.md"];
+/** 工作区根部、既是记忆语料又是智能体档案的文件。 */
+const AGENT_ROOT_MEMORY_FILES: readonly string[] = ["MEMORY.md", "USER.md"];
+
+/** 不属于检索语料、但属于智能体档案的工作区文件（性格、身份与成员能力档案）。 */
+const NON_MEMORY_AGENT_FILES: readonly string[] = ["SOUL.md", "IDENTITY.md", TEAM_FILE_NAME];
+
+/** 白名单报错文案跟随常量，新增档案文件时不会漏改提示。 */
+const AGENT_FILE_REFUSAL_HINT = `${[...AGENT_ROOT_MEMORY_FILES, ...NON_MEMORY_AGENT_FILES].join("、")}、memory/ 或 agents/<id>/`;
 
 /** 子成员私有的记忆文件：检索语料随 agents/<id>/ 收录，只对该成员可见。 */
 const MEMBER_MEMORY_FILES: readonly string[] = ["MEMORY.md", "USER.md"];

@@ -163,6 +163,13 @@ export class MemberRuntime {
         ...(this.deps.memory ? { memory: this.deps.memory } : {}),
         ...(this.deps.files ? { files: this.deps.files } : {}),
       });
+      // 主智能体要按成员能力档案决定把活派给谁：每次运行前同步 TEAM.md 再读进来，
+      // 保证新建、移除成员或改技能授权后下一轮就看到最新值（读失败则不注入，fail-open）。
+      let teamFile: string | undefined;
+      if (member.role === "main" && this.deps.memory) {
+        await this.deps.memory.syncTeamFile().catch(() => undefined);
+        teamFile = await this.deps.memory.readTeamFile();
+      }
       const system = buildSystemPrompt({
         roomName: bus.roomName,
         member,
@@ -176,6 +183,7 @@ export class MemberRuntime {
           description: skill.description,
           scope: skill.scope,
         })),
+        ...(teamFile ? { teamFile } : {}),
         availableTools: new Set(tools.map((tool) => tool.schema.name)),
       });
       // Lane-1 触发召回（移植 active-memory）：在主模型请求前跑，失败即不注入（fail-open）。

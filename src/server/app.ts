@@ -858,6 +858,8 @@ export function createApp(deps: AppDeps): express.Express {
     if (selection === undefined) delete member.skillNames;
     else member.skillNames = selection;
     workspace.bus.updateMember(member);
+    // 技能授权变了：成员能力档案里的「技能」一行要跟着刷新，面板才不会显示旧白名单。
+    await workspace.memory.syncTeamFile();
     res.json(memberSkillsView(member, userId));
   });
 

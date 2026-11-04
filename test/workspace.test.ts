@@ -185,7 +185,13 @@ describe("WorkspaceRegistry", () => {
   it("首次加载即生成智能体档案文件，且不覆盖已有内容", async () => {
     const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
     const files = await alice.memory.listAgentFiles();
-    expect(files.map((file) => file.path)).toEqual(["MEMORY.md", "USER.md", "SOUL.md", "IDENTITY.md"]);
+    expect(files.map((file) => file.path)).toEqual([
+      "MEMORY.md",
+      "USER.md",
+      "SOUL.md",
+      "IDENTITY.md",
+      "TEAM.md",
+    ]);
     const soul = await alice.memory.readAgentFile("SOUL.md");
     expect(soul.content).toContain("我是谁");
 

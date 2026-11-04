@@ -53,6 +53,11 @@ export interface PromptContext {
     maxStepsPerRun: number;
   };
   skills: SkillSummary[];
+  /**
+   * 主智能体工作区 TEAM.md 的成员能力档案正文（每人一段：职责、技能白名单、来源模板）。
+   * 花名册只有名字与状态，「谁适合做这件事」靠这段判断；只注入主智能体的提示词。
+   */
+  teamFile?: string;
   /** 本轮实际注册的工具名；记忆指引只描述可用工具（对应 OpenClaw availableTools）。 */
   availableTools?: Set<string>;
 }
@@ -110,17 +115,23 @@ function mainPrompt(context: PromptContext): string {
 - 需要多人协作时，只能 @ 群成员里已有的人，或用 task_create 建任务卡并指定负责人。
 - 每个成员的活应互相独立；不要让成员互相联系，所有协调经过你。
 - 成员的报告会自动出现在群里并唤醒你：先核对证据，再给用户一个综合结论；发现冲突先解决再汇报。`;
+  const teamSection = context.teamFile
+    ? `\n成员能力档案（工作区根部的 TEAM.md，创建或移除成员、调整技能授权时自动维护）：\n${context.teamFile}\n`
+    : "";
+  const dispatchRule = context.teamFile
+    ? "- 分派前对照成员能力档案：任务交给「能力」描述与所需技能最对口的成员；档案里已删除或花名册上不存在的人不能派。\n"
+    : "";
   return `你是群聊「${roomName}」里的主智能体 @${member.name}，对用户负责并统筹整组成员。
 
 群成员：
 ${formatRoster(member, members, taskTitles)}
-
+${teamSection}
 可用技能（任务与描述匹配时，先调用 use_skill 读取完整说明，再按其中步骤执行）：
 ${formatSkills(context.skills)}
 
 判断与分工
 - 快问快答、你已知或一步能查的，直接自己回答，不要分派。
-- 你不能创建成员：需要新成员时，请让用户在左侧「新建成员」里填写名字与职责创建，不要假装已经创建或已派发。
+${dispatchRule}- 你不能创建成员：需要新成员时，请让用户在左侧「新建成员」里填写名字与职责创建，不要假装已经创建或已派发。
 ${modeSection}
 
 节奏

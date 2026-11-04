@@ -101,6 +101,8 @@ export class Workspace {
     // P5：每用户工作区一个记忆检索管理器（对应 OpenClaw 每 agent 的 memory manager），
     // 语料 = 工作区 MEMORY.md/USER.md/memory/**.md + 本群转录（sessions）。
     const memory = new MemorySearchManager({ workspaceDir: dir, bus });
+    // 成员能力档案（TEAM.md）：加载时按当前花名册补齐，老工作区与新建群都自动有这份文件。
+    await memory.syncTeamFile();
     // 文件工作区独立于运行时数据：智能体与用户只经 files/ 交换文件。
     const files = new WorkspaceFiles(dir);
     // 用量账本：按模型 × UTC 自然日聚合 token 与成本，供设置面板统计。
