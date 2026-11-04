@@ -115,4 +115,46 @@ describe("agent loop", () => {
       }),
     ).rejects.toMatchObject({ name: "AbortError" });
   });
+
+  it("大预算在只剩 3 步时提醒收尾且只提醒一次，小预算不打扰", async () => {
+    const userTurnsOf = (request: Parameters<MockHandler>[0]) =>
+      request.messages.filter((m) => m.role === "user").map((m) => String(m.content));
+    let counter = 0;
+    const handler: MockHandler = (request) => {
+      turns.push(userTurnsOf(request));
+      if (request.tools.length === 0) return { text: "收尾总结" };
+      counter += 1;
+      return { toolCalls: [{ name: "echo", args: { text: String(counter) } }] };
+    };
+    const turns: string[][] = [];
+    const big = await runAgentLoop({
+      provider: new MockProvider(handler),
+      model: "mock",
+      system: "测试",
+      messages: [{ role: "user", content: "开始" }],
+      tools: [echoTool],
+      maxSteps: 24,
+      signal: new AbortController().signal,
+    });
+    const noticedAt = (list: string[]) => list.filter((c) => c.includes("步数预算只剩 3 步")).length;
+    const firstNoticeTurn = turns.findIndex((list) => noticedAt(list) > 0);
+    expect(big.maxStepsReached).toBe(true);
+    expect(firstNoticeTurn).toBe(21);
+    expect(turns.slice(0, firstNoticeTurn).every((list) => noticedAt(list) === 0)).toBe(true);
+    // 只注入一次：之后每轮都带着同一条提醒，不会重复叠加。
+    expect(turns.slice(firstNoticeTurn).every((list) => noticedAt(list) === 1)).toBe(true);
+
+    turns.length = 0;
+    const small = await runAgentLoop({
+      provider: new MockProvider(handler),
+      model: "mock",
+      system: "测试",
+      messages: [{ role: "user", content: "开始" }],
+      tools: [echoTool],
+      maxSteps: 6,
+      signal: new AbortController().signal,
+    });
+    expect(small.maxStepsReached).toBe(true);
+    expect(turns.some((list) => list.some((c) => c.includes("步数预算只剩")))).toBe(false);
+  });
 });

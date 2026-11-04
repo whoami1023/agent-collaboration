@@ -315,6 +315,11 @@ select {
   color: var(--muted);
 }
 
+.field > span .chip {
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
 .field-label {
   display: flex;
   align-items: center;
@@ -1864,6 +1869,7 @@ body.pane-dragging * {
 
 .composer-hint {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   width: 100%;
@@ -1871,6 +1877,55 @@ body.pane-dragging * {
   margin: 7px auto 0;
   color: var(--muted);
   font-size: var(--text-xs);
+}
+
+.composer-tips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+
+.composer-actions {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+/* 会话操作按钮：贴在输入框下面但要一眼认出是可按的——实边框、轻投影、各自带色，
+   新建走主强调色，清除走警示色（归档可恢复，不用危险红）。 */
+.btn.composer-btn {
+  height: 30px;
+  padding: 0 11px;
+  font-size: 13px;
+  background: var(--card);
+  box-shadow: var(--shadow-sm);
+  transition: background 0.18s var(--ease), border-color 0.18s var(--ease),
+    color 0.18s var(--ease), box-shadow 0.18s var(--ease);
+}
+
+.btn.composer-btn.new-session {
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--border-strong));
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.btn.composer-btn.new-session:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--card));
+  color: var(--accent-hover);
+}
+
+.btn.composer-btn.clear-session {
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--border-strong));
+  background: color-mix(in srgb, var(--warn) 7%, var(--card));
+  color: var(--warn);
+}
+
+.btn.composer-btn.clear-session:hover:not(:disabled) {
+  border-color: var(--warn);
+  background: var(--warn-subtle);
+  color: var(--warn);
 }
 
 /* ---------- board ---------- */
@@ -5055,7 +5110,7 @@ body.pane-dragging * {
     border-radius: var(--radius-lg) var(--radius-lg) 0 0;
   }
 
-  .composer-hint span:last-child {
+  .composer-tips span:last-child {
     display: none;
   }
 

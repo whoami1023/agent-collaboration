@@ -21,7 +21,7 @@ import { looksMasked, preserveSecretOnPatch, secretPreview } from "../model/secr
 
 export type { ModelDefinition, ModelSelection, ProviderApi, ProviderConfig } from "../model/types";
 
-export const SETTINGS_VERSION = 4;
+export const SETTINGS_VERSION = 5;
 
 /**
  * 内置别名（对应 OpenClaw `src/config/defaults.ts` 的 alias 表），
@@ -186,9 +186,20 @@ interface LegacySettings {
 }
 
 /**
+ * 各版本的出厂默认限额。迁移只认「存的值 == 该版本的默认值」，
+ * 命中才升级到当前默认，用户显式改过的数值一律保持不动。
+ */
+const LEGACY_LIMIT_DEFAULTS: ReadonlyArray<{ since: number; maxStepsPerRun: number; runTimeoutMs: number }> = [
+  { since: 1, maxStepsPerRun: 12, runTimeoutMs: 120_000 },
+  { since: 2, maxStepsPerRun: 24, runTimeoutMs: 180_000 },
+  { since: 3, maxStepsPerRun: 48, runTimeoutMs: 420_000 },
+];
+
+/**
  * 逐级迁移历史默认值：只有「存的值 == 那一版的默认值」才升级，用户显式改过的数值保持不动。
- * v1 默认 12 步 / 120 秒，v2 默认 24 步 / 180 秒，v3 默认 48 步 / 420 秒，
- * v4 把单 `model` 字符串的 provider 升级为模型目录，并把 `activeProviderId` 升级为 `selection.defaultModel`。
+ * v1 默认 12 步 / 120 秒，v2 默认 24 步 / 180 秒，v3-v4 默认 48 步 / 420 秒，
+ * v4 把单 `model` 字符串的 provider 升级为模型目录，并把 `activeProviderId` 升级为 `selection.defaultModel`，
+ * v5 把单次运行步数默认值收回 24 步（48 步跑满要几十次工具调用，多数任务在 24 步内就该收尾）。
  */
 function migrateSettings(raw: Partial<Settings>): Partial<Settings> {
   const legacy = raw as LegacySettings;
@@ -197,10 +208,11 @@ function migrateSettings(raw: Partial<Settings>): Partial<Settings> {
 
   const limits: Limits = { ...DEFAULT_LIMITS, ...(legacy.limits ?? {}) };
   const stored = legacy.limits;
-  if (stored?.maxStepsPerRun === 12) limits.maxStepsPerRun = DEFAULT_LIMITS.maxStepsPerRun;
-  else if (version >= 2 && stored?.maxStepsPerRun === 24) limits.maxStepsPerRun = DEFAULT_LIMITS.maxStepsPerRun;
-  if (stored?.runTimeoutMs === 120_000) limits.runTimeoutMs = DEFAULT_LIMITS.runTimeoutMs;
-  else if (version >= 2 && stored?.runTimeoutMs === 180_000) limits.runTimeoutMs = DEFAULT_LIMITS.runTimeoutMs;
+  for (const tier of LEGACY_LIMIT_DEFAULTS) {
+    if (version < tier.since) break;
+    if (stored?.maxStepsPerRun === tier.maxStepsPerRun) limits.maxStepsPerRun = DEFAULT_LIMITS.maxStepsPerRun;
+    if (stored?.runTimeoutMs === tier.runTimeoutMs) limits.runTimeoutMs = DEFAULT_LIMITS.runTimeoutMs;
+  }
 
   const providers = (legacy.providers ?? []).map((entry): ProviderConfig => {
     const api: ProviderApi =

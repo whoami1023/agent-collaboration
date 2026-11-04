@@ -147,7 +147,12 @@ export async function probeModel(input: ProbeTargetInput, deps: ProbeDeps): Prom
 
   let chain;
   try {
-    chain = resolveModelChain(settings, input.ref ?? settings.selection.defaultModel);
+    // 面板里刚填完还没保存的供应商：默认测它自己的模型，否则会退回设置里的默认模型，
+    // 出现「编辑 A 供应商、实际探测 B 模型」的错位结果。
+    chain = resolveModelChain(
+      settings,
+      input.ref ?? (input.provider ? input.provider.id : settings.selection.defaultModel),
+    );
   } catch (err) {
     if (err instanceof ModelResolutionError) {
       const missing = /缺少 API Key/.test(err.message);

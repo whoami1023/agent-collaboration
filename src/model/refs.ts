@@ -92,6 +92,10 @@ export function assertProviderUsable(provider: ProviderConfig): void {
 
 function resolveSingle(settings: Settings, ref: string): ResolvedModel {
   const { providerId, modelId } = splitModelRef(ref);
+  if (!providerId) {
+    // 默认模型被清空（例如删掉了最后一个供应商）时给出可操作的提示，而不是「供应商「」不存在」。
+    throw new ModelResolutionError("还没有设置默认模型，请在模型设置里选择一个已登记的模型");
+  }
   const provider = settings.providers.find((candidate) => candidate.id === providerId);
   if (!provider) {
     throw new ModelResolutionError(`供应商「${providerId}」不存在，请在模型设置里添加或改用其他模型`);

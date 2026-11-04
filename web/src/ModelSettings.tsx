@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   CatalogSuggestion,
   MaskedProvider,
@@ -191,12 +191,19 @@ export function ModelSettings({
   const [defaultModel, setDefaultModel] = useState(settings.selection.defaultModel);
   const [apiKey, setApiKey] = useState("");
 
+  // 保存后的回执会被「回到服务端快照」的副作用清掉，用 ref 让它活过一次刷新。
+  const justSavedRef = useRef(false);
+
   // 切换供应商或保存后回到服务端快照，避免草稿停留在旧值上。
   useEffect(() => {
     const current = settings.providers.find((item) => item.id === selectedId);
     setDraft(current ? providerToDraft(current) : null);
     setApiKey("");
     setProbe(null);
+    if (justSavedRef.current) {
+      justSavedRef.current = false;
+      return;
+    }
     setNote(null);
   }, [selectedId, settings]);
 
@@ -294,12 +301,12 @@ export function ModelSettings({
       const providerPatch = draftToPatch(editorDraft);
       // 简单表单里的 API Key 就地并入供应商补丁（留空则保持原值）。
       if (apiKey.trim()) providerPatch.apiKey = apiKey.trim();
-      onSaved(
-        await saveSettings({
-          providers: [providerPatch],
-          selection: { defaultModel: defaultModel.trim() || undefined },
-        }),
-      );
+      const next = await saveSettings({
+        providers: [providerPatch],
+        selection: { defaultModel: defaultModel.trim() || undefined },
+      });
+      justSavedRef.current = true;
+      onSaved(next);
       setDraft((current) => (current ? { ...current, apiKey: "" } : current));
       setApiKey("");
       setNote("已保存，下一条消息生效");
@@ -317,7 +324,14 @@ export function ModelSettings({
     try {
       const patch = draftToPatch(editorDraft);
       if (apiKey.trim()) patch.apiKey = apiKey.trim();
-      setProbe(await probeModel({ provider: patch }));
+      // 明确指定要探测的引用：默认模型属于当前供应商时测它，否则测这个供应商自己的第一个模型。
+      const ownModels = (patch.models ?? []).filter((model) => model.id);
+      const ref = defaultModel.startsWith(`${patch.id}/`)
+        ? defaultModel
+        : ownModels[0]?.id
+          ? `${patch.id}/${ownModels[0].id}`
+          : undefined;
+      setProbe(await probeModel({ ...(ref ? { ref } : {}), provider: patch }));
     } catch (err) {
       setError(messageOf(err));
     } finally {
@@ -329,7 +343,9 @@ export function ModelSettings({
     setBusy(true);
     setError(null);
     try {
-      onSaved(await deleteProviderKey(provider.id));
+      const next = await deleteProviderKey(provider.id);
+      justSavedRef.current = true;
+      onSaved(next);
       setNote("已清除保存的密钥");
     } catch (err) {
       setError(messageOf(err));

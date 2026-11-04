@@ -1645,3 +1645,155 @@ describe("模板库 API", () => {
     expect(after.some((item) => item["key"] === "data-analyst")).toBe(false);
   });
 });
+
+describe("模型设置保存与探针", () => {
+  async function login(): Promise<string> {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    return setup.cookie as string;
+  }
+
+  function settingsOf(body: Record<string, unknown>): Record<string, unknown> {
+    return body["settings"] as Record<string, unknown>;
+  }
+
+  function defaultModelOf(body: Record<string, unknown>): string {
+    const selection = settingsOf(body)["selection"] as Record<string, string>;
+    return selection["defaultModel"];
+  }
+
+  it("别名指向没配好的供应商时仍能保存，只有默认模型会拦住保存", async () => {
+    const cookie = await login();
+    // 新工作区自带 openai/qwen 等内置别名，目标供应商没有对应模型：这些坏引用不该阻塞保存。
+    const saved = await call("/api/settings", {
+      method: "PUT",
+      cookie,
+      body: {
+        providers: [
+          {
+            id: "deepseek",
+            api: "openai-completions",
+            baseUrl: "https://api.deepseek.com/v1",
+            models: [{ id: "deepseek-chat" }],
+          },
+        ],
+        selection: { defaultModel: "deepseek/deepseek-chat" },
+      },
+    });
+    expect(saved.status).toBe(200);
+    expect(defaultModelOf(saved.body)).toBe("deepseek/deepseek-chat");
+
+    const bad = await call("/api/settings", {
+      method: "PUT",
+      cookie,
+      body: { selection: { defaultModel: "deepseek/not-registered" } },
+    });
+    expect(bad.status).toBe(400);
+    expect(String(bad.body["error"])).toMatch(/未在供应商「deepseek」登记/);
+  });
+
+  it("默认模型指向已消失的供应商时自动回落到仍然可用的引用", async () => {
+    const cookie = await login();
+    expect(
+      (
+        await call("/api/settings", {
+          method: "PUT",
+          cookie,
+          body: { selection: { defaultModel: "openai/gpt-4o-mini" } },
+        })
+      ).status,
+    ).toBe(400);
+
+    const repaired = await call("/api/settings", {
+      method: "PUT",
+      cookie,
+      body: { selection: { defaultModel: "ghost/gpt-4o-mini" } },
+    });
+    expect(repaired.status).toBe(200);
+    expect(defaultModelOf(repaired.body)).toBe("demo/mock");
+  });
+
+  it("测试连接按面板里正在编辑的供应商探测，不退回设置里的默认模型", async () => {
+    const cookie = await login();
+    const probe = await call("/api/models/probe", {
+      method: "POST",
+      cookie,
+      body: {
+        provider: {
+          id: "local",
+          api: "openai-completions",
+          // 端口 9（discard）必定拒连：只验证探测目标选对了，不看连通结果。
+          baseUrl: "http://127.0.0.1:9/v1",
+          apiKey: "sk-test-value",
+          models: [{ id: "first-model" }],
+        },
+      },
+    });
+    expect(probe.status).toBe(200);
+    expect(probe.body["ref"]).toBe("local/first-model");
+    expect(probe.body["status"]).not.toBe("no_model");
+    expect(String(probe.body["error"] ?? "")).not.toMatch(/供应商「」/);
+  });
+
+  it("删除供应商后默认模型不会停留在被删掉的引用上", async () => {
+    const cookie = await login();
+    expect(
+      (
+        await call("/api/settings", {
+          method: "PUT",
+          cookie,
+          body: {
+            providers: [
+              {
+                id: "temp",
+                api: "openai-completions",
+                baseUrl: "https://example.com/v1",
+                models: [{ id: "m1" }],
+              },
+            ],
+            selection: { defaultModel: "temp/m1" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+
+    const removed = await call("/api/settings/providers/temp", { method: "DELETE", cookie });
+    expect(removed.status).toBe(200);
+    expect(defaultModelOf(removed.body)).not.toBe("temp/m1");
+
+    const models = await call("/api/models", { cookie });
+    expect(models.status).toBe(200);
+    const refs = (models.body["models"] as Array<Record<string, unknown>>).map(
+      (item) => String(item["ref"]),
+    );
+    expect(refs).not.toContain("temp/m1");
+  });
+
+  it("默认模型写成供应商名时，删除该供应商也不会留下解析不了的引用", async () => {
+    const cookie = await login();
+    expect(
+      (
+        await call("/api/settings", {
+          method: "PUT",
+          cookie,
+          body: {
+            providers: [
+              {
+                id: "bare",
+                api: "openai-completions",
+                baseUrl: "https://example.com/v1",
+                models: [{ id: "m2" }],
+              },
+            ],
+            selection: { defaultModel: "bare" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const removed = await call("/api/settings/providers/bare", { method: "DELETE", cookie });
+    expect(removed.status).toBe(200);
+    expect(defaultModelOf(removed.body)).toBe("demo/mock");
+  });
+});

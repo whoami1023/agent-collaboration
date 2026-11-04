@@ -34,29 +34,55 @@ function legacySettings(limits: Record<string, unknown>, settingsVersion?: numbe
 }
 
 describe("设置迁移", () => {
-  it("v1 旧默认的 12 步 / 120 秒升级为 v3 默认", async () => {
+  it("v1 旧默认的 12 步 / 120 秒升级为当前默认", async () => {
     const file = await writeSettings(
       legacySettings({ ...DEFAULT_LIMITS, maxStepsPerRun: 12, runTimeoutMs: 120_000 }),
     );
     const settings = await loadSettings(file);
     expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
-    expect(settings.limits.maxStepsPerRun).toBe(48);
+    expect(settings.limits.maxStepsPerRun).toBe(24);
     expect(settings.limits.runTimeoutMs).toBe(420_000);
     const persisted = JSON.parse(await readFile(file, "utf8")) as {
       settingsVersion: number;
       limits: { maxStepsPerRun: number };
     };
     expect(persisted.settingsVersion).toBe(SETTINGS_VERSION);
-    expect(persisted.limits.maxStepsPerRun).toBe(48);
+    expect(persisted.limits.maxStepsPerRun).toBe(24);
   });
 
-  it("v2 旧默认的 24 步 / 180 秒升级为 v3 默认", async () => {
+  it("v2 旧默认的 24 步 / 180 秒：步数仍是 24，超时升级为 420 秒", async () => {
     const file = await writeSettings(
       legacySettings({ ...DEFAULT_LIMITS, maxStepsPerRun: 24, runTimeoutMs: 180_000 }, 2),
     );
     const settings = await loadSettings(file);
-    expect(settings.limits.maxStepsPerRun).toBe(48);
+    expect(settings.limits.maxStepsPerRun).toBe(24);
     expect(settings.limits.runTimeoutMs).toBe(420_000);
+  });
+
+  it("v3/v4 旧默认的 48 步收回 24 步，超时保持 420 秒", async () => {
+    for (const version of [3, 4]) {
+      const file = await writeSettings(
+        legacySettings({ ...DEFAULT_LIMITS, maxStepsPerRun: 48, runTimeoutMs: 420_000 }, version),
+      );
+      const settings = await loadSettings(file);
+      expect(settings.limits.maxStepsPerRun, `v${version}`).toBe(24);
+      expect(settings.limits.runTimeoutMs, `v${version}`).toBe(420_000);
+      const persisted = JSON.parse(await readFile(file, "utf8")) as {
+        settingsVersion: number;
+        limits: { maxStepsPerRun: number };
+      };
+      expect(persisted.settingsVersion).toBe(SETTINGS_VERSION);
+      expect(persisted.limits.maxStepsPerRun).toBe(24);
+    }
+  });
+
+  it("v4 里用户显式改过的 60 步不会被收回", async () => {
+    const file = await writeSettings(
+      legacySettings({ ...DEFAULT_LIMITS, maxStepsPerRun: 60, runTimeoutMs: 90_000 }, 4),
+    );
+    const settings = await loadSettings(file);
+    expect(settings.limits.maxStepsPerRun).toBe(60);
+    expect(settings.limits.runTimeoutMs).toBe(90_000);
   });
 
   it("用户在 v1 显式改成的 24 步不被当成旧默认覆盖", async () => {
@@ -82,7 +108,7 @@ describe("设置迁移", () => {
     tempDirs.push(dir);
     const settings = await loadSettings(join(dir, "settings.json"));
     expect(settings).toEqual(DEFAULT_SETTINGS);
-    expect(settings.limits.maxStepsPerRun).toBe(48);
+    expect(settings.limits.maxStepsPerRun).toBe(24);
     expect(settings.limits.runTimeoutMs).toBe(420_000);
   });
 });

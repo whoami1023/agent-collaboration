@@ -49,7 +49,7 @@ export const DEFAULT_LIMITS: Limits = {
   maxConcurrent: 8,
   maxChildrenPerAgent: 5,
   maxSpawnDepth: 5,
-  maxStepsPerRun: 48,
+  maxStepsPerRun: 24,
   maxRoomWindowChars: 12000,
   maxTurnsPerUserMessage: 12,
   runTimeoutMs: 420000,

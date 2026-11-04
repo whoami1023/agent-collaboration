@@ -139,9 +139,17 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   let lastSignature = "";
   let repeats = 0;
   let text = "";
+  const noticeAtStep = stepBudgetNoticeAt(options.maxSteps);
+  let budgetNoticed = false;
 
   for (let step = 0; step < options.maxSteps; step += 1) {
     throwIfAborted(options.signal);
+
+    // 步数预警：默认预算只有 24 步，剩最后几步时提醒模型优先交付，别被硬切在探索中间。
+    if (!budgetNoticed && step === noticeAtStep) {
+      budgetNoticed = true;
+      messages.push({ role: "user", content: stepBudgetNoticeText(options.maxSteps - step) });
+    }
 
     // Steering checkpoint: commit queued messages before the provider call.
     const pending = options.pullPending?.() ?? [];
@@ -272,6 +280,15 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   }
 
   return finalizeMaxSteps(options, messages, text, options.maxSteps);
+}
+
+/** 只有预算 ≥12 步才预警：测试与短子任务用的小预算不该多一轮提示。 */
+function stepBudgetNoticeAt(maxSteps: number): number | null {
+  return maxSteps < 12 ? null : maxSteps - 3;
+}
+
+function stepBudgetNoticeText(remaining: number): string {
+  return `工具调用步数预算只剩 ${remaining} 步（含本轮）。请立刻收敛：先把关键产出落盘并登记（任务状态、文件路径），再给出已完成内容、结论与未完成项，不要开启新的探索。`;
 }
 
 const MAX_STEPS_WRAP_UP_PROMPT =

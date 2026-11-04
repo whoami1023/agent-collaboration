@@ -202,6 +202,22 @@ const RIGHT_TAB_META: Record<RightTab, { title: string; icon: IconName }> = {
   archives: { title: "归档区", icon: "archive" },
 };
 
+/**
+ * 别名目标在当前配置里是否真的可用：供应商要存在，写了模型 id 还要已登记且没停用。
+ * 内置别名表里 gpt / qwen 这类目标在没配对应供应商时解析不了，别放进成员模型下拉。
+ */
+function isRefConfigured(settings: MaskedSettings, target: string): boolean {
+  const ref = target.trim();
+  if (!ref) return false;
+  const slash = ref.indexOf("/");
+  const providerId = slash < 0 ? ref : ref.slice(0, slash);
+  const modelId = slash < 0 ? undefined : ref.slice(slash + 1);
+  const provider = settings.providers.find((item) => item.id === providerId);
+  if (!provider) return false;
+  if (!modelId) return provider.models.length > 0;
+  return provider.models.some((model) => model.id === modelId && model.status !== "disabled");
+}
+
 function rightTabTitle(tab: RightTab): string {
   return RIGHT_TAB_META[tab].title;
 }
@@ -1461,6 +1477,7 @@ function RoomView({
 
   /**
    * 成员可用的模型引用：`default`（跟随设置里的默认模型）、别名、以及各供应商已登记的模型。
+   * 别名表里带着内置的 gpt / qwen 等指向，供应商没配就跳过，避免选中后运行期才报「未登记」。
    */
   const modelChoices = useMemo(() => {
     const settings = state?.settings;
@@ -1468,6 +1485,7 @@ function RoomView({
     if (!settings) return choices;
     choices.push({ ref: "default", label: `跟随默认（${settings.selection.defaultModel || "未配置"}）` });
     for (const [alias, target] of Object.entries(settings.selection.aliases)) {
+      if (!isRefConfigured(settings, target)) continue;
       choices.push({ ref: alias, label: `别名 ${alias} → ${target}` });
     }
     for (const provider of settings.providers) {
@@ -2179,9 +2197,35 @@ function RoomView({
               </button>
             </div>
             <div className="composer-hint">
-              <span>Enter 发送 · Shift+Enter 换行</span>
-              <span>@成员名 指派任务</span>
-              <span>输入 /help 查看命令</span>
+              <div className="composer-actions">
+                <button
+                  type="button"
+                  className="btn composer-btn new-session"
+                  aria-label="新建会话（同 /new）"
+                  title="开启一个与上一个任务无关的新会话：当前聊天与任务卡归档起来，文件工作区、成员与智能体记忆不动（等同于 /new）"
+                  disabled={startingSession || clearingChat}
+                  onClick={() => void handleNewSession()}
+                >
+                  <Icon name="plus" size={15} />
+                  <span>{startingSession ? "新建中…" : "新建会话"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn composer-btn clear-session"
+                  aria-label="清除会话（同 /clear）"
+                  title="清空作战室：聊天记录、任务卡与文件成果整体归档，可在右侧「归档」恢复（等同于 /clear）"
+                  disabled={startingSession || clearingChat}
+                  onClick={() => void handleClearChat()}
+                >
+                  <Icon name="archive" size={15} />
+                  <span>{clearingChat ? "清除中…" : "清除会话"}</span>
+                </button>
+              </div>
+              <div className="composer-tips">
+                <span>Enter 发送 · Shift+Enter 换行</span>
+                <span>@成员名 指派任务</span>
+                <span>输入 /help 查看命令</span>
+              </div>
             </div>
           </div>
         </div>
@@ -4288,14 +4332,20 @@ function LimitsSection({
         const divisor = field.displayDivisor ?? 1;
         const min = field.min / divisor;
         const max = field.max / divisor;
+        const fallback = limitToDisplay(DEFAULT_LIMITS[field.key], field);
+        const customised =
+          settings.limits[field.key] !== undefined &&
+          limitToDisplay(settings.limits[field.key], field) !== fallback;
         return (
           <label className="field" key={field.key}>
             <span>
               {field.label}
               <em>
                 （{min}–{max}
+                {field.displayUnit} · 默认 {fallback}
                 {field.displayUnit}）
               </em>
+              {customised && <span className="chip">已自定义</span>}
             </span>
             <input
               type="number"

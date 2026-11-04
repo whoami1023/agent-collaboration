@@ -158,6 +158,25 @@ const BY_MODEL: Record<string, CatalogRow> = {
   },
 };
 
+/**
+ * 供应商族 → 模型 id 前缀。目录建议只在同族内挑选：把 `gpt-4o-mini` 这类建议塞给
+ * DeepSeek 或自建网关供应商，会得到「模型未在供应商登记」的死胡同。
+ */
+const PROVIDER_FAMILIES: Array<{ provider: RegExp; prefixes: string[] }> = [
+  { provider: /^(openai|azure|azure-openai|chatgpt)$/i, prefixes: ["gpt", "o1", "o3", "o4", "chatgpt"] },
+  { provider: /^deepseek$/i, prefixes: ["deepseek"] },
+  { provider: /^(qwen|qwen-?ai|dashscope|tongyi|aliyun|alibaba)$/i, prefixes: ["qwen"] },
+  { provider: /^(moonshot|moonshot-ai|kimi)$/i, prefixes: ["moonshot", "kimi"] },
+  { provider: /^(zhipu|zhipuai|glm|bigmodel|z\.ai)$/i, prefixes: ["glm", "chatglm"] },
+  { provider: /^(xai|grok)$/i, prefixes: ["grok"] },
+  { provider: /^(meta|llama|together|replicate)$/i, prefixes: ["llama"] },
+];
+
+/** 该供应商在目录里属于哪个模型族；认不出来就没有同族建议。 */
+function familyPrefixes(providerId: string): string[] | undefined {
+  return PROVIDER_FAMILIES.find((family) => family.provider.test(providerId))?.prefixes;
+}
+
 /** 目录查找：先精确 `provider/model`，再按最长模型 id 前缀。 */
 export function findCatalogRow(ref: string): CatalogRow | undefined {
   const exact = BY_REF[ref];
@@ -172,14 +191,19 @@ export function findCatalogRow(ref: string): CatalogRow | undefined {
   return bestKey ? BY_MODEL[bestKey] : undefined;
 }
 
-/** 设置面板的「从目录快速填充」候选：按 provider id 归组展示。 */
+/** 设置面板的「从内置目录添加模型」候选：只给同族模型，避免选出供应商里并不存在的引用。 */
 export function catalogSuggestions(providerId: string): Array<{ ref: string; row: CatalogRow }> {
   const refs = new Set<string>();
   for (const ref of Object.keys(BY_REF)) {
     if (ref.startsWith(`${providerId}/`)) refs.add(ref);
   }
-  for (const modelId of Object.keys(BY_MODEL)) {
-    refs.add(`${providerId}/${modelId}`);
+  const prefixes = familyPrefixes(providerId);
+  if (prefixes) {
+    for (const modelId of Object.keys(BY_MODEL)) {
+      if (prefixes.some((prefix) => modelId.toLowerCase().startsWith(prefix.toLowerCase()))) {
+        refs.add(`${providerId}/${modelId}`);
+      }
+    }
   }
   return [...refs]
     .map((ref) => ({ ref, row: findCatalogRow(ref) ?? {} }))

@@ -15,7 +15,7 @@ import {
   type ProviderConfig,
   type ResolvedModel,
 } from "../model/types";
-import { listModelRefs, resolveModelChain } from "../model/refs";
+import { listModelRefs, resolveModelChain, splitModelRef, ModelResolutionError } from "../model/refs";
 import { catalogSuggestions } from "../model/catalog";
 import { probeModel } from "../model/probe";
 import {
@@ -85,15 +85,46 @@ function publicModelCard(model: ResolvedModel): Omit<ResolvedModel, "headers"> {
   return rest;
 }
 
-/** 保存选择层时校验默认模型、别名与备用链都能解析，避免运行时才炸。 */
+/**
+ * 保存选择层时只硬校验默认模型。
+ * 别名与备用链是「尽力而为」的引用：内置别名表里 gpt / qwen 这类指向的供应商多半还没配好，
+ * 备用链在 `resolveModelChain` 里本来就是静默跳过坏引用，保存时同样不该拦住整个表单。
+ */
 function assertSelectionUsable(settings: Settings): void {
-  resolveModelChain(settings, settings.selection.defaultModel);
-  for (const target of Object.values(settings.selection.aliases)) {
-    resolveModelChain(settings, target);
+  const ref = settings.selection.defaultModel.trim();
+  if (!ref) {
+    if (firstUsableRef(settings) !== undefined) {
+      throw new ModelResolutionError("还没有选择默认模型，请在模型设置里挑一个已登记的模型");
+    }
+    return; // 一个模型都还没配（例如刚新建的空供应商）：允许先把 baseUrl / Key 存下来。
   }
-  for (const target of settings.selection.fallbacks) {
-    resolveModelChain(settings, target);
+  resolveModelChain(settings, ref);
+}
+
+/** 第一个还能用的 `provider/model` 引用；跳过停用模型与没有模型的供应商。 */
+function firstUsableRef(settings: Settings): string | undefined {
+  return listModelRefs(settings).find((model) => model.status !== "disabled")?.ref;
+}
+
+/**
+ * 默认模型指向的供应商整个不见了（删掉最后一个供应商的典型后果）时，
+ * 自动回落到第一个仍然可用的引用。供应商还在、只是模型没登记，则原样保留，
+ * 让 `assertSelectionUsable` 把可读的错误抛回面板，而不是悄悄换掉用户选的东西。
+ */
+function repairDefaultModel(settings: Settings): Settings {
+  const current = settings.selection.defaultModel.trim();
+  if (current) {
+    try {
+      resolveModelChain(settings, current);
+      return settings;
+    } catch {
+      const providerId = splitModelRef(current).providerId;
+      if (settings.providers.some((provider) => provider.id === providerId)) return settings;
+    }
   }
+  const fallback = firstUsableRef(settings);
+  if (!fallback || fallback === current) return settings;
+  return { ...settings, selection: { ...settings.selection, defaultModel: fallback } };
 }
 
 export function createApp(deps: AppDeps): express.Express {
@@ -883,10 +914,12 @@ export function createApp(deps: AppDeps): express.Express {
         ...(selection ? { selection } : {}),
         ...(limits ? { limits } : {}),
       });
-      // 默认模型 / 别名 / 备用链指向不存在的模型时立刻报错，避免运行时才炸。
-      assertSelectionUsable(next);
-      await workspace.setSettings(next);
-      res.json({ settings: maskSettings(next) });
+      // 默认模型失效（指向已删/已停用的模型）时先回落到仍然可用的引用，再校验。
+      const ready = repairDefaultModel(next);
+      // 只硬校验默认模型：别名与备用链里的坏引用不该阻塞保存。
+      assertSelectionUsable(ready);
+      await workspace.setSettings(ready);
+      res.json({ settings: maskSettings(ready) });
     } catch (err) {
       res.status(400).json({ error: errorMessage(err) });
     }
@@ -899,7 +932,7 @@ export function createApp(deps: AppDeps): express.Express {
       res.status(404).json({ error: "供应商不存在" });
       return;
     }
-    const next = removeProvider(workspace.getSettings(), providerId);
+    const next = repairDefaultModel(removeProvider(workspace.getSettings(), providerId));
     await workspace.setSettings(next);
     res.json({ settings: maskSettings(next) });
   });
