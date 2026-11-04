@@ -7,6 +7,7 @@ import {
   deleteTemplate,
   fetchTemplates,
   updateTemplate,
+  type MemberTemplateDraft,
   type SkillCategory,
   type SkillCategoryView,
   type TemplateInput,
@@ -18,11 +19,14 @@ import { Icon } from "./icons";
 type TemplateTab = "builtin" | "personal";
 type CategoryFilter = SkillCategory | "all";
 
+/** 新建表单的预填来源：另一份模板，或某个成员导出的草稿。 */
+type TemplateSeed = TemplateView | MemberTemplateDraft;
+
 type TemplateMode =
   | { kind: "list" }
   | { kind: "view"; template: TemplateView }
   | { kind: "apply"; template: TemplateView }
-  | { kind: "create"; copyFrom?: TemplateView }
+  | { kind: "create"; copyFrom?: TemplateSeed; fromMember?: string }
   | { kind: "edit"; template: TemplateView };
 
 const TITLE_MAX = 40;
@@ -50,10 +54,15 @@ export default function TemplateLibraryPanel({
   onClose,
   onApplied,
   takenNames,
+  memberDraft,
+  onMemberDraftUsed,
 }: {
   onClose: () => void;
   onApplied: (member: Member, template: TemplateView) => void;
   takenNames: string[];
+  /** 侧栏/智能体文件面板点「存为模板」时带进来的草稿：直接打开新建表单并预填。 */
+  memberDraft?: { seed: MemberTemplateDraft; memberName: string } | null;
+  onMemberDraftUsed?: () => void;
 }) {
   const [snapshot, setSnapshot] = useState<TemplateSnapshot | null>(null);
   const [tab, setTab] = useState<TemplateTab>("builtin");
@@ -77,6 +86,18 @@ export default function TemplateLibraryPanel({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // 成员导出的草稿到达时直接进入新建表单（仍在模板库这一块区域里，不叠弹框）。
+  useEffect(() => {
+    if (!memberDraft) return;
+    setTab("personal");
+    setCategoryFilter("all");
+    setQuery("");
+    setNotice(null);
+    setError(null);
+    setMode({ kind: "create", copyFrom: memberDraft.seed, fromMember: memberDraft.memberName });
+    onMemberDraftUsed?.();
+  }, [memberDraft, onMemberDraftUsed]);
 
   function backToList() {
     setMode({ kind: "list" });
@@ -470,10 +491,13 @@ export default function TemplateLibraryPanel({
             key={
               mode.kind === "edit"
                 ? mode.template.id
-                : `new-${mode.copyFrom?.id ?? "blank"}`
+                : mode.fromMember
+                  ? `member-${mode.fromMember}`
+                  : `new-${mode.copyFrom && "id" in mode.copyFrom ? mode.copyFrom.id : "blank"}`
             }
             template={mode.kind === "edit" ? mode.template : undefined}
             copyFrom={mode.kind === "create" ? mode.copyFrom : undefined}
+            fromMember={mode.kind === "create" ? mode.fromMember : undefined}
             categories={categories}
             availableSkills={availableSkills}
             onCancel={() =>
@@ -482,11 +506,14 @@ export default function TemplateLibraryPanel({
                 : backToList()
             }
             onSaved={(template, created) => {
+              const from = mode.kind === "create" ? mode.fromMember : undefined;
               setMode({ kind: "list" });
               setTab("personal");
               setNotice(
                 created
-                  ? `已创建个人模板「${template.title}」，在「我的模板」里可以引用`
+                  ? from
+                    ? `已把 @${from} 存为个人模板「${template.title}」，在「我的模板」里可以再次引用`
+                    : `已创建个人模板「${template.title}」，在「我的模板」里可以引用`
                   : `已保存模板「${template.title}」`,
               );
               setError(null);
@@ -718,13 +745,15 @@ function TemplateApplyView({
 function TemplateForm({
   template,
   copyFrom,
+  fromMember,
   categories,
   availableSkills,
   onCancel,
   onSaved,
 }: {
   template?: TemplateView;
-  copyFrom?: TemplateView;
+  copyFrom?: TemplateSeed;
+  fromMember?: string;
   categories: SkillCategoryView[];
   availableSkills: Array<{ name: string; description: string }>;
   onCancel: () => void;
@@ -785,12 +814,19 @@ function TemplateForm({
   }
 
   const isCopy = Boolean(copyFrom) && !template;
+  const formTitle = template
+    ? "编辑个人模板"
+    : fromMember
+      ? "成员存为个人模板"
+      : isCopy
+        ? "另存为个人模板"
+        : "新建个人模板";
 
   return (
     <form className="skill-form template-form" onSubmit={(event) => void submit(event)}>
       <div className="skill-form-head">
         <span className="skill-form-title">
-          {template ? "编辑个人模板" : isCopy ? "另存为个人模板" : "新建个人模板"}
+          {formTitle}
           <span className="chip">个人</span>
         </span>
         <button type="button" className="btn ghost sm" onClick={onCancel}>
@@ -798,10 +834,17 @@ function TemplateForm({
         </button>
       </div>
 
-      {isCopy && (
+      {fromMember ? (
         <p className="hint">
-          复制自内置模板「{copyFrom?.title}」，改完保存就是你自己的模板，不会影响内置模板。
+          预填自成员 @{fromMember} 的当前设定：职责、档案里的工作方式与技能白名单（技能未勾选限制时不带清单，引用后跟随技能库）。
+          保存后成为你自己的模板，之后可在「我的模板」里引用或继续修改。
         </p>
+      ) : (
+        isCopy && (
+          <p className="hint">
+            复制自内置模板「{copyFrom?.title}」，改完保存就是你自己的模板，不会影响内置模板。
+          </p>
+        )
       )}
 
       <label className="field">

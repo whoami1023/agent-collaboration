@@ -69,6 +69,7 @@ import {
   fetchMemberFileContent,
   fetchMemberFiles,
   fetchMemberSkills,
+  fetchMemberTemplateDraft,
   fetchState,
   fetchWorkspaceFile,
   fetchWorkspaceFiles,
@@ -96,6 +97,7 @@ import {
   type AgentFileEntry,
   type MaskedSettings,
   type MemberSkillsView,
+  type MemberTemplateDraft,
   type StateSnapshot,
   type WorkspaceFileContent,
   type WorkspaceFileEntry,
@@ -505,6 +507,11 @@ function RoomView({
     }
   });
   const [templatesOpen, setTemplatesOpen] = useState(false);
+  /** 成员导出的模板草稿：非空时模板库面板直接打开新建表单并预填（用后即清）。 */
+  const [memberTemplateDraft, setMemberTemplateDraft] = useState<{
+    seed: MemberTemplateDraft;
+    memberName: string;
+  } | null>(null);
   const [cronOpen, setCronOpen] = useState(false);
   /** 定时任务事件到达时自增：面板据此重新拉取定义与状态，不重挂载（编辑器状态保留）。 */
   const [cronTick, setCronTick] = useState(0);
@@ -1557,6 +1564,19 @@ function RoomView({
     setNavOpen(false);
   }
 
+  /** 成员 → 我的模板：先向服务端要一份草稿，再让模板库面板用新建表单接住它。 */
+  async function handleSaveMemberAsTemplate(memberId: string, memberName: string) {
+    if (memberTemplateDraft) return;
+    try {
+      const { draft } = await fetchMemberTemplateDraft(memberId);
+      setMemberTemplateDraft({ seed: draft, memberName });
+      openTemplates();
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    }
+  }
+
   function openCron() {
     setCronOpen(true);
     setSkillsOpen(false);
@@ -2252,6 +2272,8 @@ function RoomView({
           <TemplateLibraryPanel
             onClose={() => setTemplatesOpen(false)}
             takenNames={members.map((member) => member.name)}
+            memberDraft={memberTemplateDraft}
+            onMemberDraftUsed={() => setMemberTemplateDraft(null)}
             onApplied={(member, template) => {
               openAgentFiles(member.id);
               setChatNotice(
@@ -2278,6 +2300,7 @@ function RoomView({
             onRefresh={reloadAgentFiles}
             onSave={saveOpenFile}
             onLoadFull={loadFullFile}
+            onSaveAsTemplate={() => void handleSaveMemberAsTemplate(selectedMember.id, selectedMember.name)}
             onClose={closeAgentFiles}
           />
         </aside>
@@ -3085,6 +3108,7 @@ function AgentFilesPanel({
   onRefresh,
   onSave,
   onLoadFull,
+  onSaveAsTemplate,
   onClose,
 }: {
   member: { id: string; name: string; modelRef: string; templateTitle?: string };
@@ -3098,6 +3122,7 @@ function AgentFilesPanel({
   onRefresh: () => void;
   onSave: (path: string, text: string) => Promise<void>;
   onLoadFull: () => Promise<string>;
+  onSaveAsTemplate: () => void;
   onClose: () => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -3276,6 +3301,17 @@ function AgentFilesPanel({
             >
               <Icon name="edit" />
               <span>{loadingFull ? "载入全文…" : "编辑"}</span>
+            </button>
+          )}
+          {!showSkills && (
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={onSaveAsTemplate}
+              title="把这个成员的设定存为「我的模板」，之后可以重复引用"
+            >
+              <Icon name="template" />
+              <span>存为模板</span>
             </button>
           )}
           <button

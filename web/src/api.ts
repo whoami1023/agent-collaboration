@@ -406,6 +406,27 @@ export async function applyTemplate(
   });
 }
 
+/** 把某个成员导出成个人模板草稿（职责、档案里的工作方式、技能白名单）。 */
+export interface MemberTemplateDraft {
+  title: string;
+  description: string;
+  suggestedName: string;
+  category: SkillCategory;
+  brief: string;
+  emoji?: string;
+  vibe?: string;
+  workstyle?: string[];
+  skillNames?: string[];
+}
+
+export async function fetchMemberTemplateDraft(
+  memberId: string,
+): Promise<{ member: { id: string; name: string; role: string }; draft: MemberTemplateDraft }> {
+  return request<{ member: { id: string; name: string; role: string }; draft: MemberTemplateDraft }>(
+    `/api/members/${encodeURIComponent(memberId)}/template-draft`,
+  );
+}
+
 /** 定时任务：定义 + 运行期状态 + 上一次运行，一次给全面板用。 */
 export interface CronJobView {
   job: CronJob;

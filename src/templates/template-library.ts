@@ -86,6 +86,19 @@ const WORKSTYLE_MAX = 200;
 const MAX_SKILL_NAMES = 60;
 const MAX_TEMPLATES = 400;
 
+/** 字段上限的对外视图：成员导出草稿与前端表单都按同一套值校验。 */
+export const TEMPLATE_LIMITS = {
+  title: TITLE_MAX,
+  description: DESCRIPTION_MAX,
+  brief: BRIEF_MAX,
+  suggestedName: NAME_MAX,
+  emoji: EMOJI_MAX,
+  vibe: VIBE_MAX,
+  workstyle: MAX_WORKSTYLE,
+  workstyleLine: WORKSTYLE_MAX,
+  skillNames: MAX_SKILL_NAMES,
+} as const;
+
 function normalizeKey(raw: unknown, fallback: string): string {
   if (raw !== undefined && raw !== null && raw !== "") {
     if (typeof raw !== "string") throw new TemplateError(400, "模板标识必须是字符串");

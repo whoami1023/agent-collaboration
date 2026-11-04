@@ -1816,3 +1816,98 @@ describe("模型设置保存与探针", () => {
     expect(defaultModelOf(removed.body)).toBe("demo/mock");
   });
 });
+
+describe("成员 API：存为我的模板（模板草稿）", () => {
+  async function login(): Promise<string> {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    return setup.cookie as string;
+  }
+
+  it("子成员草稿带职责与技能白名单，可直接存成个人模板", async () => {
+    const cookie = await login();
+    await call("/api/skills", {
+      method: "POST",
+      cookie,
+      body: {
+        scope: "shared",
+        name: "research-brief",
+        description: "三段式简报",
+        instructions: "# 调研\n先给结论。",
+      },
+    });
+    const created = await call("/api/members", {
+      method: "POST",
+      cookie,
+      body: { name: "资料员", description: "整理季度资料并归档。缺条目时列清单回报。" },
+    });
+    const memberId = String((created.body["member"] as Record<string, unknown>)["id"]);
+    expect(
+      (
+        await call(`/api/members/${memberId}/skills`, {
+          method: "PUT",
+          cookie,
+          body: { names: ["research-brief"] },
+        })
+      ).status,
+    ).toBe(200);
+
+    const draftRes = await call(`/api/members/${memberId}/template-draft`, { cookie });
+    expect(draftRes.status).toBe(200);
+    const draft = draftRes.body["draft"] as Record<string, unknown>;
+    expect(draft["title"]).toBe("资料员");
+    expect(draft["suggestedName"]).toBe("资料员");
+    expect(draft["brief"]).toBe("整理季度资料并归档。缺条目时列清单回报。");
+    expect(draft["description"]).toBe("整理季度资料并归档");
+    expect(draft["skillNames"]).toEqual(["research-brief"]);
+    // 档案里只有系统默认的工作方式条目，草稿不该把它们搬进模板。
+    expect(draft).not.toHaveProperty("workstyle");
+
+    const saved = await call("/api/templates", {
+      method: "POST",
+      cookie,
+      body: { ...draft, title: "资料整理员", description: "把零散资料整理成带清单的档案" },
+    });
+    expect(saved.status).toBe(201);
+    const template = saved.body["template"] as Record<string, unknown>;
+    expect(template["scope"]).toBe("personal");
+    expect(template["skillNames"]).toEqual(["research-brief"]);
+    const list = await call("/api/templates", { cookie });
+    expect(
+      (list.body["personal"] as Array<Record<string, unknown>>).map((item) => item["title"]),
+    ).toContain("资料整理员");
+  });
+
+  it("未登录 401、未知成员 404；主智能体没改过档案时草稿回落到待补充职责", async () => {
+    expect((await call("/api/members/m_main/template-draft")).status).toBe(401);
+
+    const cookie = await login();
+    expect((await call("/api/members/m_missing/template-draft", { cookie })).status).toBe(404);
+
+    const main = await call("/api/members/m_main/template-draft", { cookie });
+    expect(main.status).toBe(200);
+    expect((main.body["member"] as Record<string, unknown>)["role"]).toBe("main");
+    const draft = main.body["draft"] as Record<string, unknown>;
+    expect(draft["title"]).toBe("主智能体");
+    // 预置信条不算成员设定，避免把模板文字当成这个角色。
+    expect(draft["brief"]).toBe("由成员导出的模板：职责待补充。");
+    expect(draft).not.toHaveProperty("skillNames");
+
+    // 用户改了信条之后，改过的那条才会进草稿。
+    const edited = await call("/api/members/m_main/files/content", {
+      method: "PUT",
+      cookie,
+      body: {
+        path: "SOUL.md",
+        content: "# SOUL.md - 我是谁\n\n## 基本信条\n\n**只接中文需求。** 英文需求先转成中文再拆解。\n",
+      },
+    });
+    expect(edited.status).toBe(200);
+    const draftAfter = await call("/api/members/m_main/template-draft", { cookie });
+    const draftAfterFields = draftAfter.body["draft"] as Record<string, unknown>;
+    expect(String(draftAfterFields["brief"])).toBe("只接中文需求。 英文需求先转成中文再拆解。");
+    expect(String(draftAfterFields["description"])).toBe("只接中文需求");
+  });
+});

@@ -71,6 +71,44 @@ function userTemplate(context: AgentFileTemplateContext): string {
 `;
 }
 
+/**
+ * 主智能体 SOUL.md 预置的「基本信条」。lead 是固定前缀，rest 里才插入用户信息，
+ * 这样导出成员模板时能按前缀判断这条到底是不是用户自己写的。
+ */
+export const DEFAULT_MAIN_CREED: ReadonlyArray<{
+  lead: string;
+  rest: (context: AgentFileTemplateContext) => string;
+}> = [
+  {
+    lead: "**真的帮忙，不是表演帮忙。**",
+    rest: () => "省掉“好问题！”“我很乐意帮您！”，直接给结论和下一步。",
+  },
+  {
+    lead: "**有判断。**",
+    rest: () => "会不同意，会有偏好，会指出更省事的路线。没有立场的助手只是多了一步的搜索引擎。",
+  },
+  {
+    lead: "**先自己查再开口。**",
+    rest: () =>
+      "先用 room_history、task_list、use_skill、memory_search 把手上的信息用完，再带着答案提问，而不是带着问题回来。",
+  },
+  {
+    lead: "**用能力换信任。**",
+    rest: () => "交代的事做到底；对外发送、删除、覆盖这类不可逆动作，先确认再做。",
+  },
+  {
+    lead: "**记住自己是客人。**",
+    rest: (context) => `这里能看到 ${context.displayName} 的任务、思考和上下文，按私密信息对待。`,
+  },
+];
+
+/** 生成档案时写入的信条前缀，未改动即代表不是成员自己的设定。 */
+export const DEFAULT_MAIN_CREED_LEADS = DEFAULT_MAIN_CREED.map((entry) => entry.lead);
+
+function creedSection(context: AgentFileTemplateContext): string {
+  return DEFAULT_MAIN_CREED.map((entry) => `${entry.lead} ${entry.rest(context)}`).join("\n\n");
+}
+
 function soulTemplate(context: AgentFileTemplateContext): string {
   return `# SOUL.md - 我是谁
 
@@ -78,15 +116,7 @@ _不是聊天机器人，是在${context.roomName}里逐渐成形的搭档。_
 
 ## 基本信条
 
-**真的帮忙，不是表演帮忙。** 省掉“好问题！”“我很乐意帮您！”，直接给结论和下一步。
-
-**有判断。** 会不同意，会有偏好，会指出更省事的路线。没有立场的助手只是多了一步的搜索引擎。
-
-**先自己查再开口。** 先用 room_history、task_list、use_skill、memory_search 把手上的信息用完，再带着答案提问，而不是带着问题回来。
-
-**用能力换信任。** 交代的事做到底；对外发送、删除、覆盖这类不可逆动作，先确认再做。
-
-**记住自己是客人。** 这里能看到 ${context.displayName} 的任务、思考和上下文，按私密信息对待。
+${creedSection(context)}
 
 ## 边界
 
@@ -177,7 +207,7 @@ export interface MemberProfileHints {
 }
 
 /** 没有模板时使用的通用工作方式，模板条目排在前面。 */
-const DEFAULT_MEMBER_WORKSTYLE = [
+export const DEFAULT_MEMBER_WORKSTYLE = [
   "只做分给我的任务；别人的闲聊和同级成员的活不接。",
   "先自己查再开口：room_history、use_skill、memory_search 能查到的不要问回来。",
   "一次只发一条完整结论，不刷屏，不说「收到」这类空话。",

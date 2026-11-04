@@ -27,6 +27,7 @@ import { AuthError, type AuthService, type PublicUser } from "../auth/auth-servi
 import { buildClearSessionCookie, buildSessionCookie, readSessionToken } from "../auth/cookies";
 import { SkillError, type SkillRecord, type SkillLibrary } from "../skills/library";
 import { TemplateError, type AgentTemplateRecord, type TemplateLibrary } from "../templates/template-library";
+import { draftTemplateFromMember } from "../templates/member-template";
 import { CronError, CRON_LIMITS } from "../cron/normalize";
 import {
   DEFAULT_SKILL_CATEGORY,
@@ -706,6 +707,41 @@ export function createApp(deps: AppDeps): express.Express {
     } catch (err) {
       res.status(400).json({ error: errorMessage(err) });
     }
+  });
+
+  // 成员 → 个人模板草稿：把成员的职责、档案里改过的工作方式与技能白名单打包成模板预填值，
+  // 用户在模板库的新建表单里确认后再保存（保存仍走 POST /api/templates 的同一套校验）。
+  app.get("/api/members/:id/template-draft", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const user = currentUser(res);
+    const memberId = String(req.params["id"] ?? "");
+    const member = workspace.bus.listMembers().find((candidate) => candidate.id === memberId);
+    if (!member) {
+      res.status(404).json({ error: "成员不存在" });
+      return;
+    }
+    const prefix = member.role === "main" ? "" : `agents/${member.id}/`;
+    const readProfile = async (name: string): Promise<string | undefined> => {
+      const file = await workspace.memory
+        .readAgentFile(`${prefix}${name}`, { full: true })
+        .catch(() => null);
+      return file?.content;
+    };
+    const [soul, identity] = await Promise.all([readProfile("SOUL.md"), readProfile("IDENTITY.md")]);
+    const origin = member.templateKey
+      ? [...deps.templates.listBuiltin(), ...deps.templates.listPersonal(user.id)].find(
+          (template) => template.key === member.templateKey,
+        )
+      : undefined;
+    res.json({
+      member: { id: member.id, name: member.name, role: member.role },
+      draft: draftTemplateFromMember({
+        member,
+        ...(soul ? { soul } : {}),
+        ...(identity ? { identity } : {}),
+        ...(origin ? { categoryHint: origin.category } : {}),
+      }),
+    });
   });
 
   app.get("/api/files", async (_req: Request, res: Response) => {
