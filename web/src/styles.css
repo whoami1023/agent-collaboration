@@ -1876,13 +1876,18 @@ body.pane-dragging * {
   max-width: 48rem;
   margin: 7px auto 0;
   color: var(--muted);
-  font-size: var(--text-xs);
+  /* 11px 的操作提示在输入框下面几乎读不出来；升到 12px 仍小于按钮 13px 与正文 14px，
+     保持「提示」层级，不与按钮抢注意力。 */
+  font-size: var(--text-sm);
 }
 
 .composer-tips {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
+  /* 字号升到 12px 后，聊天列窄时提示会折行：行距收到 4px、整体靠右对齐，
+     折出来的第二行不会悬在按钮正下方。 */
+  gap: 4px 12px;
+  justify-content: flex-end;
   min-width: 0;
 }
 
