@@ -32,6 +32,7 @@ export type IconName =
   | "archive"
   | "restore"
   | "sliders"
+  | "sparkles"
   | "check";
 
 const ICON_PATHS: Record<IconName, ReactNode> = {
@@ -197,6 +198,12 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
     </>
   ),
   check: <path d="m5 12.5 4.5 4.5L19 7" />,
+  sparkles: (
+    <>
+      <path d="M11 3.5l1.7 4.1 4.1 1.7-4.1 1.7L11 15.1l-1.7-4.1L5.2 9.3l4.1-1.7Z" />
+      <path d="M17.5 14.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9Z" />
+    </>
+  ),
   sliders: (
     <>
       <path d="M4 8h9M17 8h3" />

@@ -1,4 +1,5 @@
 import type { CronJob, CronJobState, CronRunRecord } from "../cron/types";
+import type { MemoryProposal, ReviewLog } from "../agent/learning/types";
 
 export const USER_ID = "user";
 export const SYSTEM_ID = "system";
@@ -307,6 +308,8 @@ export type RoomEvent =
   | { type: "task"; task: TaskCard }
   | { type: "run"; event: AgentEvent }
   | { type: "model-usage"; usage: ModelUsageEvent }
+  /** 一次后台复盘的产出：提案（可能为空）+ 流水，前端据此刷新「学习」面板。 */
+  | { type: "learning"; proposals: readonly MemoryProposal[]; log: ReviewLog }
   | { type: "cron-job"; job: CronJob; state: CronJobState }
   | { type: "cron-job-removed"; jobId: string }
   | { type: "cron-run"; run: CronRunRecord }

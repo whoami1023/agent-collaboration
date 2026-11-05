@@ -113,6 +113,7 @@ const settings: MaskedSettings = {
     runTimeoutMs: 120_000,
     maxConcurrent: 8,
   },
+  learning: { mode: "propose", everyNRuns: 2, dailyCap: 20 },
 };
 
 function data(overrides: Partial<CommandData> = {}): CommandData {

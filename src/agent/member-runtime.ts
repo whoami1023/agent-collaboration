@@ -17,6 +17,7 @@ import type { MemorySearchManager } from "../memory/manager";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import { resolveTriggerRecall } from "../memory/recall";
 import { runAgentLoop } from "./loop";
+import type { LearningHost } from "./learning/types";
 import { CRON_SENDER_ID } from "../cron/types";
 import type { CronService } from "../cron/service";
 import { resolveSilentReply } from "../cron/run-prompt";
@@ -48,6 +49,8 @@ export interface RuntimeDeps {
   files?: WorkspaceFiles;
   /** 用量账本；未提供时只不发事件，不落盘。 */
   usage?: ModelUsageStore;
+  /** 学习层：一轮成功交付之后的后台复盘（P1 只写长期记忆）。 */
+  learning?: LearningHost;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -139,6 +142,8 @@ export class MemberRuntime {
 
     // 运行中止或报错时也要把已产生的 token 用量入账，所以记账函数声明在 try 外。
     let flushUsage: () => void = () => {};
+    /** 本轮真实调用过的工具名：复盘素材用它区分「动手做过」与「只是说了说」。 */
+    const usedTools = new Set<string>();
 
     try {
       const taskTitles = new Map<string, string>();
@@ -290,8 +295,10 @@ export class MemberRuntime {
           }
         },
         onDelta: (text) => this.emit({ type: "delta", runId, memberId: this.member.id, text }),
-        onToolCall: (call) =>
-          this.emit({ type: "tool", runId, memberId: this.member.id, name: call.name, args: call.args }),
+        onToolCall: (call) => {
+          usedTools.add(call.name);
+          this.emit({ type: "tool", runId, memberId: this.member.id, name: call.name, args: call.args });
+        },
         onToolResult: (call, content) =>
           this.emit({ type: "tool-result", runId, memberId: this.member.id, name: call.name, content }),
         onRepair: ({ toolNames }) =>
@@ -347,6 +354,24 @@ export class MemberRuntime {
         );
       }
       this.setStatus("idle");
+      // 学习层（P1）：结论交付完之后才复盘，异步跑、不占运行槽；复盘失败不会影响本轮。
+      const learning = this.deps.learning;
+      if (learning && result.text) {
+        void learning.afterRun({
+          memberId: this.member.id,
+          memberName: member.name,
+          memberRole: member.role,
+          modelRef: member.modelRef,
+          roomId: bus.roomId,
+          roomName: bus.roomName,
+          runId,
+          triggerText: trigger.text,
+          finalText: result.text,
+          toolNames: [...usedTools],
+          transcript: window,
+          unattended: trigger.senderId === CRON_SENDER_ID,
+        });
+      }
     } catch (err) {
       if (isAbort(err)) {
         this.emit({ type: "run-aborted", runId, memberId: this.member.id });

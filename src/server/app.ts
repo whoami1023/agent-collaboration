@@ -7,6 +7,7 @@ import {
   maskSettings,
   mergeSettings,
   removeProvider,
+  sanitizeLearning,
   sanitizeLimits,
   type Settings,
 } from "../core/settings";
@@ -741,6 +742,43 @@ export function createApp(deps: AppDeps): express.Express {
     res.json({ removed: removed.id });
   });
 
+  /** 学习层：待确认的记忆提案 + 复盘流水。面板据此展示「这轮学到了什么、为什么没学」。 */
+  app.get("/api/learning", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const limit = Number(queryField(req, "limit")) || undefined;
+    res.json({
+      proposals: await workspace.learning.listProposals(),
+      log: await workspace.learning.listLog(limit),
+    });
+  });
+
+  /** 采纳提案：走受控追加通道写入长期记忆（主智能体→账号 MEMORY.md，子成员→自己的档案）。 */
+  app.post("/api/learning/:id/apply", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json({ proposal: await workspace.learning.applyProposal(String(req.params["id"] ?? "")) });
+    } catch (err) {
+      const message = errorMessage(err);
+      res.status(message === "提案不存在" ? 404 : 400).json({ error: message });
+    }
+  });
+
+  app.post("/api/learning/:id/dismiss", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const reason = stringField(bodyOf(req), "reason").trim();
+    try {
+      res.json({
+        proposal: await workspace.learning.dismissProposal(
+          String(req.params["id"] ?? ""),
+          reason || "用户忽略",
+        ),
+      });
+    } catch (err) {
+      const message = errorMessage(err);
+      res.status(message === "提案不存在" ? 404 : 400).json({ error: message });
+    }
+  });
+
   app.post("/api/members", async (req: Request, res: Response) => {
     const body = bodyOf(req);
     const name = stringField(body, "name");
@@ -1075,10 +1113,12 @@ export function createApp(deps: AppDeps): express.Express {
           ? sanitizeSelectionPatch(body.selection, current.selection)
           : undefined;
       const limits = body.limits !== undefined ? sanitizeLimits(body.limits) : undefined;
+      const learning = body.learning !== undefined ? sanitizeLearning(body.learning) : undefined;
       const next = mergeSettings(current, {
         ...(providers ? { providers } : {}),
         ...(selection ? { selection } : {}),
         ...(limits ? { limits } : {}),
+        ...(learning ? { learning } : {}),
       });
       // 默认模型失效（指向已删/已停用的模型）时先回落到仍然可用的引用，再校验。
       const ready = repairDefaultModel(next);

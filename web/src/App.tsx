@@ -38,6 +38,7 @@ import {
 import SkillLibraryPanel from "./SkillLibrary";
 import TemplateLibraryPanel from "./TemplateLibrary";
 import CronPanel from "./CronPanel";
+import LearningPanel from "./LearningPanel";
 import RoomsPanel from "./RoomsPanel";
 import { ModelSettings } from "./ModelSettings";
 import {
@@ -68,6 +69,7 @@ import {
   fetchArchive,
   fetchArchives,
   fetchBootstrap,
+  fetchLearning,
   fetchMe,
   fetchMemberFileContent,
   fetchMemberFiles,
@@ -103,6 +105,7 @@ import {
   workspaceFileDownloadUrl,
   type AgentFileContent,
   type AgentFileEntry,
+  type LearningSettings,
   type MaskedSettings,
   type MemberSkillsView,
   type MemberTemplateDraft,
@@ -117,7 +120,7 @@ import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdo
 import { CsvPreview, RichPreviewBody } from "./FilePreviews";
 
 type ThemeMode = "light" | "dark";
-type SettingsTab = "profile" | "model" | "limits" | "appearance";
+type SettingsTab = "profile" | "model" | "limits" | "learning" | "appearance";
 /** 右侧面板的三个视图：任务看板、文件工作区、归档区。 */
 type RightTab = "tasks" | "files" | "archives";
 
@@ -536,6 +539,11 @@ function RoomView({
   const [cronOpen, setCronOpen] = useState(false);
   /** 定时任务事件到达时自增：面板据此重新拉取定义与状态，不重挂载（编辑器状态保留）。 */
   const [cronTick, setCronTick] = useState(0);
+  const [learningOpen, setLearningOpen] = useState(false);
+  /** 复盘事件到达时自增：学习面板据此重拉提案与流水。 */
+  const [learningTick, setLearningTick] = useState(0);
+  /** 待确认提案数：侧边栏角标，让用户知道「有东西等你确认」。 */
+  const [learningPending, setLearningPending] = useState(0);
   const [membersOpen, setMembersOpen] = useState(true);
   const [navOpen, setNavOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -796,6 +804,22 @@ function RoomView({
     }
   }, [onSessionLost]);
 
+  /** 学习层待确认提案数：侧边栏角标用；复盘事件与面板操作都会重拉。 */
+  const refreshLearningPending = useCallback(async () => {
+    try {
+      const snapshot = await fetchLearning();
+      setLearningPending(
+        snapshot.proposals.filter((proposal) => proposal.status === "pending").length,
+      );
+    } catch {
+      // 角标只是提示，拉不到就保留上一次的数字，不打扰聊天。
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshLearningPending();
+  }, [refreshLearningPending]);
+
   /** 群聊区改动了房间（新建/改名/删群/拉人/移人）：列表与当前视图一起刷新。 */
   const syncRoomView = useCallback(async () => {
     await refreshRooms();
@@ -860,6 +884,11 @@ function RoomView({
     const unsubscribe = subscribeEvents((frame: RoomFrame) => {
       const event = frame.event;
       if (event.type === "rooms-changed") void refreshRooms();
+      // 复盘是账号级的事：不管事件来自哪间房，都要刷新角标与学习面板。
+      if (event.type === "learning") {
+        setLearningTick((tick) => tick + 1);
+        void refreshLearningPending();
+      }
       // 消息、任务卡、成员进出会改变群聊卡片上的统计；其余事件（运行增量等）不重拉列表。
       const affectsRoomStats =
         event.type === "message" ||
@@ -935,13 +964,20 @@ function RoomView({
 
   const selectedMember = members.find((member) => member.id === selectedMemberId);
   const inWarRoom =
-    !skillsOpen && !roomsOpen && !templatesOpen && !cronOpen && !newMemberOpen && !selectedMember;
-  /** 技能库 / 群聊区 / 模板库 / 定时任务 / 智能体文件 / 新建成员独占右侧整块区域：此时连聊天一起收起。 */
+    !skillsOpen &&
+    !roomsOpen &&
+    !templatesOpen &&
+    !cronOpen &&
+    !learningOpen &&
+    !newMemberOpen &&
+    !selectedMember;
+  /** 技能库 / 群聊区 / 模板库 / 定时任务 / 学习 / 智能体文件 / 新建成员独占右侧整块区域：此时连聊天一起收起。 */
   const takeover =
     skillsOpen ||
     roomsOpen ||
     templatesOpen ||
     cronOpen ||
+    learningOpen ||
     newMemberOpen ||
     Boolean(selectedMember);
   const isGroupRoom = state?.room.kind === "group";
@@ -1633,6 +1669,7 @@ function RoomView({
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setLearningOpen(false);
     setRoomsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
@@ -1644,6 +1681,7 @@ function RoomView({
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setLearningOpen(false);
     setRoomsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
@@ -1654,6 +1692,7 @@ function RoomView({
     setNewMemberOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setLearningOpen(false);
     setRoomsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
@@ -1664,6 +1703,7 @@ function RoomView({
     setSkillsOpen(false);
     setNewMemberOpen(false);
     setCronOpen(false);
+    setLearningOpen(false);
     setRoomsOpen(false);
     setSelectedMemberId(null);
     setBoardOpen(true);
@@ -1694,6 +1734,19 @@ function RoomView({
     setNavOpen(false);
   }
 
+  /** 学习面板：右侧整块区域，展示复盘产出的待确认记忆提案与流水。 */
+  function openLearning() {
+    setLearningOpen(true);
+    setSkillsOpen(false);
+    setTemplatesOpen(false);
+    setCronOpen(false);
+    setRoomsOpen(false);
+    setNewMemberOpen(false);
+    setSelectedMemberId(null);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
   /** 群聊区面板：列表或花名册，两个标签共用同一个右侧区域。 */
   function openRooms(tab: "list" | "members") {
     setRoomsTab(tab);
@@ -1701,6 +1754,7 @@ function RoomView({
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setLearningOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setBoardOpen(true);
@@ -1727,6 +1781,7 @@ function RoomView({
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setLearningOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setOpenArchiveId(null);
@@ -1743,6 +1798,7 @@ function RoomView({
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setLearningOpen(false);
     setRoomsOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
@@ -1925,6 +1981,18 @@ function RoomView({
 
             <button
               type="button"
+              className={`nav-item${learningOpen ? " active" : ""}`}
+              aria-pressed={learningOpen}
+              onClick={() => (learningOpen ? setLearningOpen(false) : openLearning())}
+            >
+              <Icon name="sparkles" />
+              <span className="nav-label">学习</span>
+              <span className="nav-hint">复盘产出 · 待确认记忆</span>
+              {learningPending > 0 && <span className="nav-count">{learningPending}</span>}
+            </button>
+
+            <button
+              type="button"
               className={`nav-item${roomsOpen ? " active" : ""}`}
               aria-pressed={roomsOpen}
               onClick={() => (roomsOpen ? setRoomsOpen(false) : openRooms("list"))}
@@ -2048,7 +2116,7 @@ function RoomView({
                 >
                   <Icon name="settings" />
                   <span className="menu-label">设置</span>
-                  <span className="menu-hint">资料 · 模型 · 限额 · 外观</span>
+                  <span className="menu-hint">资料 · 模型 · 限额 · 学习 · 外观</span>
                 </button>
                 {user.role === "admin" && (
                   <button
@@ -2530,6 +2598,15 @@ function RoomView({
         <aside id="cron-panel" className="board-panel" aria-label="定时任务">
           <CronPanel onClose={() => setCronOpen(false)} members={members} refreshToken={cronTick} />
         </aside>
+      ) : learningOpen ? (
+        <aside id="learning-panel" className="board-panel" aria-label="学习">
+          <LearningPanel
+            onClose={() => setLearningOpen(false)}
+            refreshToken={learningTick}
+            learning={state?.settings.learning}
+            onPendingChange={setLearningPending}
+          />
+        </aside>
       ) : selectedMember ? (
         <aside id="agent-files-panel" className="board-panel" aria-label="智能体文件">
           <AgentFilesPanel
@@ -2734,6 +2811,7 @@ function RoomView({
           user={user}
           roomName={state.room.name}
           settings={state.settings}
+          modelChoices={modelChoices}
           theme={theme}
           initialTab={settingsTab}
           onClose={() => setSettingsTab(null)}
@@ -4309,6 +4387,7 @@ function SettingsDialog({
   user,
   roomName,
   settings,
+  modelChoices,
   theme,
   initialTab,
   onClose,
@@ -4319,6 +4398,7 @@ function SettingsDialog({
   user: PublicUser;
   roomName: string;
   settings: MaskedSettings;
+  modelChoices: { ref: string; label: string }[];
   theme: ThemeMode;
   initialTab: SettingsTab;
   onClose: () => void;
@@ -4374,6 +4454,14 @@ function SettingsDialog({
             </button>
             <button
               type="button"
+              className={`settings-tab${tab === "learning" ? " active" : ""}`}
+              onClick={() => setTab("learning")}
+            >
+              <Icon name="sparkles" />
+              学习
+            </button>
+            <button
+              type="button"
               className={`settings-tab${tab === "appearance" ? " active" : ""}`}
               onClick={() => setTab("appearance")}
             >
@@ -4387,6 +4475,13 @@ function SettingsDialog({
             )}
             {tab === "model" && <ModelSettings settings={settings} onSaved={onSettingsSaved} />}
             {tab === "limits" && <LimitsSection settings={settings} onSaved={onSettingsSaved} />}
+            {tab === "learning" && (
+              <LearningSection
+                settings={settings}
+                modelChoices={modelChoices}
+                onSaved={onSettingsSaved}
+              />
+            )}
             {tab === "appearance" && (
               <AppearanceSection theme={theme} onThemeChange={onThemeChange} />
             )}
@@ -4678,6 +4773,139 @@ function LimitsSection({
       <p className="hint">
         步数与超时同时生效：只调大步数、不调超时，长任务会先被整轮超时中止。超限的值服务端会拒绝保存。
       </p>
+    </div>
+  );
+}
+
+/**
+ * 学习层设置：复盘模式、频率、每日上限与复盘用模型。
+ * 取值区间与服务端 `sanitizeLearning()` 同源，界面不会比校验宽。
+ */
+function LearningSection({
+  settings,
+  modelChoices,
+  onSaved,
+}: {
+  settings: MaskedSettings;
+  modelChoices: { ref: string; label: string }[];
+  onSaved: (next: MaskedSettings) => void;
+}) {
+  const learning = settings.learning;
+  const [mode, setMode] = useState<LearningSettings["mode"]>(learning?.mode ?? "propose");
+  const [everyNRuns, setEveryNRuns] = useState(String(learning?.everyNRuns ?? 2));
+  const [dailyCap, setDailyCap] = useState(String(learning?.dailyCap ?? 20));
+  const [modelRef, setModelRef] = useState(learning?.modelRef ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  async function handleSave() {
+    if (busy) return;
+    setError(null);
+    setNote(null);
+    const every = Number(everyNRuns.trim());
+    const cap = Number(dailyCap.trim());
+    if (!Number.isInteger(every) || every < 1 || every > 20) {
+      setError("复盘频率需在 1–20 次运行之间（整数）");
+      return;
+    }
+    if (!Number.isInteger(cap) || cap < 1 || cap > 200) {
+      setError("每日复盘上限需在 1–200 次之间（整数）");
+      return;
+    }
+    setBusy(true);
+    try {
+      const next = await saveSettings({
+        learning: { mode, everyNRuns: every, dailyCap: cap, modelRef: modelRef.trim() },
+      });
+      onSaved(next);
+      const saved = next.learning;
+      setMode(saved.mode);
+      setEveryNRuns(String(saved.everyNRuns));
+      setDailyCap(String(saved.dailyCap));
+      setModelRef(saved.modelRef ?? "");
+      setNote("已保存，成员下一轮运行起生效");
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="settings-form">
+      <div className="section-label">学习</div>
+      <p className="hint">
+        成员每轮交付后，服务端另起一次不带工具的模型调用，只判断「这轮有没有值得长期记住的事实」，
+        产出候选记忆。采纳后写入该成员的长期记忆，不会改动人格与身份文件，也不会自动删除任何已写入的内容。
+      </p>
+      <label className="field">
+        <span>
+          复盘模式
+          <em>（待确认最稳：提案要你点「写入记忆」才生效）</em>
+        </span>
+        <select value={mode} onChange={(event) => setMode(event.target.value as LearningSettings["mode"])}>
+          <option value="off">关闭（不复盘）</option>
+          <option value="propose">待确认（产出提案，等你采纳）</option>
+          <option value="auto">自动写入（产出即落盘，不经确认）</option>
+        </select>
+      </label>
+      <label className="field">
+        <span>
+          复盘频率
+          <em>（1–20 · 每几轮运行复盘一次）</em>
+        </span>
+        <input
+          type="number"
+          value={everyNRuns}
+          min={1}
+          max={20}
+          step={1}
+          disabled={mode === "off"}
+          onChange={(event) => setEveryNRuns(event.target.value)}
+        />
+      </label>
+      <label className="field">
+        <span>
+          每日上限
+          <em>（1–200 · 一天最多复盘几次，控住额外成本）</em>
+        </span>
+        <input
+          type="number"
+          value={dailyCap}
+          min={1}
+          max={200}
+          step={1}
+          disabled={mode === "off"}
+          onChange={(event) => setDailyCap(event.target.value)}
+        />
+      </label>
+      <label className="field">
+        <span>
+          复盘模型
+          <em>（留空则跟随成员自己用的模型）</em>
+        </span>
+        <select value={modelRef} onChange={(event) => setModelRef(event.target.value)}>
+          <option value="">跟随成员的模型</option>
+          {modelChoices
+            .filter((choice) => choice.ref !== "default")
+            .map((choice) => (
+              <option key={choice.ref} value={choice.ref}>
+                {choice.label}
+              </option>
+            ))}
+        </select>
+        <span className="hint">
+          建议挑一个便宜的小模型：复盘每轮都要花一次调用，账本里会按同一口径计入成本。
+        </span>
+      </label>
+      {error && <p className="form-error">{error}</p>}
+      {note && <p className="form-note">{note}</p>}
+      <div className="modal-actions">
+        <button className="btn primary" disabled={busy} onClick={() => void handleSave()}>
+          {busy ? "保存中…" : "保存学习设置"}
+        </button>
+      </div>
     </div>
   );
 }

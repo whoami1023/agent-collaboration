@@ -1,5 +1,7 @@
 import { join } from "node:path";
 import { rm } from "node:fs/promises";
+import { LearningService } from "../agent/learning/service";
+import { LearningStore } from "../agent/learning/store";
 import { ensureMainMember, Orchestrator } from "../agent/orchestrator";
 import { SessionArchives, summaryOf } from "../archive/session-archive";
 import { CronService } from "../cron/service";
@@ -124,6 +126,8 @@ export class Workspace {
     readonly archives: SessionArchives,
     private readonly settingsRef: { current: Settings },
     private readonly manifest: RoomManifest,
+    /** 学习层：复盘服务 + 账本，路由与关房都要用。 */
+    readonly learning: LearningService,
   ) {}
 
   static async load(rootDir: string, owner: WorkspaceOwner, skills: SkillLibrary): Promise<Workspace> {
@@ -169,6 +173,21 @@ export class Workspace {
     // 用量账本：按模型 × UTC 自然日聚合 token 与成本，供设置面板统计。
     const usage = new ModelUsageStore(join(dir, "model-usage.json"));
 
+    // 学习层（P1）：成员一轮交付后的后台复盘。产出先落进本账号的 learning.json，
+    // 事件按复盘所在的房间广播，前端「学习」面板据此刷新。
+    let workspaceRef: Workspace | undefined;
+    const learning = new LearningService({
+      store: new LearningStore(join(dir, "learning.json")),
+      getSettings: () => settingsRef.current,
+      getModelDeps: () => ({ settings: settingsRef.current, dataDir: dir }),
+      memory,
+      usage,
+      onLearned: ({ proposals, log }) => {
+        const bus = workspaceRef?.rooms.get(log.roomId)?.bus;
+        if (bus) bus.emit({ type: "learning", proposals, log });
+      },
+    });
+
     const workspace = new Workspace(
       owner.id,
       dir,
@@ -180,7 +199,9 @@ export class Workspace {
       new SessionArchives(dir),
       settingsRef,
       manifest,
+      learning,
     );
+    workspaceRef = workspace;
     workspace.groupBuses = groupBuses;
     workspace.rooms.set(MAIN_ROOM_ID, workspace.openRoom(mainDescriptor, state, mainBus));
     for (const descriptor of descriptors) {
@@ -271,6 +292,7 @@ export class Workspace {
       dataDir: this.dir,
       usage: this.usage,
       onUsageRecord: (record) => bus.emit({ type: "model-usage", usage: record }),
+      learning: this.learning,
     });
     const instance: RoomInstance = { descriptor, bus, board, orchestrator, stateFile: this.stateFileFor(descriptor.id), saveTimer: null };
     bus.subscribe((event) => {
@@ -461,6 +483,7 @@ export class Workspace {
       room.bus.removeMember(memberId);
       await this.persistRoom(room.descriptor.id);
     }
+    await this.learning.dropMember(memberId);
   }
 
   async updateRoom(roomId: string, patch: { name?: unknown; topic?: unknown }): Promise<RoomInfo> {
@@ -730,6 +753,7 @@ export class Workspace {
       [...this.rooms.keys()].map((roomId) => this.writeRoom(roomId).catch(() => undefined)),
     );
     await this.usage.flush().catch(() => undefined);
+    await this.learning.flush().catch(() => undefined);
     await this.cronService?.flush().catch(() => undefined);
   }
 }

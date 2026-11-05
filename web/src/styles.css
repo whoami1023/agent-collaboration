@@ -4771,6 +4771,140 @@ body.pane-dragging * {
   flex: none;
 }
 
+/* ---------- learning (复盘 → 长期记忆) ---------- */
+
+.learning-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.learning-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  box-shadow: var(--shadow-sm);
+}
+
+.learning-card.done {
+  background: var(--panel);
+}
+
+.learning-content {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--text-sm);
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.learning-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+}
+
+.learning-triggers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 0;
+}
+
+.learning-trigger {
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill, 999px);
+  background: var(--accent-subtle);
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.learning-why {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.learning-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.learning-log {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  font-size: var(--text-xs);
+}
+
+.learning-log.applied {
+  border-left-color: var(--ok);
+}
+
+.learning-log.proposed {
+  border-left-color: var(--accent);
+}
+
+.learning-log.skipped {
+  border-left-color: var(--warn);
+}
+
+.learning-log.failed {
+  border-left-color: var(--danger);
+}
+
+.learning-outcome {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill, 999px);
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.learning-log-main {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+}
+
+.learning-log-main strong {
+  color: var(--text-strong);
+}
+
+.learning-log-detail {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.learning-log-model {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 /* ---------- auth ---------- */
 
 .auth-screen {

@@ -20,6 +20,13 @@ import type {
   CronSchedule,
 } from "../../src/cron/types";
 import type { ProviderApi } from "../../src/model/types";
+import type {
+  LearningSettings,
+  MemoryProposal,
+  ReviewLog,
+} from "../../src/agent/learning/types";
+
+export type { LearningSettings, MemoryProposal, ReviewLog };
 
 export type { RoomInfo, RoomKind, RoomMode };
 
@@ -61,6 +68,7 @@ export interface MaskedSettings {
   providers: MaskedProvider[];
   selection: ModelSelectionView;
   limits: Limits;
+  learning: LearningSettings;
 }
 
 export interface StateSnapshot {
@@ -560,6 +568,33 @@ export async function fetchCronRuns(query: { jobId?: string; limit?: number } = 
   return request<CronRunPage>(`/api/crons/runs?${params.toString()}`);
 }
 
+/** 学习层：账号内所有房间 accumulated 的待确认提案与复盘流水。 */
+export interface LearningSnapshot {
+  proposals: MemoryProposal[];
+  log: ReviewLog[];
+}
+
+export async function fetchLearning(): Promise<LearningSnapshot> {
+  return request<LearningSnapshot>("/api/learning");
+}
+
+/** 采纳提案：后端走受控追加通道写入长期记忆，返回写入库之后的提案（含落盘路径）。 */
+export async function applyLearningProposal(proposalId: string): Promise<MemoryProposal> {
+  const body = await request<{ proposal: MemoryProposal }>(
+    `/api/learning/${encodeURIComponent(proposalId)}/apply`,
+    { method: "POST", body: "{}" },
+  );
+  return body.proposal;
+}
+
+export async function dismissLearningProposal(proposalId: string): Promise<MemoryProposal> {
+  const body = await request<{ proposal: MemoryProposal }>(
+    `/api/learning/${encodeURIComponent(proposalId)}/dismiss`,
+    { method: "POST", body: "{}" },
+  );
+  return body.proposal;
+}
+
 export function fetchState(): Promise<StateSnapshot> {
   return request<StateSnapshot>(withRoom("/api/state"));
 }
@@ -965,6 +1000,8 @@ export async function saveSettings(patch: {
   selection?: SelectionPatch;
   /** 以存储单位提交（超时为毫秒），服务端按 LIMIT_FIELDS 区间校验。 */
   limits?: Partial<Limits>;
+  /** 学习层开关：模式 / 复盘频率 / 每日上限 / 复盘模型。 */
+  learning?: Partial<LearningSettings>;
 }): Promise<MaskedSettings> {
   const body = await request<{ settings: MaskedSettings }>("/api/settings", {
     method: "PUT",

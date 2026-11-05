@@ -45,6 +45,27 @@ const DEFAULT_SELECTION: ModelSelection = {
   allow: [],
 };
 
+export type LearningMode = "off" | "propose" | "auto";
+
+/** 一次运行结束后要不要复盘、学到的记忆条目是直接落盘还是等用户确认（对应 Hermes 的 background review）。 */
+export interface LearningSettings {
+  mode: LearningMode;
+  /** 每 N 次成功运行复盘一次；1 表示每次运行后都复盘。 */
+  everyNRuns: number;
+  /** 每天最多复盘几次，防止后台调用把成本跑飞。 */
+  dailyCap: number;
+  /** 复盘专用模型引用；留空跟随成员自己用的模型。 */
+  modelRef?: string;
+}
+
+export const LEARNING_MODES: readonly LearningMode[] = ["off", "propose", "auto"];
+
+export const DEFAULT_LEARNING: LearningSettings = {
+  mode: "propose",
+  everyNRuns: 2,
+  dailyCap: 20,
+};
+
 export const DEFAULT_SETTINGS: Settings = {
   settingsVersion: SETTINGS_VERSION,
   providers: [
@@ -64,6 +85,7 @@ export const DEFAULT_SETTINGS: Settings = {
   ],
   selection: DEFAULT_SELECTION,
   limits: { ...DEFAULT_LIMITS },
+  learning: { ...DEFAULT_LEARNING },
 };
 
 export interface Settings {
@@ -72,6 +94,8 @@ export interface Settings {
   providers: ProviderConfig[];
   selection: ModelSelection;
   limits: Limits;
+  /** 学习层（回合后复盘）的开关与节流；旧设置缺失时按默认值补齐。 */
+  learning: LearningSettings;
 }
 
 /** 每次返回一份全新的默认设置：DEFAULT_SETTINGS 是共享常量，调用方不要直接改它。 */
@@ -109,6 +133,7 @@ export interface MaskedSettings {
   providers: MaskedProviderConfig[];
   selection: ModelSelection;
   limits: Limits;
+  learning: LearningSettings;
 }
 
 function maskModel(model: ModelDefinition): MaskedModelDefinition {
@@ -145,6 +170,7 @@ export function maskSettings(settings: Settings): MaskedSettings {
     }),
     selection: structuredClone(settings.selection),
     limits: settings.limits,
+    learning: structuredClone(settings.learning),
   };
 }
 
@@ -183,6 +209,7 @@ interface LegacySettings {
   defaultModel?: string;
   selection?: Partial<ModelSelection>;
   limits?: Partial<Limits>;
+  learning?: Partial<LearningSettings>;
 }
 
 /**
@@ -255,7 +282,21 @@ function migrateSettings(raw: Partial<Settings>): Partial<Settings> {
     aliases: { ...BUILTIN_ALIASES, ...(legacy.selection?.aliases ?? {}) },
   };
 
-  return { ...legacy, settingsVersion: SETTINGS_VERSION, providers, selection, limits };
+  return {
+    ...legacy,
+    settingsVersion: SETTINGS_VERSION,
+    providers,
+    selection,
+    limits,
+    // 老文件没有 learning 字段：一律补出厂默认；存坏的字段退回默认而不是让加载失败。
+    learning: (() => {
+      try {
+        return { ...DEFAULT_LEARNING, ...sanitizeLearning(legacy.learning ?? {}) };
+      } catch {
+        return { ...DEFAULT_LEARNING };
+      }
+    })(),
+  };
 }
 
 /**
@@ -294,6 +335,47 @@ interface SettingsPatch {
   providers?: Array<Partial<ProviderConfig> & { id: string }>;
   selection?: Partial<ModelSelection>;
   limits?: Partial<Limits>;
+  learning?: Partial<LearningSettings>;
+}
+
+/**
+ * 校验学习层设置：`mode` 只认三种，频率与每日上限按整数与区间收口，
+ * `modelRef` 空串视为「跟随成员模型」。
+ */
+export function sanitizeLearning(input: unknown): Partial<LearningSettings> {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) throw new Error("learning 必须是对象");
+  const record = input as Record<string, unknown>;
+  const known = ["mode", "everyNRuns", "dailyCap", "modelRef"];
+  for (const key of Object.keys(record)) {
+    if (!known.includes(key)) throw new Error(`未知的学习层字段 ${key}`);
+  }
+  const result: Partial<LearningSettings> = {};
+  if (record.mode !== undefined) {
+    if (typeof record.mode !== "string" || !LEARNING_MODES.includes(record.mode as LearningMode)) {
+      throw new Error(`复盘模式只能是 ${LEARNING_MODES.join(" / ")}`);
+    }
+    result.mode = record.mode as LearningMode;
+  }
+  if (record.everyNRuns !== undefined) {
+    if (typeof record.everyNRuns !== "number" || !Number.isInteger(record.everyNRuns) ||
+      record.everyNRuns < 1 || record.everyNRuns > 20) {
+      throw new Error("复盘频率需在 1–20 次运行之间（整数）");
+    }
+    result.everyNRuns = record.everyNRuns;
+  }
+  if (record.dailyCap !== undefined) {
+    if (typeof record.dailyCap !== "number" || !Number.isInteger(record.dailyCap) ||
+      record.dailyCap < 1 || record.dailyCap > 200) {
+      throw new Error("每日复盘上限需在 1–200 次之间（整数）");
+    }
+    result.dailyCap = record.dailyCap;
+  }
+  if (record.modelRef !== undefined) {
+    if (typeof record.modelRef !== "string") throw new Error("复盘模型引用必须是字符串");
+    const ref = record.modelRef.trim();
+    result.modelRef = ref || undefined;
+  }
+  return result;
 }
 
 function normalizeApi(value: unknown, fallback: ProviderApi): ProviderApi {
@@ -387,6 +469,11 @@ export function mergeSettings(base: Settings, patch: SettingsPatch): Settings {
     providers,
     selection,
     limits: { ...base.limits, ...(patch.limits ?? {}) },
+    learning: {
+      ...DEFAULT_LEARNING,
+      ...base.learning,
+      ...(patch.learning ?? {}),
+    },
   };
 }
 

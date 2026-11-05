@@ -13,6 +13,7 @@ import type { MemberProfileHints } from "../memory/bootstrap-files";
 import type { MemorySearchManager } from "../memory/manager";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import { MemberRuntime } from "./member-runtime";
+import type { LearningHost } from "./learning/types";
 import { CRON_SENDER_ID } from "../cron/types";
 import type { CronTurnOutcome } from "../cron/types";
 import type { CronService } from "../cron/service";
@@ -34,6 +35,8 @@ export interface OrchestratorDeps {
   dataDir?: string;
   usage?: ModelUsageStore;
   onUsageRecord?(record: MemberUsageRecord): void;
+  /** 学习层：成员一轮交付后触发后台复盘（工作区在建模时注入）。 */
+  learning?: LearningHost;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -514,6 +517,7 @@ export class Orchestrator {
         ...(deps.files ? { files: deps.files } : {}),
         ...(deps.usage ? { usage: deps.usage } : {}),
         ...(deps.onUsageRecord ? { onUsageRecord: deps.onUsageRecord } : {}),
+        ...(deps.learning ? { learning: deps.learning } : {}),
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });
       this.runtimes.set(member.id, runtime);
