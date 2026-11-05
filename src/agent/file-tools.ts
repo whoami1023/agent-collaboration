@@ -105,13 +105,17 @@ export function buildFileTools(files: WorkspaceFiles): ToolImpl[] {
       schema: {
         name: "file_write",
         description:
-          "把文本成果写进文件工作区，用户可在右侧「文件」标签页查看和下载。用于报告、数据表、代码等产出。",
+          "把文本成果写进文件工作区，用户可在右侧「文件」标签页查看和下载。用于报告、方案、纪要、数据表、代码等产出；长文档可用 append 分节续写。",
         parameters: {
           type: "object",
           properties: {
             path: { type: "string", description: "文件相对路径，如 reports/summary.md；子目录会自动创建" },
             content: { type: "string", description: "完整文本内容（UTF-8）" },
             overwrite: { type: "boolean", description: "文件已存在时是否覆盖，默认 false" },
+            append: {
+              type: "boolean",
+              description: "追加到文件末尾；不存在则新建。用于长文档分节续写，与 overwrite 互斥",
+            },
           },
           required: ["path", "content"],
           additionalProperties: false,
@@ -122,19 +126,29 @@ export function buildFileTools(files: WorkspaceFiles): ToolImpl[] {
         if (!relPath) return "错误：path 不能为空";
         const content = readText(args, "content");
         if (content === undefined) return "错误：content 不能为空";
+        const append = args["append"] === true;
+        const overwrite = args["overwrite"] === true;
+        if (append && overwrite) return "错误：append 与 overwrite 不能同时使用";
         const sizeBytes = Buffer.byteLength(content, "utf8");
         if (sizeBytes > MAX_TEXT_BYTES) {
           return `错误：文本文件不能超过 ${MAX_TEXT_BYTES / 1024} KB；更大的内容请拆成多个文件。`;
         }
+        if (append) {
+          const current = await files.read(relPath, { maxBytes: 1 }).catch(() => undefined);
+          if (current && current.sizeBytes + sizeBytes > MAX_TEXT_BYTES) {
+            return `错误：追加后文本文件会超过 ${MAX_TEXT_BYTES / 1024} KB；请拆成多个文件。`;
+          }
+        }
         try {
           const saved = await files.write(relPath, Buffer.from(content, "utf8"), {
-            overwrite: args["overwrite"] === true,
+            overwrite,
+            append,
           });
-          return `已写入 files/${saved.path}（${formatSize(saved.sizeBytes)}，${content.split("\n").length} 行）。` +
+          return `${append ? "已追加到" : "已写入"} files/${saved.path}（${formatSize(saved.sizeBytes)}，${content.split("\n").length} 行）。` +
             "用户可在右侧「文件工作区」查看和下载。";
         } catch (err) {
           if (err instanceof WorkspaceFileError && err.status === 409) {
-            return `写入失败：${err.message}。如果确实要替换，请传入 overwrite=true。`;
+            return `写入失败：${err.message}。如果确实要替换，请传入 overwrite=true；要在末尾续写，请传入 append=true。`;
           }
           return `写入失败：${err instanceof Error ? err.message : String(err)}`;
         }

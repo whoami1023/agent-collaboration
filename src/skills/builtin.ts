@@ -19,7 +19,7 @@ export interface BuiltinSkillSeed {
 }
 
 /** 内置技能内容版本：升级时启动会刷新已有内置记录，用户自建的同名技能不受影响。 */
-export const BUILTIN_SKILLS_VERSION = 8;
+export const BUILTIN_SKILLS_VERSION = 9;
 
 const CORE_SKILLS: BuiltinSkillSeed[] = [
   {

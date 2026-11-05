@@ -181,6 +181,34 @@ describe("文件工具", () => {
     expect(await read!.execute({ path: "notes/todo.md" }, signal)).toContain("覆盖");
   });
 
+  it("file_write 追加写入：可续写长文档，append 与 overwrite 互斥", async () => {
+    const tools = new Map(buildFileTools(files).map((tool) => [tool.schema.name, tool]));
+    const write = tools.get("file_write")!;
+    const read = tools.get("file_read")!;
+
+    expect(
+      await write.execute({ path: "draft.md", content: "第一节\n", append: true }, signal),
+    ).toContain("已追加到");
+    expect(
+      await write.execute({ path: "draft.md", content: "第二节\n", append: true }, signal),
+    ).toContain("已追加到");
+    const content = await read.execute({ path: "draft.md" }, signal);
+    expect(content).toContain("第一节");
+    expect(content).toContain("第二节");
+
+    expect(
+      await write.execute(
+        { path: "draft.md", content: "x", append: true, overwrite: true },
+        signal,
+      ),
+    ).toBe("错误：append 与 overwrite 不能同时使用");
+
+    // 追加已有的普通写入仍按覆盖语义：不传 overwrite 就拒绝。
+    expect(await write.execute({ path: "draft.md", content: "重写" }, signal)).toContain(
+      "overwrite=true",
+    );
+  });
+
   it("file_read 对二进制与图片给出下载提示", async () => {
     await files.write("blob.bin", Buffer.from([0, 1, 2]));
     await files.write("pic.png", Buffer.from([0x89, 0x50, 0x4e, 0x47]));

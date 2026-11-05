@@ -21,7 +21,7 @@ export function formatRoomWindow(messages: RoomMessage[]): string {
             : `@${message.senderName}`;
       const meta = [`#${message.seq}`, who, clock(message.ts)];
       if (message.taskId) meta.push(`任务 ${message.taskId}`);
-      if (message.kind === "announce") meta.push("报告");
+      if (message.kind === "announce") meta.push("汇报");
       return `${meta.join(" · ")}\n${message.text}`;
     })
     .join("\n\n");
@@ -67,6 +67,15 @@ const FILE_WORKSPACE_SECTION = `文件工作区
 - file_list 查看清单，file_read 读取文本，file_write 写入结果；路径用相对路径（如 reports/a.md），子目录会自动创建。
 - 汇报时给出文件的相对路径作为证据；图片、PDF 等二进制或超大文件请让用户在面板里预览、下载。`;
 
+const DOCUMENT_SECTION = `交付文档（给别人看的成稿）
+- 不限于报告：方案、纪要、说明书、论文、合同、手册、简报都按同一套要求——离开群聊后，读者只靠这份文件就能理解背景、判断与依据。
+- 动笔前先定四件事：读者是谁、拿它做什么决定、读者已经知道什么、篇幅多少。用户没说，就按「不了解背景、需要据此判断」的读者写，并在汇报里说明这个假设。
+- 结构随文体调整，不套死模板：标题 → 摘要或核心结论 →（长文）目录 → 背景与目的 → 分节正文 → 结论/建议/下一步 → 资料来源或附录。短文不要硬加封面和目录。
+- 正文以连续段落为主：一节讲清一个判断，先结论后依据；术语首次出现给定义，口径、单位、人名、时间与缩写全文一致；节与节之间写过渡。
+- 正文只放读者需要的信息：不写内部分工、工具调用、文件指纹（md5/字节数/行尾）、核对过程与待办清单；这些留在群聊汇报或文末「工作说明」。
+- 数据要写明年份、口径与来源；不确定的内容集中放进「局限与存疑」，不要混在正文里当作确定结论。
+- 长文分节写：一节一个文件，或用 file_write 的 append 续写，最后统一装配；不要为改一处整篇重写。交付前自检：只看文件，读者能否理解背景、结论与依据。`;
+
 const COMMAND_SECTION = `命令执行
 - run_command 在文件工作区执行命令（默认 30 秒、最长 120 秒，输出截断到 32 KB）：可跑 Python/Node 脚本、pip/npm 安装、数据校验；cwd 必须留在工作区内。
 - run_skill_script 执行技能附带脚本：会先把该技能的全部文件展开到 files/.skill-runtime/<技能名>/，再用对应解释器运行。默认在该展开目录里跑（产出只留在临时目录）；要处理文件工作区里的成果就传 cwd="." 让脚本在 files/ 里读写。
@@ -94,10 +103,12 @@ export function buildSystemPrompt(context: PromptContext): string {
     : "";
   const fileSection =
     context.availableTools?.has("file_list") === true ? FILE_WORKSPACE_SECTION : "";
+  const documentSection =
+    context.availableTools?.has("file_write") === true ? DOCUMENT_SECTION : "";
   const commandSection =
     context.availableTools?.has("run_command") === true ? COMMAND_SECTION : "";
   const cronSection = context.availableTools?.has("cron") === true ? CRON_SECTION : "";
-  return [base, memorySection.trim(), fileSection, commandSection, cronSection]
+  return [base, memorySection.trim(), fileSection, documentSection, commandSection, cronSection]
     .filter((section) => section.length > 0)
     .join("\n\n");
 }
@@ -134,8 +145,13 @@ ${formatSkills(context.skills)}
 ${dispatchRule}- 你不能创建成员：需要新成员时，请让用户在左侧「新建成员」里填写名字与职责创建，不要假装已经创建或已派发。
 ${modeSection}
 
+成稿与统稿
+- 用户要的是给别人看的成稿（报告、方案、纪要、说明书、论文、简报等）时，先定交付契约：读者是谁、用来做什么、文体、结构、篇幅；分派时要求成员按章节交连续正文并写进文件工作区。
+- 收齐后由你统稿，不要直接把成员汇报拼成文档：统一口径、术语与时间，补背景与结论，删重复和过程性内容，顺好章节过渡，再落成最终文件。
+- 群聊回复仍然只做简短汇报；成稿正文在文件里，回复里给路径、结构与你做过的关键取舍。
+
 节奏
-- 分派后不要轮询、不要反复催问，等它的报告。
+- 分派后不要轮询、不要反复催问，等它的汇报。
 - 一次回复只做一件事：要么分派，要么综合汇报；不要刷屏。
 - 用 task_create 建任务卡，进展用 task_update 更新，结果用 task_attach_artifact 登记。
 - 单次运行最多 ${limits.maxStepsPerRun} 步工具调用：相互独立的调用放在同一轮发起（例如改任务状态与登记产出），接近上限时先收尾汇报，不要一步只做一个工具调用。
@@ -162,7 +178,7 @@ ${formatSkills(context.skills)}
 纪律
 - 你只在被 @${member.name} 或收到分配任务时行动；其他人的闲聊不回应。
 - 一次只发一条完整结论，不刷屏，不发「收到」这类空话。
-- 汇报必须包含：结论、证据（路径/链接/关键输出）、未解决项与不确定点。不要只给承诺。
+- 群聊汇报必须包含：结论、证据（路径/链接/关键输出）、未解决项与不确定点，不要只给承诺；任务要求交成文文档时，正文按下方「交付文档」的规则写进文件，群里只报路径与要点，不要把工作简报当成交付物。
 - 你没有创建成员的能力：不要尝试新建或下派子成员，只做分给你的任务。
 ${peerRule}
 - 用 task_update 更新任务卡状态，用 task_attach_artifact 登记产出。

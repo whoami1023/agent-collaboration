@@ -245,9 +245,12 @@ export class WorkspaceFiles {
   async write(
     rawPath: string,
     content: Buffer,
-    options: { overwrite?: boolean } = {},
+    options: { overwrite?: boolean; append?: boolean } = {},
   ): Promise<WorkspaceFileEntry> {
     if (!Buffer.isBuffer(content)) throw new WorkspaceFileError(400, "文件内容必须是二进制数据");
+    if (options.append && options.overwrite) {
+      throw new WorkspaceFileError(400, "append 与 overwrite 不能同时使用");
+    }
     if (content.length > MAX_UPLOAD_BYTES) {
       throw new WorkspaceFileError(413, `文件不能超过 ${MAX_UPLOAD_BYTES / 1024 / 1024} MB`);
     }
@@ -268,8 +271,11 @@ export class WorkspaceFiles {
     if (existing?.isDirectory()) {
       throw new WorkspaceFileError(400, `目标是一个目录：${rel}`);
     }
-    if (existing && !options.overwrite) {
+    if (existing && !options.overwrite && !options.append) {
       throw new WorkspaceFileError(409, `文件已存在：${rel}`);
+    }
+    if (options.append && existing && existing.size + content.length > MAX_UPLOAD_BYTES) {
+      throw new WorkspaceFileError(413, `追加后文件不能超过 ${MAX_UPLOAD_BYTES / 1024 / 1024} MB`);
     }
 
     await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -278,7 +284,11 @@ export class WorkspaceFiles {
     if (!parentReal || !isInsideDir(realRoot, parentReal)) {
       throw new WorkspaceFileError(400, `路径越出文件工作区：${rel}`);
     }
-    await fs.writeFile(abs, content);
+    if (options.append) {
+      await fs.appendFile(abs, content);
+    } else {
+      await fs.writeFile(abs, content);
+    }
     const stat = await fs.stat(abs);
     return {
       path: rel,

@@ -211,7 +211,8 @@ export const DEFAULT_MEMBER_WORKSTYLE = [
   "只做分给我的任务；别人的闲聊和同级成员的活不接。",
   "先自己查再开口：room_history、use_skill、memory_search 能查到的不要问回来。",
   "一次只发一条完整结论，不刷屏，不说「收到」这类空话。",
-  "汇报格式固定：结论、证据（路径/链接/关键输出）、未解决项。",
+  "群聊汇报格式固定：结论、证据（路径/链接/关键输出）、未解决项。",
+  "交付给别人看的成稿要成文：按读者、用途与结构写连续正文，过程和核对留在汇报里。",
 ];
 
 function memberMemoryTemplate(context: MemberAgentFileContext): string {

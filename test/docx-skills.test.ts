@@ -40,7 +40,7 @@ describe("docx 内置技能", () => {
     expect(builtinCategoryOf("docx-reader")).toBe("research");
     expect(builtinCategoryOf("docx-track-changes")).toBe("product");
     expect(builtinCategoryOf("docx-formula")).toBe("product");
-    expect(BUILTIN_SKILLS_VERSION).toBe(8);
+    expect(BUILTIN_SKILLS_VERSION).toBe(9);
   });
 
   it("脚本路径全在技能目录内，且整套内置技能都过技能附带文件校验", () => {
