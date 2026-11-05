@@ -8,7 +8,11 @@ import {
   BUILTIN_AGENT_TEMPLATES,
   BUILTIN_TEMPLATES_VERSION,
 } from "../src/templates/agent-templates";
-import { TemplateLibrary } from "../src/templates/template-library";
+import {
+  TEMPLATE_EXPORT_FORMAT,
+  TEMPLATE_EXPORT_VERSION,
+  TemplateLibrary,
+} from "../src/templates/template-library";
 
 let dir: string;
 let library: TemplateLibrary;
@@ -219,6 +223,149 @@ describe("TemplateLibrary", () => {
       builtinVersion?: number;
     };
     expect(persisted.builtinVersion).toBe(BUILTIN_TEMPLATES_VERSION);
+  });
+
+  it("导出个人模板：只带设定字段，内置与他人的个人模板不可导出", async () => {
+    const personal = await library.create(alice, { ...personalInput, key: "localized-translator" });
+    const document = library.exportFor(alice, personal.id);
+    expect(document.format).toBe(TEMPLATE_EXPORT_FORMAT);
+    expect(document.version).toBe(TEMPLATE_EXPORT_VERSION);
+    expect(document.template).toMatchObject({
+      key: "localized-translator",
+      title: personalInput.title,
+      category: "research",
+      description: personalInput.description,
+      brief: personalInput.brief,
+      suggestedName: "翻译",
+      emoji: "🌍",
+      vibe: "咬文嚼字",
+      workstyle: ["术语先建表，全篇保持一致。"],
+      skillNames: ["humanizer", "summarize"],
+    });
+    expect("id" in document.template).toBe(false);
+    expect("scope" in document.template).toBe(false);
+    expect("ownerId" in document.template).toBe(false);
+    expect(Number.isNaN(Date.parse(document.exportedAt))).toBe(false);
+
+    const builtin = library.listBuiltin()[0]!;
+    expect(() => library.exportFor(admin, builtin.id)).toThrow(/只能导出个人模板/);
+    const bobs = await library.create(bob, personalInput);
+    expect(() => library.exportFor(alice, bobs.id)).toThrow(/只能使用自己的个人模板/);
+  });
+
+  it("导入导出往返：兼容导出格式、裸对象与数组，标识撞车自动改名", async () => {
+    const source = await library.create(alice, { ...personalInput, key: "translator" });
+    const document = library.exportFor(alice, source.id);
+    const content = JSON.stringify(document);
+
+    // 同账号再导入同一份文件：标识被占，自动加序号并提示。
+    const [again] = await library.importMany(alice, {
+      files: [{ filename: "template-translator.json", content }],
+    });
+    expect(again?.ok).toBe(true);
+    expect(again?.created).toHaveLength(1);
+    expect(again?.created[0]?.key).toBe("translator-2");
+    expect(again?.created[0]?.title).toBe(source.title);
+    expect(again?.created[0]?.ownerId).toBe(alice.id);
+    expect(again?.warnings[0]).toContain("已被占用");
+    expect(again?.warnings[0]).toContain("translator-2");
+
+    // 其他账号导入同一份文件：标识可用，内容原样落地。
+    const [bobs] = await library.importMany(bob, {
+      files: [{ filename: "template-translator.json", content }],
+    });
+    expect(bobs?.created[0]?.key).toBe("translator");
+    expect(bobs?.created[0]?.skillNames).toEqual(["humanizer", "summarize"]);
+    expect(library.listPersonal(bob.id)).toHaveLength(1);
+    expect(library.listPersonal(alice.id)).toHaveLength(2);
+
+    // 裸对象、裸数组和 { templates: [...] } 批量格式都能导入。
+    const result = await library.importMany(alice, {
+      files: [
+        {
+          filename: "bare.json",
+          content: JSON.stringify({ ...document.template, key: "bare-one", title: "裸对象模板" }),
+        },
+        {
+          filename: "array.json",
+          content: JSON.stringify([{ ...document.template, key: "array-one", title: "数组模板" }]),
+        },
+        {
+          filename: "bundle.json",
+          content: JSON.stringify({ templates: [{ ...document.template, key: "bundle-one", title: "批量模板" }] }),
+        },
+      ],
+    });
+    expect(result.map((item) => item.created.map((record) => record.key))).toEqual([
+      ["bare-one"],
+      ["array-one"],
+      ["bundle-one"],
+    ]);
+    expect(result.every((item) => item.ok && item.errors.length === 0)).toBe(true);
+
+    const reloaded = new TemplateLibrary(templateFile());
+    await reloaded.init();
+    expect(reloaded.listPersonal(bob.id).map((record) => record.key)).toEqual(["translator"]);
+    expect(reloaded.listPersonal(alice.id)).toHaveLength(5);
+  });
+
+  it("导入校验：坏文件与坏条目逐条报错，好的照样导入", async () => {
+    const invalidJson = await library.importMany(alice, {
+      files: [{ filename: "bad.json", content: "{ not json" }],
+    });
+    expect(invalidJson[0]?.ok).toBe(false);
+    expect(invalidJson[0]?.errors[0]).toContain("JSON");
+
+    const wrongFormat = await library.importMany(alice, {
+      files: [{ filename: "x.json", content: JSON.stringify({ format: "other", template: personalInput }) }],
+    });
+    expect(wrongFormat[0]?.errors[0]).toContain("format");
+
+    const futureVersion = await library.importMany(alice, {
+      files: [
+        {
+          filename: "x.json",
+          content: JSON.stringify({
+            format: TEMPLATE_EXPORT_FORMAT,
+            version: TEMPLATE_EXPORT_VERSION + 1,
+            template: personalInput,
+          }),
+        },
+      ],
+    });
+    expect(futureVersion[0]?.errors[0]).toContain("版本");
+
+    const mixed = await library.importMany(alice, {
+      files: [
+        {
+          filename: "mix.json",
+          content: JSON.stringify([{ title: "" }, { ...personalInput, key: "mixed-good" }]),
+        },
+        { filename: "empty.json", content: "[]" },
+      ],
+    });
+    expect(mixed[0]?.created.map((record) => record.key)).toEqual(["mixed-good"]);
+    expect(mixed[0]?.ok).toBe(true);
+    expect(mixed[0]?.errors[0]).toContain("模板名称");
+    expect(mixed[1]?.ok).toBe(false);
+    expect(mixed[1]?.errors[0]).toContain("没有模板");
+
+    await expect(library.importMany(alice, { files: [] })).rejects.toMatchObject({ status: 400 });
+    await expect(
+      library.importMany(alice, {
+        files: Array.from({ length: 21 }, (_, index) => ({
+          filename: `${index}.json`,
+          content: JSON.stringify(personalInput),
+        })),
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      library.importMany(alice, {
+        files: [{ filename: "many.json", content: JSON.stringify(Array.from({ length: 51 }, () => personalInput)) }],
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    // 被拒的批量请求没有留下任何模板。
+    expect(library.listPersonal(alice.id)).toHaveLength(1);
   });
 
   it("内置模板引用的技能名都存在于内置技能库", async () => {

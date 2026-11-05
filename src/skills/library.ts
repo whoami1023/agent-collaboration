@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { newId } from "../core/ids";
-import type { PublicUser } from "../core/types";
+import type { UserRole } from "../core/types";
 import { writeJsonAtomic } from "../store/persist";
 import { BUILTIN_SHARED_SKILLS, BUILTIN_SKILLS_VERSION, type BuiltinSkillSeed } from "./builtin";
 import {
@@ -24,6 +24,12 @@ import { parseSkillMarkdown, skillNameFromFile, SkillMarkdownError } from "./ski
 
 export type SkillScope = "shared" | "personal";
 export type { SkillFileRecord } from "./skill-files";
+
+/** 技能写操作只需要账号 ID 与角色：学习层拿工作区属主就能创建个人技能。 */
+export interface SkillActor {
+  id: string;
+  role?: UserRole;
+}
 
 export interface SkillRecord {
   id: string;
@@ -428,7 +434,7 @@ export class SkillLibrary {
   }
 
   /** 接口层按技能 id 取附带文件正文：共享技能任何登录用户可读，个人技能仅属主可读。 */
-  readFile(user: PublicUser, id: string, rawPath: unknown): SkillFileRecord {
+  readFile(user: SkillActor, id: string, rawPath: unknown): SkillFileRecord {
     const record = this.find(id);
     if (record.scope === "personal" && record.ownerId !== user.id) {
       throw new SkillError(403, "只能读取自己的个人技能文件");
@@ -450,7 +456,7 @@ export class SkillLibrary {
     return file;
   }
 
-  async create(user: PublicUser, input: SkillInput): Promise<SkillRecord> {
+  async create(user: SkillActor, input: SkillInput): Promise<SkillRecord> {
     return this.mutate(async () => {
       const scope = normalizeScope(input.scope);
       if (scope === "shared" && user.role !== "admin") {
@@ -486,7 +492,7 @@ export class SkillLibrary {
     });
   }
 
-  async update(user: PublicUser, id: string, input: SkillInput): Promise<SkillRecord> {
+  async update(user: SkillActor, id: string, input: SkillInput): Promise<SkillRecord> {
     return this.mutate(async () => {
       const record = this.find(id);
       this.assertCanManage(user, record);
@@ -521,7 +527,7 @@ export class SkillLibrary {
     });
   }
 
-  async remove(user: PublicUser, id: string): Promise<void> {
+  async remove(user: SkillActor, id: string): Promise<void> {
     await this.mutate(async () => {
       const record = this.find(id);
       this.assertCanManage(user, record);
@@ -548,7 +554,7 @@ export class SkillLibrary {
     });
   }
 
-  async importMany(user: PublicUser, input: SkillImportInput): Promise<SkillImportResult[]> {
+  async importMany(user: SkillActor, input: SkillImportInput): Promise<SkillImportResult[]> {
     return this.mutate(async () => {
       const scope = normalizeScope(input.scope);
       if (scope === "shared" && user.role !== "admin") {
@@ -726,7 +732,7 @@ export class SkillLibrary {
     return record;
   }
 
-  private assertCanManage(user: PublicUser, record: SkillRecord): void {
+  private assertCanManage(user: SkillActor, record: SkillRecord): void {
     if (record.scope === "shared") {
       if (user.role !== "admin") throw new SkillError(403, "只有管理员可以管理共享技能");
       return;

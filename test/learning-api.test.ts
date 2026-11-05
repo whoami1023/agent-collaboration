@@ -11,7 +11,7 @@ import { MAIN_ROOM_ID } from "../src/room/registry";
 import { SkillLibrary } from "../src/skills/library";
 import { TemplateLibrary } from "../src/templates/template-library";
 import { WorkspaceRegistry } from "../src/workspace/workspace";
-import type { LearningRunInput, MemoryProposal } from "../src/agent/learning/types";
+import type { LearningProposal, LearningRunInput, MemoryProposal, SkillProposal } from "../src/agent/learning/types";
 import { createApp } from "../src/server/app";
 
 let dir: string;
@@ -103,6 +103,7 @@ function proposalOf(
 ): MemoryProposal {
   return {
     id,
+    kind: "memory",
     status: "pending",
     createdAt,
     updatedAt: createdAt,
@@ -121,9 +122,38 @@ function proposalOf(
   };
 }
 
-async function seedLearning(proposals: readonly MemoryProposal[]): Promise<void> {
+async function seedLearning(proposals: readonly LearningProposal[]): Promise<void> {
   // LearningStore 懒加载：只要在任何学习接口之前把文件写好，工作区就会按这份账本继续。
   await writeFile(join(dir, "workspaces", ownerId, "learning.json"), JSON.stringify({ proposals, log: [] }), "utf8");
+}
+
+function skillProposalOf(
+  id: string,
+  createdAt: number,
+  overrides: Partial<SkillProposal> = {},
+): SkillProposal {
+  return {
+    id,
+    kind: "skill",
+    status: "pending",
+    createdAt,
+    updatedAt: createdAt,
+    memberId: "m_main",
+    memberName: "主智能体",
+    memberRole: "main",
+    roomId: MAIN_ROOM_ID,
+    roomName: "老板 的作战室",
+    runId: "run_seed",
+    rationale: "本轮完整跑通了切换流程",
+    skill: {
+      name: "pnpm-migration",
+      description: "把一个 Node 仓库从 npm 切换到 pnpm",
+      instructions: "1. 读取 package.json，确认现有包管理器。\n2. 生成 pnpm 锁文件。\n3. 更新脚本与文档。\n4. 运行测试确认依赖一致。",
+      category: "engineering",
+      triggers: ["迁移 pnpm"],
+    },
+    ...overrides,
+  };
 }
 
 function learningInput(overrides: Partial<LearningRunInput> = {}): LearningRunInput {
@@ -240,6 +270,99 @@ describe("学习层 REST", () => {
     expect(again.body["proposal"]).toMatchObject({ status: "applied" });
     const persisted = await readFile(join(dir, "workspaces", ownerId, "MEMORY.md"), "utf8");
     expect(persisted.match(/pnpm 作为包管理器/g)).toHaveLength(1);
+  });
+
+  it("技能提案 apply 创建个人技能并回填技能库路径，REST 列表与账本一致", async () => {
+    await seedLearning([skillProposalOf("skill_1", 1000)]);
+    const applied = await call("/api/learning/skill_1/apply", { method: "POST", auth: ownerCookie, body: {} });
+    expect(applied.status).toBe(200);
+    expect(applied.body["proposal"]).toMatchObject({
+      id: "skill_1",
+      kind: "skill",
+      status: "applied",
+      appliedPath: "技能库/pnpm-migration",
+      appliedSkillName: "pnpm-migration",
+    });
+    expect(String((applied.body["proposal"] as Record<string, unknown>)["appliedSkillId"])).toMatch(/^sk_/);
+
+    const listed = await call("/api/skills", { auth: ownerCookie });
+    const personal = listed.body["personal"] as Array<Record<string, unknown>>;
+    expect(personal.filter((item) => item["name"] === "pnpm-migration")).toHaveLength(1);
+    expect(personal.find((item) => item["name"] === "pnpm-migration")).toMatchObject({
+      scope: "personal",
+      ownerId,
+      category: "engineering",
+      description: "把一个 Node 仓库从 npm 切换到 pnpm",
+    });
+    expect(String(personal.find((item) => item["name"] === "pnpm-migration")?.["instructions"])).toContain(
+      "生成 pnpm 锁文件",
+    );
+
+    // 重复采纳幂等，技能不会被建第二份；已创建的提案不能再忽略。
+    const again = await call("/api/learning/skill_1/apply", { method: "POST", auth: ownerCookie, body: {} });
+    expect(again.status).toBe(200);
+    const relisted = await call("/api/skills", { auth: ownerCookie });
+    expect(
+      (relisted.body["personal"] as Array<Record<string, unknown>>).filter((item) => item["name"] === "pnpm-migration"),
+    ).toHaveLength(1);
+    const dismissed = await call("/api/learning/skill_1/dismiss", {
+      method: "POST",
+      auth: ownerCookie,
+      body: {},
+    });
+    expect(dismissed.status).toBe(400);
+    expect(dismissed.body["error"]).toContain("已创建的技能提案不能忽略");
+
+    // 账号隔离：别人的提案在别的账号里不存在。
+    const other = await call("/api/learning/skill_1/apply", { method: "POST", auth: aliceCookie, body: {} });
+    expect(other.status).toBe(404);
+  });
+
+  it("技能提案可以忽略，忽略后不创建技能", async () => {
+    await seedLearning([skillProposalOf("skill_2", 1000)]);
+    const dismissed = await call("/api/learning/skill_2/dismiss", {
+      method: "POST",
+      auth: ownerCookie,
+      body: { reason: "暂不需要这个技能" },
+    });
+    expect(dismissed.status).toBe(200);
+    expect(dismissed.body["proposal"]).toMatchObject({
+      kind: "skill",
+      status: "dismissed",
+      dismissReason: "暂不需要这个技能",
+    });
+
+    const listed = await call("/api/skills", { auth: ownerCookie });
+    expect(
+      (listed.body["personal"] as Array<Record<string, unknown>>).some((item) => item["name"] === "pnpm-migration"),
+    ).toBe(false);
+  });
+
+  it("来源成员有技能白名单时，采纳后自动把新技能加进名单", async () => {
+    const member = await call("/api/members", {
+      method: "POST",
+      auth: ownerCookie,
+      body: { name: "调研员", description: "负责资料调研与整理" },
+    });
+    expect(member.status).toBe(201);
+    const memberId = String((member.body["member"] as { id: string }).id);
+    const limited = await call(`/api/members/${memberId}/skills`, {
+      method: "PUT",
+      auth: ownerCookie,
+      body: { names: [] },
+    });
+    expect(limited.status).toBe(200);
+    expect(limited.body["enabled"]).toEqual([]);
+
+    await seedLearning([
+      skillProposalOf("skill_grant", 1000, { memberId, memberName: "调研员", memberRole: "sub" }),
+    ]);
+    const applied = await call("/api/learning/skill_grant/apply", { method: "POST", auth: ownerCookie, body: {} });
+    expect(applied.status).toBe(200);
+    expect(applied.body["proposal"]).toMatchObject({ status: "applied" });
+
+    const after = await call(`/api/members/${memberId}/skills`, { auth: ownerCookie });
+    expect(after.body["enabled"]).toEqual(["pnpm-migration"]);
   });
 
   it("子成员提案写入它自己的 agents/<id>/MEMORY.md，不碰账号记忆", async () => {

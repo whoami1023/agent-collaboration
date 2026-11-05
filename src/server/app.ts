@@ -417,6 +417,25 @@ export function createApp(deps: AppDeps): express.Express {
     res.status(201).json({ template });
   });
 
+  // 导出个人模板为可迁移的 JSON；内置模板与别人的个人模板都不导出。
+  app.get("/api/templates/:id/export", (req: Request, res: Response) => {
+    const document = deps.templates.exportFor(
+      currentUser(res),
+      String(req.params["id"] ?? ""),
+    );
+    res.setHeader(
+      "content-disposition",
+      `attachment; filename="template-${document.template.key}.json"`,
+    );
+    res.json(document);
+  });
+
+  // 导入只落到导入者自己的「我的模板」；每个文件逐个模板给结果，部分失败不影响其余。
+  app.post("/api/templates/import", async (req: Request, res: Response) => {
+    const results = await deps.templates.importMany(currentUser(res), bodyOf(req));
+    res.status(201).json({ results });
+  });
+
   app.patch("/api/templates/:id", async (req: Request, res: Response) => {
     const template = await deps.templates.update(
       currentUser(res),

@@ -1642,6 +1642,105 @@ describe("模板库 API", () => {
     expect((await call("/api/templates/apply", { method: "POST", cookie, body: { id: "tpl_missing", name: "甲" } })).status).toBe(404);
   });
 
+  it("个人模板导出与导入：只导出自己的，导入落进导入者的「我的模板」", async () => {
+    const cookie = await login();
+    const aliceCookie = await secondAccount(cookie);
+    const created = await call("/api/templates", {
+      method: "POST",
+      cookie,
+      body: {
+        title: "材料整理员",
+        description: "把材料整理成结构清楚的笔记。",
+        brief: "负责把收到的材料按主题整理成笔记，标注出处，不改事实。",
+        category: "research",
+        suggestedName: "材料员",
+        workstyle: ["先列提纲再动笔。"],
+        skillNames: ["summarize"],
+      },
+    });
+    expect(created.status).toBe(201);
+    const template = created.body["template"] as Record<string, unknown>;
+    const templateId = String(template["id"]);
+
+    expect((await call(`/api/templates/${templateId}/export`)).status).toBe(401);
+    expect(
+      (await call(`/api/templates/${templateId}/export`, { cookie: aliceCookie })).status,
+    ).toBe(403);
+    const builtinId = String(
+      (
+        (await call("/api/templates", { cookie })).body["builtin"] as Array<Record<string, unknown>>
+      )[0]?.["id"],
+    );
+    expect((await call(`/api/templates/${builtinId}/export`, { cookie })).status).toBe(400);
+
+    const direct = await fetch(`${baseUrl}/api/templates/${templateId}/export`, {
+      headers: { cookie },
+    });
+    expect(direct.status).toBe(200);
+    expect(direct.headers.get("content-disposition")).toBe(
+      `attachment; filename="template-${String(template["key"])}.json"`,
+    );
+    const document = (await direct.json()) as Record<string, unknown>;
+    expect(document["format"]).toBe("agent-collaboration/template");
+    expect(document["version"]).toBe(1);
+    const payload = document["template"] as Record<string, unknown>;
+    expect(payload["title"]).toBe("材料整理员");
+    expect(payload["id"]).toBeUndefined();
+    expect(payload["ownerId"]).toBeUndefined();
+    expect(payload["workstyle"]).toEqual(["先列提纲再动笔。"]);
+    expect(payload["skillNames"]).toEqual(["summarize"]);
+
+    // alice 导入：模板落到 alice 名下，原账号的模板数不变。
+    const imported = await call("/api/templates/import", {
+      method: "POST",
+      cookie: aliceCookie,
+      body: { files: [{ filename: "template.json", content: JSON.stringify(document) }] },
+    });
+    expect(imported.status).toBe(201);
+    const results = imported.body["results"] as Array<Record<string, unknown>>;
+    expect(results).toHaveLength(1);
+    const importedRecords = results[0]?.["created"] as Array<Record<string, unknown>>;
+    expect(importedRecords).toHaveLength(1);
+    expect(importedRecords[0]?.["ownerId"]).not.toBe(template["ownerId"]);
+    expect(importedRecords[0]?.["title"]).toBe("材料整理员");
+    const alicePersonal = (
+      (await call("/api/templates", { cookie: aliceCookie })).body["personal"] as Array<
+        Record<string, unknown>
+      >
+    ).map((item) => item["title"]);
+    expect(alicePersonal).toEqual(["材料整理员"]);
+    expect(
+      ((await call("/api/templates", { cookie })).body["personal"] as Array<unknown>),
+    ).toHaveLength(1);
+
+    // 再导入同一份：标识撞车自动加序号，已有模板不被覆盖。
+    const again = await call("/api/templates/import", {
+      method: "POST",
+      cookie: aliceCookie,
+      body: { files: [{ filename: "template.json", content: JSON.stringify(document) }] },
+    });
+    const againRecords = (
+      (again.body["results"] as Array<Record<string, unknown>>)[0]?.["created"] as Array<
+        Record<string, unknown>
+      >
+    )[0];
+    expect(againRecords?.["key"]).toBe(`${String(importedRecords[0]?.["key"])}-2`);
+    expect(
+      ((await call("/api/templates", { cookie: aliceCookie })).body["personal"] as Array<unknown>),
+    ).toHaveLength(2);
+
+    // 坏文件逐条报错，不影响同一请求里的其它文件。
+    const broken = await call("/api/templates/import", {
+      method: "POST",
+      cookie: aliceCookie,
+      body: { files: [{ filename: "broken.json", content: "{oops" }] },
+    });
+    expect(broken.status).toBe(201);
+    const brokenResult = (broken.body["results"] as Array<Record<string, unknown>>)[0];
+    expect(brokenResult?.["ok"]).toBe(false);
+    expect(String((brokenResult?.["errors"] as string[])[0])).toContain("JSON");
+  });
+
   it("内置模板普通账号只能引用不能改删，管理员删除后重启不再预装", async () => {
     const cookie = await login();
     const aliceCookie = await secondAccount(cookie);

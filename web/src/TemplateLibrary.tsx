@@ -1,15 +1,20 @@
-import { useCallback, useEffect, useState } from "react";
-import type { FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { ChangeEvent, FormEvent } from "react";
 import type { Member } from "../../src/core/types";
 import {
+  ApiError,
   applyTemplate,
   createTemplate,
   deleteTemplate,
+  exportTemplate,
   fetchTemplates,
+  importTemplates,
   updateTemplate,
   type MemberTemplateDraft,
   type SkillCategory,
   type SkillCategoryView,
+  type TemplateExportDocument,
+  type TemplateImportResult,
   type TemplateInput,
   type TemplateSnapshot,
   type TemplateView,
@@ -27,7 +32,13 @@ type TemplateMode =
   | { kind: "view"; template: TemplateView }
   | { kind: "apply"; template: TemplateView }
   | { kind: "create"; copyFrom?: TemplateSeed; fromMember?: string }
-  | { kind: "edit"; template: TemplateView };
+  | { kind: "edit"; template: TemplateView }
+  | { kind: "import" };
+
+type PendingTemplateFile = { filename: string; content: string };
+
+const MAX_IMPORT_FILES = 20;
+const MAX_IMPORT_FILE_BYTES = 512 * 1024;
 
 const TITLE_MAX = 40;
 const DESCRIPTION_MAX = 160;
@@ -42,12 +53,34 @@ function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** 服务端还没重启时新接口会 404（tsx 无热重载），单独给出可操作的提示。 */
+function templateErrorMessage(err: unknown, hint: string): string {
+  if (err instanceof ApiError && err.status === 404 && !err.message.includes("模板")) {
+    return hint;
+  }
+  return messageOf(err);
+}
+
 function scopeLabel(scope: TemplateView["scope"]): string {
   return scope === "builtin" ? "内置" : "个人";
 }
 
 function skillCount(template: TemplateView): number {
   return template.skillNames?.length ?? 0;
+}
+
+function downloadTemplateDocument(doc: TemplateExportDocument): void {
+  const blob = new Blob([JSON.stringify(doc, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `template-${doc.template.key}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 export default function TemplateLibraryPanel({
@@ -73,6 +106,7 @@ export default function TemplateLibraryPanel({
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [exportingId, setExportingId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -122,6 +156,42 @@ export default function TemplateLibraryPanel({
     }
   }
 
+  async function handleExport(template: TemplateView) {
+    if (exportingId) return;
+    setExportingId(template.id);
+    setError(null);
+    try {
+      const document = await exportTemplate(template.id);
+      downloadTemplateDocument(document);
+      setNotice(`已导出模板「${template.title}」：template-${document.template.key}.json`);
+    } catch (err) {
+      setError(
+        templateErrorMessage(err, "导出接口返回 404：服务端可能还在运行旧版本，重启服务后再试。"),
+      );
+    } finally {
+      setExportingId(null);
+    }
+  }
+
+  function finishImport(results: TemplateImportResult[]) {
+    const created = results.flatMap((result) => result.created);
+    const failures = results.flatMap((result) =>
+      result.errors.map((error) => `${result.filename}：${error}`),
+    );
+    const warnings = results.flatMap((result) => result.warnings);
+    setMode({ kind: "list" });
+    setTab("personal");
+    setNotice(
+      created.length > 0
+        ? `已导入 ${created.length} 个个人模板：${created.map((item) => item.title).join("、")}${
+            warnings.length > 0 ? `；${warnings.join("；")}` : ""
+          }${failures.length > 0 ? `；${failures.length} 条未通过` : ""}`
+        : null,
+    );
+    setError(failures[0] ?? null);
+    if (created.length > 0) void refresh();
+  }
+
   const builtin = snapshot?.builtin ?? [];
   const personal = snapshot?.personal ?? [];
   const templates = tab === "builtin" ? builtin : personal;
@@ -164,7 +234,7 @@ export default function TemplateLibraryPanel({
   const hint =
     tab === "builtin"
       ? "内置模板随系统预装，覆盖各类分工；点「引用为成员」就能把它变成一个可 @ 的子智能体，要改动请先另存为个人模板。"
-      : "个人模板只有你自己能用，可以按团队习惯新建、修改或删除。";
+      : "个人模板只有你自己能用，可以按团队习惯新建、修改或删除；导出成 JSON 可备份或带到别的账号，导入只进你自己的库，标识撞车会自动换名。";
 
   const renderCard = (template: TemplateView) => (
     <li key={template.id} className="skill-card template-card">
@@ -222,6 +292,15 @@ export default function TemplateLibraryPanel({
                 }}
               >
                 编辑
+              </button>
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={exportingId !== null}
+                title="导出为 JSON，可导入到其他账号"
+                onClick={() => void handleExport(template)}
+              >
+                {exportingId === template.id ? "导出中…" : "导出"}
               </button>
               {confirmingId === template.id ? (
                 <>
@@ -337,6 +416,21 @@ export default function TemplateLibraryPanel({
               </div>
 
               <div className="skills-toolbar-actions">
+                {tab === "personal" && (
+                  <button
+                    type="button"
+                    className="btn sm"
+                    onClick={() => {
+                      setNotice(null);
+                      setError(null);
+                      setConfirmingId(null);
+                      setMode({ kind: "import" });
+                    }}
+                  >
+                    <Icon name="import" />
+                    导入模板
+                  </button>
+                )}
                 <button
                   type="button"
                   className="btn primary sm"
@@ -404,7 +498,7 @@ export default function TemplateLibraryPanel({
             ) : templates.length === 0 ? (
               <p className="empty small">
                 {tab === "personal"
-                  ? "你还没有个人模板。可以先从内置模板「另存为个人模板」，再按团队习惯改。"
+                  ? "你还没有个人模板。可以从内置模板「另存为个人模板」，或把之前导出的 JSON 导入回来。"
                   : "内置模板为空。"}
               </p>
             ) : matching.length === 0 ? (
@@ -484,6 +578,10 @@ export default function TemplateLibraryPanel({
               onApplied(member, template);
             }}
           />
+        )}
+
+        {mode.kind === "import" && (
+          <TemplateImportView onCancel={backToList} onFinish={finishImport} />
         )}
 
         {(mode.kind === "create" || mode.kind === "edit") && (
@@ -1017,6 +1115,225 @@ function TemplateForm({
         <button className="btn ghost" type="button" onClick={onCancel}>
           取消
         </button>
+      </div>
+    </form>
+  );
+}
+
+/** 导入个人模板：选导出过的 JSON（可多选）或粘贴内容，逐个模板给结果。 */
+function TemplateImportView({
+  onCancel,
+  onFinish,
+}: {
+  onCancel: () => void;
+  onFinish: (results: TemplateImportResult[]) => void;
+}) {
+  const [files, setFiles] = useState<PendingTemplateFile[]>([]);
+  const [pasted, setPasted] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [results, setResults] = useState<TemplateImportResult[] | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  async function handlePick(event: ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (!picked.length) return;
+    setError(null);
+    setResults(null);
+    const loaded: PendingTemplateFile[] = [];
+    const skipped: string[] = [];
+    for (const file of picked) {
+      if (files.length + loaded.length >= MAX_IMPORT_FILES) {
+        skipped.push(`单次最多 ${MAX_IMPORT_FILES} 个文件，其余请分批导入`);
+        break;
+      }
+      if (file.size > MAX_IMPORT_FILE_BYTES) {
+        skipped.push(`${file.name} 超过 ${MAX_IMPORT_FILE_BYTES / 1024} KB`);
+        continue;
+      }
+      try {
+        loaded.push({ filename: file.name, content: await file.text() });
+      } catch (err) {
+        skipped.push(`${file.name} 读取失败：${messageOf(err)}`);
+      }
+    }
+    if (loaded.length > 0) setFiles((current) => [...current, ...loaded]);
+    if (skipped.length > 0) setError(`部分文件未加入：${skipped.join("；")}。`);
+  }
+
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (busy) return;
+    const payload = [...files];
+    if (pasted.trim()) payload.push({ filename: "粘贴内容.json", content: pasted });
+    if (payload.length === 0) {
+      setError("请选择模板 JSON 文件，或把导出内容粘贴到文本框。");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setResults(null);
+    try {
+      const response = await importTemplates(payload);
+      const created = response.results.reduce((sum, item) => sum + item.created.length, 0);
+      const failed = response.results.some((item) => !item.ok || item.errors.length > 0);
+      if (created > 0 && !failed) {
+        onFinish(response.results);
+        return;
+      }
+      setResults(response.results);
+      if (created === 0) setError("没有模板被导入，请看下面的原因。");
+    } catch (err) {
+      setError(
+        templateErrorMessage(err, "导入接口返回 404：服务端可能还在运行旧版本，重启服务后再试。"),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const anyCreated = results?.some((item) => item.created.length > 0) ?? false;
+
+  return (
+    <form className="skill-form skill-import" onSubmit={(event) => void handleSubmit(event)}>
+      <div className="skill-form-head">
+        <span className="skill-form-title">导入个人模板</span>
+        <button type="button" className="btn ghost sm" onClick={onCancel}>
+          返回
+        </button>
+      </div>
+
+      <p className="hint">
+        选择从模板库「导出」得到的 JSON 文件（可多选），或直接粘贴导出内容。
+        模板只会进入你的「我的模板」，不会覆盖已有模板；标识撞车时自动加序号。
+        一个文件里可以放一个模板，也可以放模板数组。
+      </p>
+
+      <div className="skill-import-drop">
+        <input
+          ref={fileInput}
+          type="file"
+          accept=".json,application/json"
+          multiple
+          hidden
+          onChange={(event) => void handlePick(event)}
+        />
+        <button type="button" className="btn sm" onClick={() => fileInput.current?.click()}>
+          <Icon name="import" />
+          选择 JSON 文件
+        </button>
+        <span className="hint">
+          {files.length > 0 ? `已选 ${files.length} 个文件` : "单个模板导出文件，或含多个模板的 JSON"}
+        </span>
+        {files.length > 0 && (
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={() => {
+              setFiles([]);
+              setResults(null);
+            }}
+          >
+            清空
+          </button>
+        )}
+      </div>
+
+      {files.length > 0 && (
+        <ul className="skill-import-files">
+          {files.map((file, index) => (
+            <li key={`${file.filename}-${index}`}>
+              <span className="skill-import-file-name" title={file.filename}>
+                {file.filename}
+              </span>
+              <span className="skill-import-file-size">
+                {(new TextEncoder().encode(file.content).length / 1024).toFixed(1)} KB
+              </span>
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => {
+                  setFiles((current) => current.filter((candidate) => candidate !== file));
+                  setResults(null);
+                }}
+              >
+                移除
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <label className="field">
+        <span>或粘贴内容</span>
+        <textarea
+          className="skill-instructions-input"
+          rows={8}
+          spellCheck={false}
+          value={pasted}
+          placeholder={'{\n  "format": "agent-collaboration/template",\n  "version": 1,\n  "template": { "title": "深度调研员", … }\n}'}
+          onChange={(event) => setPasted(event.target.value)}
+        />
+      </label>
+
+      {error && <p className="form-error">{error}</p>}
+
+      {results && (
+        <ul className="skill-import-results">
+          {results.map((item, index) => (
+            <li key={`${item.filename}-${index}`} className={item.ok ? "ok" : "failed"}>
+              <span className="skill-import-state">{item.ok ? "✓" : "✕"}</span>
+              <span className="skill-import-msg">
+                <span>
+                  {item.ok
+                    ? `${item.filename}：已导入 ${item.created.length} 个模板（${item.created
+                        .map((template) => template.title)
+                        .join("、")}）`
+                    : `${item.filename}：${item.errors[0] ?? "导入失败"}`}
+                </span>
+                {item.ok && item.errors.length > 0 && (
+                  <span className="skill-import-warnings">
+                    {item.errors.map((message, position) => (
+                      <em key={position}>{message}</em>
+                    ))}
+                  </span>
+                )}
+                {item.warnings.length > 0 && (
+                  <span className="skill-import-warnings">
+                    {item.warnings.map((message, position) => (
+                      <em key={position}>{message}</em>
+                    ))}
+                  </span>
+                )}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="modal-actions">
+        {results ? (
+          <>
+            {anyCreated && (
+              <button className="btn primary" type="button" onClick={() => onFinish(results)}>
+                完成
+              </button>
+            )}
+            <button className="btn ghost" type="button" onClick={onCancel}>
+              返回列表
+            </button>
+          </>
+        ) : (
+          <>
+            <button className="btn primary" type="submit" disabled={busy}>
+              {busy ? "导入中…" : "开始导入"}
+            </button>
+            <button className="btn ghost" type="button" onClick={onCancel}>
+              取消
+            </button>
+          </>
+        )}
       </div>
     </form>
   );

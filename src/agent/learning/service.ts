@@ -1,7 +1,8 @@
 // 学习层核心：一次运行交付后的复盘 pass。
-// 结构对应 Hermes `agent/background_review.py`——独立于群聊的一次模型调用、只判断该记什么、
+// 结构对应 Hermes `agent/background_review.py`——独立于群聊的一次模型调用、只判断该记什么，
 // 写入通道只有受控追加的记忆文件；差别在于本项目把「直接落盘」做成可开关的模式，
-// 默认 propose（等用户在面板里确认），auto 才直接写。
+// 默认 propose（等用户在面板里确认），auto 才直接写记忆。
+// P2：复盘还能提议技能，但技能永远只提案——auto 模式也只自动写记忆，建技能必须人工批准。
 
 import type { Settings } from "../../core/settings";
 import { newId } from "../../core/ids";
@@ -14,18 +15,26 @@ import {
 } from "../../model/registry";
 import { addUsage, calculateUsageCost, emptyUsage, type UsageTotals } from "../../model/usage-cost";
 import type { LlmProvider, LlmRequest } from "../../provider/types";
+import type { SkillActor, SkillLibrary } from "../../skills/library";
 import type { MemberUsageRecord } from "../member-runtime";
-import { LEARNING_SYSTEM_PROMPT, buildReviewUserPrompt, extractEntries, type ReviewMaterial } from "./prompt";
-import { buildDedupeEntries, isDuplicateOf, validateCandidate } from "./filters";
+import { LEARNING_SYSTEM_PROMPT, buildReviewUserPrompt, extractReview, type ReviewMaterial } from "./prompt";
+import {
+  buildDedupeEntries,
+  isDuplicateOf,
+  validateCandidate,
+  validateSkillCandidate,
+} from "./filters";
 import type { LearningStore } from "./store";
 import {
   LEARNING_RULES,
+  type LearningProposal,
   type LearningRunInput,
   type LearningSettings,
   type MemoryProposal,
   type MemoryTarget,
   type ReviewLog,
   type ReviewOutcome,
+  type SkillProposal,
 } from "./types";
 
 export interface LearningServiceDeps {
@@ -35,9 +44,14 @@ export interface LearningServiceDeps {
   getModelDeps(): ModelRuntimeDeps;
   memory?: MemorySearchManager;
   usage?: ModelUsageStore;
+  /** 技能库与账号属主：技能提案采纳时用它创建个人技能。 */
+  skills?: SkillLibrary;
+  skillOwner?: SkillActor;
+  /** 技能落地后把它授权给提案来源成员（成员有白名单时追加）；由工作区注入。 */
+  grantSkillToMember?(memberId: string, skillName: string): Promise<void>;
   onUsageRecord?(record: MemberUsageRecord): void;
   /** 每次复盘（含没学到东西的）都广播一次，供 SSE 与前端刷新。 */
-  onLearned?(payload: { proposals: readonly MemoryProposal[]; log: ReviewLog }): void;
+  onLearned?(payload: { proposals: readonly LearningProposal[]; log: ReviewLog }): void;
   onError?(message: string): void;
 }
 
@@ -114,6 +128,7 @@ export class LearningService {
         .readAgentFile(relPath, { full: true })
         .then((file) => file.content)
         .catch(() => "");
+      const existingSkills = this.existingSkillsSnapshot();
 
       const material: ReviewMaterial = {
         roomName: input.roomName,
@@ -126,6 +141,7 @@ export class LearningService {
         toolNames: input.toolNames,
         transcript: input.transcript,
         existingMemory,
+        existingSkills,
       };
 
       let transport: ModelTransport;
@@ -155,55 +171,28 @@ export class LearningService {
         return;
       }
 
-      const entries = extractEntries(usage.text);
-      if (!entries) {
-        await this.record(input, "failed", "复盘输出不是可解析的 JSON，本轮不写入", [], transport.activeRef() || transport.model.ref);
+      const parsed = extractReview(usage.text);
+      if (!parsed) {
+        await this.record(
+          input,
+          "failed",
+          "复盘输出不是可解析的 JSON（缺少 entries 或 skills 数组），本轮不写入",
+          [],
+          transport.activeRef() || transport.model.ref,
+        );
         return;
       }
 
       const pending = await this.deps.store.listProposals({ status: "pending" });
-      const corpus = buildDedupeEntries(existingMemory, pending);
-      const created: MemoryProposal[] = [];
       const dropped: string[] = [];
-      const seen = new Set<string>();
-      for (const raw of entries.slice(0, LEARNING_RULES.maxEntriesPerReview)) {
-        const validated = validateCandidate(raw);
-        if ("reason" in validated) {
-          dropped.push(validated.reason);
-          continue;
-        }
-        if (isDuplicateOf(validated.content, [...corpus, ...created.map((item) => item.content)])) {
-          dropped.push("与已有记忆或待确认提案重复");
-          continue;
-        }
-        const key = validated.content;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const now = Date.now();
-        created.push({
-          id: newId("mem"),
-          status: "pending",
-          createdAt: now,
-          updatedAt: now,
-          memberId: input.memberId,
-          memberName: input.memberName,
-          memberRole: input.memberRole,
-          roomId: input.roomId,
-          roomName: input.roomName,
-          runId: input.runId,
-          target,
-          content: validated.content,
-          triggers: validated.triggers,
-          importance: validated.importance,
-          rationale: validated.rationale,
-        });
-      }
+      const createdMemory = this.buildMemoryProposals(input, target, existingMemory, pending, parsed.entries, dropped);
+      const createdSkills = this.buildSkillProposals(input, pending, parsed.skills, dropped);
 
-      await this.deps.store.addProposals(created);
+      await this.deps.store.addProposals([...createdMemory, ...createdSkills]);
 
-      const applied: MemoryProposal[] = [];
+      const applied: LearningProposal[] = [];
       if (settings.mode === "auto") {
-        for (const proposal of created) {
+        for (const proposal of createdMemory) {
           try {
             applied.push(await this.applyProposal(proposal.id));
           } catch (err) {
@@ -212,14 +201,26 @@ export class LearningService {
         }
       }
 
+      const created = [...createdMemory, ...createdSkills];
       const outcome: ReviewOutcome =
         created.length === 0 ? "nothing" : applied.length > 0 ? "applied" : "proposed";
+      const parts: string[] = [];
+      if (createdMemory.length > 0) {
+        parts.push(
+          settings.mode === "auto"
+            ? `自动写入 ${applied.length}/${createdMemory.length} 条记忆`
+            : `产出 ${createdMemory.length} 条待确认记忆`,
+        );
+      }
+      if (createdSkills.length > 0) {
+        parts.push(
+          `${createdSkills.length} 条技能提案待确认${settings.mode === "auto" ? "（技能不会被自动创建）" : ""}`,
+        );
+      }
       const detail =
         created.length === 0
-          ? `模型认为本轮没有值得长期记住的事实${dropped.length > 0 ? `（丢弃 ${dropped.length} 条：${dropped.join("；")}）` : ""}`
-          : settings.mode === "auto"
-            ? `自动写入 ${applied.length}/${created.length} 条${dropped.length > 0 ? `；丢弃 ${dropped.length} 条（${dropped.join("；")}）` : ""}`
-            : `产出 ${created.length} 条待确认提案${dropped.length > 0 ? `；丢弃 ${dropped.length} 条（${dropped.join("；")}）` : ""}`;
+          ? `模型认为本轮没有值得长期记住或沉淀的内容${dropped.length > 0 ? `（丢弃 ${dropped.length} 条：${dropped.join("；")}）` : ""}`
+          : `${parts.join("；")}${dropped.length > 0 ? `；丢弃 ${dropped.length} 条（${dropped.join("；")}）` : ""}`;
       await this.record(
         input,
         outcome,
@@ -231,6 +232,120 @@ export class LearningService {
       clearTimeout(timer);
       this.inFlight.delete(input.memberId);
     }
+  }
+
+  /** 已有技能快照：让复盘模型避开账号已经具备的能力。 */
+  private existingSkillsSnapshot(): string {
+    if (!this.deps.skills || !this.deps.skillOwner) return "";
+    return this.deps.skills
+      .listForAgent(this.deps.skillOwner.id)
+      .map((skill) => `- ${skill.name}：${skill.description}`)
+      .join("\n");
+  }
+
+  private buildMemoryProposals(
+    input: LearningRunInput,
+    target: MemoryTarget,
+    existingMemory: string,
+    pending: readonly LearningProposal[],
+    entries: readonly unknown[],
+    dropped: string[],
+  ): MemoryProposal[] {
+    const corpus = buildDedupeEntries(existingMemory, pending);
+    const created: MemoryProposal[] = [];
+    const seen = new Set<string>();
+    for (const raw of entries.slice(0, LEARNING_RULES.maxEntriesPerReview)) {
+      const validated = validateCandidate(raw);
+      if ("reason" in validated) {
+        dropped.push(validated.reason);
+        continue;
+      }
+      if (isDuplicateOf(validated.content, [...corpus, ...created.map((item) => item.content)])) {
+        dropped.push("与已有记忆或待确认提案重复");
+        continue;
+      }
+      if (seen.has(validated.content)) continue;
+      seen.add(validated.content);
+      const now = Date.now();
+      created.push({
+        id: newId("mem"),
+        kind: "memory",
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+        memberId: input.memberId,
+        memberName: input.memberName,
+        memberRole: input.memberRole,
+        roomId: input.roomId,
+        roomName: input.roomName,
+        runId: input.runId,
+        target,
+        content: validated.content,
+        triggers: validated.triggers,
+        importance: validated.importance,
+        rationale: validated.rationale,
+      });
+    }
+    return created;
+  }
+
+  private buildSkillProposals(
+    input: LearningRunInput,
+    pending: readonly LearningProposal[],
+    skills: readonly unknown[],
+    dropped: string[],
+  ): SkillProposal[] {
+    if (skills.length === 0) return [];
+    if (!this.deps.skills || !this.deps.skillOwner) {
+      dropped.push("技能：技能库未接入，技能候选已跳过");
+      return [];
+    }
+    // 同名技能已存在（共享或个人）或已在待确认提案里就不再提：采纳时本来也会被技能库拒绝。
+    const taken = new Set(
+      this.deps.skills
+        .listForAgent(this.deps.skillOwner.id)
+        .map((skill) => skill.name.toLowerCase()),
+    );
+    for (const proposal of pending) {
+      if (proposal.kind === "skill") taken.add(proposal.skill.name.toLowerCase());
+    }
+
+    const created: SkillProposal[] = [];
+    for (const raw of skills.slice(0, LEARNING_RULES.maxSkillsPerReview)) {
+      const validated = validateSkillCandidate(raw);
+      if ("reason" in validated) {
+        dropped.push(`技能：${validated.reason}`);
+        continue;
+      }
+      if (taken.has(validated.name)) {
+        dropped.push(`技能：技能库或待确认提案里已有 ${validated.name}`);
+        continue;
+      }
+      taken.add(validated.name);
+      const now = Date.now();
+      created.push({
+        id: newId("skill"),
+        kind: "skill",
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+        memberId: input.memberId,
+        memberName: input.memberName,
+        memberRole: input.memberRole,
+        roomId: input.roomId,
+        roomName: input.roomName,
+        runId: input.runId,
+        rationale: validated.rationale,
+        skill: {
+          name: validated.name,
+          description: validated.description,
+          instructions: validated.instructions,
+          category: validated.category,
+          triggers: validated.triggers,
+        },
+      });
+    }
+    return created;
   }
 
   /** 调用模型并把 token 与成本按同一口径入账（复盘也是真金白银）。 */
@@ -288,7 +403,7 @@ export class LearningService {
     input: LearningRunInput,
     outcome: ReviewOutcome,
     detail: string,
-    proposals: readonly MemoryProposal[],
+    proposals: readonly LearningProposal[],
     modelRef: string,
   ): Promise<void> {
     const entry: ReviewLog = {
@@ -307,12 +422,14 @@ export class LearningService {
     this.deps.onLearned?.({ proposals, log: entry });
   }
 
-  /** 用户点「写入记忆」：过一遍写入通道，成功后把落盘路径回填进提案。 */
-  async applyProposal(id: string): Promise<MemoryProposal> {
+  /** 用户点「写入记忆 / 创建技能」：过一遍对应通道，成功后把落地位置回填进提案。 */
+  async applyProposal(id: string): Promise<LearningProposal> {
     const proposal = await this.deps.store.getProposal(id);
     if (!proposal) throw new Error("提案不存在");
     if (proposal.status === "applied") return proposal;
     if (proposal.status === "dismissed") throw new Error("提案已忽略，不能再生效");
+    if (proposal.kind === "skill") return this.applySkillProposal(proposal);
+
     if (!this.deps.memory) throw new Error("记忆层未启用");
     const path = await this.deps.memory.appendEntry(
       proposal.content,
@@ -328,16 +445,48 @@ export class LearningService {
     return updated;
   }
 
-  async dismissProposal(id: string, reason = "用户忽略"): Promise<MemoryProposal> {
+  /** 技能采纳：建账号级个人技能；来源成员有技能白名单时顺手追加，省得再手动勾选。 */
+  private async applySkillProposal(proposal: SkillProposal): Promise<LearningProposal> {
+    if (!this.deps.skills || !this.deps.skillOwner) throw new Error("技能库未接入");
+    const record = await this.deps.skills.create(this.deps.skillOwner, {
+      scope: "personal",
+      name: proposal.skill.name,
+      description: proposal.skill.description,
+      instructions: proposal.skill.instructions,
+      category: proposal.skill.category,
+    });
+    try {
+      await this.deps.grantSkillToMember?.(proposal.memberId, record.name);
+    } catch (err) {
+      this.deps.onError?.(`技能已创建，但授权给 @${proposal.memberName} 失败：${errorMessage(err)}`);
+    }
+    const updated = await this.deps.store.patchProposal(proposal.id, {
+      status: "applied",
+      appliedAt: Date.now(),
+      appliedPath: `技能库/${record.name}`,
+      appliedSkillId: record.id,
+      appliedSkillName: record.name,
+    });
+    if (!updated) throw new Error("提案不存在");
+    return updated;
+  }
+
+  async dismissProposal(id: string, reason = "用户忽略"): Promise<LearningProposal> {
     const proposal = await this.deps.store.getProposal(id);
     if (!proposal) throw new Error("提案不存在");
-    if (proposal.status === "applied") throw new Error("已写入记忆的提案不能忽略，请在记忆文件里删除");
+    if (proposal.status === "applied") {
+      throw new Error(
+        proposal.kind === "skill"
+          ? "已创建的技能提案不能忽略，请在技能库里删除该技能"
+          : "已写入记忆的提案不能忽略，请在记忆文件里删除",
+      );
+    }
     const updated = await this.deps.store.patchProposal(id, { status: "dismissed", dismissReason: reason });
     if (!updated) throw new Error("提案不存在");
     return updated;
   }
 
-  async listProposals(): Promise<MemoryProposal[]> {
+  async listProposals(): Promise<LearningProposal[]> {
     return this.deps.store.listProposals();
   }
 

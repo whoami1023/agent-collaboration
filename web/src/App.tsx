@@ -1734,7 +1734,7 @@ function RoomView({
     setNavOpen(false);
   }
 
-  /** 学习面板：右侧整块区域，展示复盘产出的待确认记忆提案与流水。 */
+  /** 学习面板：右侧整块区域，展示复盘产出的待确认记忆/技能提案与流水。 */
   function openLearning() {
     setLearningOpen(true);
     setSkillsOpen(false);
@@ -1987,7 +1987,7 @@ function RoomView({
             >
               <Icon name="sparkles" />
               <span className="nav-label">学习</span>
-              <span className="nav-hint">复盘产出 · 待确认记忆</span>
+              <span className="nav-hint">复盘产出 · 记忆与技能</span>
               {learningPending > 0 && <span className="nav-count">{learningPending}</span>}
             </button>
 

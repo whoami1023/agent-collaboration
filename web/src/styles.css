@@ -4797,6 +4797,67 @@ body.pane-dragging * {
   background: var(--panel);
 }
 
+.learning-kind-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.learning-kind {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill, 999px);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.learning-kind.skill {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+  color: var(--text);
+}
+
+.learning-skill-name {
+  color: var(--text-strong);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+.learning-target {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.learning-instructions {
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+}
+
+.learning-instructions summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: var(--text-xs);
+}
+
+.learning-instructions pre {
+  max-height: 260px;
+  margin: 6px 0 0;
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .learning-content {
   margin: 0;
   color: var(--text-strong);

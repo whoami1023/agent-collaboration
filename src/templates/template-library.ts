@@ -53,6 +53,45 @@ export interface AgentTemplateInput {
   skillNames?: unknown;
 }
 
+/** 个人模板导出文件的格式标记；导入时带了这个标记就按导出文件严格校验版本。 */
+export const TEMPLATE_EXPORT_FORMAT = "agent-collaboration/template";
+export const TEMPLATE_EXPORT_VERSION = 1;
+
+/** 导出的模板只带可迁移的设定字段，不带 id、归属与时间戳。 */
+export interface TemplateExportPayload {
+  key: string;
+  title: string;
+  category: SkillCategory;
+  description: string;
+  suggestedName: string;
+  brief: string;
+  emoji?: string;
+  vibe?: string;
+  workstyle?: string[];
+  skillNames?: string[];
+}
+
+export interface TemplateExportDocument {
+  format: typeof TEMPLATE_EXPORT_FORMAT;
+  version: number;
+  exportedAt: string;
+  template: TemplateExportPayload;
+}
+
+export interface TemplateImportFile {
+  filename?: unknown;
+  content?: unknown;
+}
+
+export interface TemplateImportResult {
+  filename: string;
+  /** 至少成功创建一个模板；部分失败时 errors 里逐条说明。 */
+  ok: boolean;
+  created: AgentTemplateRecord[];
+  errors: string[];
+  warnings: string[];
+}
+
 export interface TemplateLibraryOptions {
   seedBuiltins?: boolean;
   now?: () => number;
@@ -85,6 +124,11 @@ const MAX_WORKSTYLE = 8;
 const WORKSTYLE_MAX = 200;
 const MAX_SKILL_NAMES = 60;
 const MAX_TEMPLATES = 400;
+/** 导入与技能库同一套口径：一次最多 20 个文件、50 个模板，单文件 512 KB。 */
+const MAX_IMPORT_FILES = 20;
+const MAX_IMPORT_TEMPLATES = 50;
+const MAX_IMPORT_FILE_CHARS = 512 * 1024;
+const IMPORT_FILENAME_MAX = 240;
 
 /** 字段上限的对外视图：成员导出草稿与前端表单都按同一套值校验。 */
 export const TEMPLATE_LIMITS = {
@@ -191,6 +235,62 @@ function seedRecord(seed: AgentTemplateSeed, now: number): AgentTemplateRecord {
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function exportPayload(record: AgentTemplateRecord): TemplateExportPayload {
+  return {
+    key: record.key,
+    title: record.title,
+    category: record.category,
+    description: record.description,
+    suggestedName: record.suggestedName,
+    brief: record.brief,
+    ...(record.emoji ? { emoji: record.emoji } : {}),
+    ...(record.vibe ? { vibe: record.vibe } : {}),
+    ...(record.workstyle?.length ? { workstyle: [...record.workstyle] } : {}),
+    ...(record.skillNames?.length ? { skillNames: [...record.skillNames] } : {}),
+  };
+}
+
+/** 导入文件既接受导出格式，也接受裸对象、裸数组和 { templates: [...] } 批量文件。 */
+function documentsFrom(content: string): unknown[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw new TemplateError(400, "文件不是有效的 JSON");
+  }
+  if (Array.isArray(parsed)) return parsed;
+  if (!isRecord(parsed)) throw new TemplateError(400, "模板文件应为 JSON 对象或数组");
+  if (parsed["format"] !== undefined && parsed["format"] !== TEMPLATE_EXPORT_FORMAT) {
+    throw new TemplateError(400, "不是本系统的模板导出文件（format 不匹配）");
+  }
+  if (parsed["version"] !== undefined && parsed["version"] !== TEMPLATE_EXPORT_VERSION) {
+    throw new TemplateError(400, `不支持的模板导出格式版本：${String(parsed["version"])}`);
+  }
+  if (Array.isArray(parsed["templates"])) return parsed["templates"];
+  if (parsed["template"] !== undefined) return [parsed["template"]];
+  return [parsed];
+}
+
+/** 只取模板设定的白名单字段，忽略导出文件里的 id、归属、内置标记等运行时信息。 */
+function pickTemplateInput(doc: Record<string, unknown>): AgentTemplateInput {
+  return {
+    ...(doc["key"] !== undefined ? { key: doc["key"] } : {}),
+    title: doc["title"],
+    description: doc["description"],
+    brief: doc["brief"],
+    ...(doc["category"] !== undefined ? { category: doc["category"] } : {}),
+    ...(doc["suggestedName"] !== undefined ? { suggestedName: doc["suggestedName"] } : {}),
+    ...(doc["emoji"] !== undefined ? { emoji: doc["emoji"] } : {}),
+    ...(doc["vibe"] !== undefined ? { vibe: doc["vibe"] } : {}),
+    ...(doc["workstyle"] !== undefined ? { workstyle: doc["workstyle"] } : {}),
+    ...(doc["skillNames"] !== undefined ? { skillNames: doc["skillNames"] } : {}),
+  };
+}
+
 /**
  * 智能体模板库：内置模板随系统预装（与技能库同样的版本迁移规则），
  * 个人模板由每个账号自建、只有本人可见。存储为单个 data/templates.json。
@@ -294,6 +394,121 @@ export class TemplateLibrary {
       throw new TemplateError(403, "只能使用自己的个人模板");
     }
     return record;
+  }
+
+  /** 导出个人模板：内置模板不导出，避免把系统预装内容混进个人备份。 */
+  exportFor(user: PublicUser, id: string): TemplateExportDocument {
+    const record = this.getFor(user, id);
+    if (record.scope !== "personal") {
+      throw new TemplateError(400, "内置模板随系统预装，只能导出个人模板");
+    }
+    return {
+      format: TEMPLATE_EXPORT_FORMAT,
+      version: TEMPLATE_EXPORT_VERSION,
+      exportedAt: new Date(this.now()).toISOString(),
+      template: exportPayload(record),
+    };
+  }
+
+  /**
+   * 导入个人模板。沿用 create 的全部校验与落盘，逐个模板给结果；
+   * 标识撞车不中断导入，改为自动加序号并给出提示。
+   */
+  async importMany(user: PublicUser, input: { files?: unknown }): Promise<TemplateImportResult[]> {
+    if (!Array.isArray(input.files) || input.files.length === 0) {
+      throw new TemplateError(400, "请选择要导入的模板 JSON 文件");
+    }
+    if (input.files.length > MAX_IMPORT_FILES) {
+      throw new TemplateError(400, `单次最多导入 ${MAX_IMPORT_FILES} 个文件`);
+    }
+    const parsedFiles: Array<
+      { filename: string; documents: unknown[] } | { filename: string; error: string }
+    > = [];
+    let total = 0;
+    for (const [index, raw] of input.files.entries()) {
+      const entry = isRecord(raw) ? raw : {};
+      const filename =
+        typeof entry["filename"] === "string" && entry["filename"].trim()
+          ? entry["filename"].trim().slice(0, IMPORT_FILENAME_MAX)
+          : `模板-${index + 1}.json`;
+      const content = entry["content"];
+      if (typeof content !== "string" || !content.trim()) {
+        parsedFiles.push({ filename, error: "文件内容为空" });
+        continue;
+      }
+      if (content.length > MAX_IMPORT_FILE_CHARS) {
+        parsedFiles.push({ filename, error: `文件超过 ${MAX_IMPORT_FILE_CHARS / 1024} KB` });
+        continue;
+      }
+      try {
+        const documents = documentsFrom(content);
+        total += documents.length;
+        parsedFiles.push({ filename, documents });
+      } catch (err) {
+        parsedFiles.push({
+          filename,
+          error: err instanceof TemplateError ? err.message : "无法解析模板文件",
+        });
+      }
+    }
+    if (total > MAX_IMPORT_TEMPLATES) {
+      throw new TemplateError(400, `单次最多导入 ${MAX_IMPORT_TEMPLATES} 个模板，请分批导入`);
+    }
+
+    const results: TemplateImportResult[] = [];
+    for (const item of parsedFiles) {
+      if ("error" in item) {
+        results.push({
+          filename: item.filename,
+          ok: false,
+          created: [],
+          errors: [item.error],
+          warnings: [],
+        });
+        continue;
+      }
+      if (item.documents.length === 0) {
+        results.push({
+          filename: item.filename,
+          ok: false,
+          created: [],
+          errors: ["文件里没有模板"],
+          warnings: [],
+        });
+        continue;
+      }
+      const created: AgentTemplateRecord[] = [];
+      const errors: string[] = [];
+      const warnings: string[] = [];
+      for (const doc of item.documents) {
+        if (!isRecord(doc)) {
+          errors.push("模板条目必须是 JSON 对象");
+          continue;
+        }
+        const wantedKey = typeof doc["key"] === "string" ? doc["key"].trim().toLowerCase() : "";
+        // 沿用一个合法但已被占用的标识时，保留原名加序号，而不是退化到标题生成的模板标识。
+        const conflict =
+          wantedKey !== "" && KEY_RE.test(wantedKey) && this.keyTaken(wantedKey, user.id);
+        try {
+          const record = await this.create(
+            user,
+            conflict
+              ? { ...pickTemplateInput(doc), key: this.freeKey(wantedKey, user.id) }
+              : pickTemplateInput(doc),
+          );
+          created.push(record);
+          if (conflict) warnings.push(`标识「${wantedKey}」已被占用，新模板改用「${record.key}」`);
+        } catch (err) {
+          const title =
+            typeof doc["title"] === "string" && doc["title"].trim()
+              ? `「${doc["title"].trim().slice(0, TITLE_MAX)}」`
+              : "模板";
+          errors.push(`${title}：${err instanceof TemplateError ? err.message : "导入失败"}`);
+        }
+      }
+      results.push({ filename: item.filename, ok: created.length > 0, created, errors, warnings });
+    }
+    return results;
   }
 
   async create(user: PublicUser, input: AgentTemplateInput): Promise<AgentTemplateRecord> {

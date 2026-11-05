@@ -27,21 +27,26 @@ import {
   buildDedupeEntries,
   containsSecret,
   isDuplicateOf,
+  normalizeSkillName,
   validateCandidate,
+  validateSkillCandidate,
 } from "../src/agent/learning/filters";
 import {
   LEARNING_SYSTEM_PROMPT,
   buildReviewUserPrompt,
   extractEntries,
+  extractReview,
   type ReviewMaterial,
 } from "../src/agent/learning/prompt";
-import { LearningStore, dayKeyOf } from "../src/agent/learning/store";
+import { LearningStore, dayKeyOf, normalizeProposal } from "../src/agent/learning/store";
 import { LearningService, type LearningServiceDeps } from "../src/agent/learning/service";
 import {
   LEARNING_RULES,
+  type LearningProposal,
   type LearningRunInput,
   type MemoryProposal,
   type ReviewLog,
+  type SkillProposal,
 } from "../src/agent/learning/types";
 
 let dir: string;
@@ -92,11 +97,15 @@ function runInput(overrides: Partial<LearningRunInput> = {}): LearningRunInput {
   };
 }
 
-/** 复盘模型固定输出 entries；省略参数表示输出空数组（最常见的正确回答）。 */
-function reviewHandler(entries?: unknown[], onCall?: (request: LlmRequest) => void): MockHandler {
+/** 复盘模型固定输出 entries / skills；省略参数表示输出空数组（最常见的正确回答）。 */
+function reviewHandler(
+  entries?: unknown[],
+  onCall?: (request: LlmRequest) => void,
+  skills?: unknown[],
+): MockHandler {
   return (request) => {
     onCall?.(request);
-    return { text: "```json\n" + JSON.stringify({ entries: entries ?? [] }) + "\n```" };
+    return { text: "```json\n" + JSON.stringify({ entries: entries ?? [], skills: skills ?? [] }) + "\n```" };
   };
 }
 
@@ -110,13 +119,37 @@ function oneEntry(overrides: Record<string, unknown> = {}): Record<string, unkno
   };
 }
 
+function oneSkill(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: "pnpm-migration",
+    description: "把一个 Node 仓库从 npm 切换到 pnpm 并同步脚本与文档",
+    instructions:
+      "1. 读取 package.json 与 CI 配置，确认现有包管理器。\n2. 用 pnpm import 生成锁文件。\n3. 把脚本与文档里的 npm 命令改成 pnpm。\n4. 运行测试确认依赖解析一致。",
+    category: "engineering",
+    triggers: ["迁移 pnpm", "包管理器"],
+    rationale: "本轮完整跑通了切换流程",
+    ...overrides,
+  };
+}
+
 interface Harness {
   settings: Settings;
   store: LearningStore;
   memory: MemorySearchManager;
   service: LearningService;
-  learned: Array<{ proposals: readonly MemoryProposal[]; log: ReviewLog }>;
+  skills: SkillLibrary;
+  learned: Array<{ proposals: readonly LearningProposal[]; log: ReviewLog }>;
   usageRecords: Array<{ ref: string }>;
+}
+
+function memoryOf(proposal: LearningProposal | undefined): MemoryProposal {
+  if (!proposal || proposal.kind !== "memory") throw new Error("缺少记忆提案");
+  return proposal;
+}
+
+function skillOf(proposal: LearningProposal | undefined): SkillProposal {
+  if (!proposal || proposal.kind !== "skill") throw new Error("缺少技能提案");
+  return proposal;
 }
 
 function harness(
@@ -140,6 +173,8 @@ function harness(
   };
   const memory = new MemorySearchManager({ workspaceDir: dir, bus: new RoomBus("room_main", "测试作战室") });
   const store = newStore(join(dir, "learning.json"));
+  // 个人技能只在测试目录里落盘；不预装共享技能，避免噪声干扰技能提案。
+  const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
   const learned: Harness["learned"] = [];
   const usageRecords: Harness["usageRecords"] = [];
   const service = new LearningService({
@@ -147,11 +182,13 @@ function harness(
     getSettings: () => settings,
     getModelDeps: () => ({ settings, dataDir: dir, mockHandler: options.handler ?? reviewHandler() }),
     memory,
+    skills,
+    skillOwner: { id: "u_test", role: "admin" },
     onLearned: (payload) => learned.push(payload),
     onUsageRecord: (record) => usageRecords.push(record),
     ...options.deps,
   });
-  return { settings, store, memory, service, learned, usageRecords };
+  return { settings, store, memory, service, skills, learned, usageRecords };
 }
 
 describe("复盘闸门（filters）", () => {
@@ -223,7 +260,7 @@ describe("复盘闸门（filters）", () => {
 
   it("去重语料 = 记忆条目行（去掉列表符号与标题）+ 待确认提案", () => {
     const memory = ["# 长期记忆", "", "- 第一条既有事实", "  * 第二条既有事实", "正文行没有列表符号"].join("\n");
-    const pending = [{ content: "还没确认的提案" }] as MemoryProposal[];
+    const pending = [{ kind: "memory", content: "还没确认的提案" }] as MemoryProposal[];
     expect(buildDedupeEntries(memory, pending)).toEqual([
       "第一条既有事实",
       "第二条既有事实",
@@ -231,13 +268,70 @@ describe("复盘闸门（filters）", () => {
       "还没确认的提案",
     ]);
   });
+
+  it("技能名统一 slug 化，转不出合法名字就放弃提议", () => {
+    expect(normalizeSkillName("  My Skill_2 ")).toBe("my-skill-2");
+    expect(normalizeSkillName("pnpm---migration")).toBe("pnpm-migration");
+    expect(normalizeSkillName("技能")).toBeUndefined();
+    expect(normalizeSkillName("")).toBeUndefined();
+    expect(normalizeSkillName(42)).toBeUndefined();
+  });
+
+  it("技能候选按技能库口径收口：名称、描述、说明长度、分类与密钥", () => {
+    const ok = validateSkillCandidate(oneSkill());
+    if ("reason" in ok) throw new Error("应当通过校验");
+    expect(ok).toMatchObject({
+      name: "pnpm-migration",
+      description: "把一个 Node 仓库从 npm 切换到 pnpm 并同步脚本与文档",
+      category: "engineering",
+      triggers: ["迁移 pnpm", "包管理器"],
+      rationale: "本轮完整跑通了切换流程",
+    });
+    expect(ok.instructions).toContain("pnpm import");
+
+    expect(validateSkillCandidate({ ...oneSkill(), name: "Bad Name!" })).toMatchObject({ name: "bad-name" });
+    expect(validateSkillCandidate({ ...oneSkill(), name: "技能" })).toEqual({
+      reason: "技能名需为小写字母、数字或短横线（最长 48 位）",
+    });
+    expect(validateSkillCandidate({ ...oneSkill(), description: "  " })).toEqual({ reason: "技能描述为空" });
+    expect(
+      validateSkillCandidate({ ...oneSkill(), description: "长".repeat(LEARNING_RULES.maxSkillDescriptionChars + 1) }),
+    ).toEqual({ reason: `技能描述超过 ${LEARNING_RULES.maxSkillDescriptionChars} 字` });
+    expect(validateSkillCandidate({ ...oneSkill(), instructions: "太短" })).toEqual({
+      reason: `技能说明少于 ${LEARNING_RULES.minSkillInstructionsChars} 字`,
+    });
+    expect(
+      validateSkillCandidate({ ...oneSkill(), instructions: "长".repeat(LEARNING_RULES.maxSkillInstructionsChars + 1) }),
+    ).toEqual({ reason: `技能说明超过 ${LEARNING_RULES.maxSkillInstructionsChars} 字` });
+    expect(
+      validateSkillCandidate({ ...oneSkill(), instructions: `${"步骤".repeat(20)} password: hunter22` }),
+    ).toEqual({ reason: "技能说明疑似包含密钥或凭据" });
+    expect(validateSkillCandidate(null)).toEqual({ reason: "技能候选不是对象" });
+
+    const inferred = validateSkillCandidate({
+      ...oneSkill(),
+      name: "tanzania-research",
+      description: "为坦桑尼亚调研生成结构化提纲",
+      category: "不存在的分类",
+    });
+    if ("reason" in inferred) throw new Error("应当通过校验");
+    expect(inferred.category).toBe("research");
+
+    const capped = validateSkillCandidate({
+      ...oneSkill(),
+      triggers: ["一", "二", "三", "四", "五", "六"],
+    });
+    if ("reason" in capped) throw new Error("应当通过校验");
+    expect(capped.triggers).toHaveLength(LEARNING_RULES.maxTriggers);
+  });
 });
 
 describe("复盘提示词（prompt）", () => {
   it("系统提示是逐字常量：不含本轮素材，便于命中上游上下文缓存", () => {
     expect(LEARNING_SYSTEM_PROMPT).toContain("复盘助手");
-    expect(LEARNING_SYSTEM_PROMPT).toContain('{"entries":[]}');
+    expect(LEARNING_SYSTEM_PROMPT).toContain('{"entries":[],"skills":[]}');
     expect(LEARNING_SYSTEM_PROMPT).toContain(String(LEARNING_RULES.maxEntriesPerReview));
+    expect(LEARNING_SYSTEM_PROMPT).toContain(String(LEARNING_RULES.maxSkillsPerReview));
     expect(LEARNING_SYSTEM_PROMPT).not.toContain("pnpm");
     expect(LEARNING_SYSTEM_PROMPT).not.toContain("room_main");
   });
@@ -254,6 +348,7 @@ describe("复盘提示词（prompt）", () => {
       toolNames: ["bash", "edit_file"],
       transcript: "很长的记录".repeat(3000),
       existingMemory: "",
+      existingSkills: "",
     };
     const prompt = buildReviewUserPrompt(material);
     expect(prompt).toContain("群聊：测试作战室");
@@ -277,6 +372,14 @@ describe("复盘提示词（prompt）", () => {
     expect(sub).toContain("@调研员（子成员）");
     expect(sub).toContain("agents/m_doc/MEMORY.md");
     expect(sub).toContain("（本轮没有调用工具）");
+    expect(sub).toContain("【已有技能（不要重复提议）】");
+    expect(sub).toContain("（无）");
+
+    const withSkills = buildReviewUserPrompt({
+      ...material,
+      existingSkills: "- pnpm-migration：把一个 Node 仓库从 npm 切换到 pnpm",
+    });
+    expect(withSkills).toContain("pnpm-migration：把一个 Node 仓库从 npm 切换到 pnpm");
   });
 
   it("extractEntries 容忍代码块与前后闲话，解析不出 entries 数组就返回 undefined", () => {
@@ -290,11 +393,26 @@ describe("复盘提示词（prompt）", () => {
     expect(extractEntries("{\"note\":\"没有 entries 字段\"}")).toBeUndefined();
     expect(extractEntries("{}")).toBeUndefined();
   });
+
+  it("extractReview 同时取记忆与技能，允许只输出其中一类", () => {
+    expect(extractReview('{"entries":[{"content":"a"}],"skills":[{"name":"x"}]}')).toEqual({
+      entries: [{ content: "a" }],
+      skills: [{ name: "x" }],
+    });
+    expect(extractReview('{"skills":[{"name":"x"}]}')).toEqual({ entries: [], skills: [{ name: "x" }] });
+    expect(extractReview('{"entries":[{"content":"a"}]}')).toEqual({ entries: [{ content: "a" }], skills: [] });
+    expect(extractEntries('{"skills":[{"name":"x"}]}')).toEqual([]);
+    // 字段存在但不是数组，说明模型没有按约定输出，整轮按失败处理。
+    expect(extractReview('{"entries":"不是数组"}')).toBeUndefined();
+    expect(extractReview('{"skills":{}}')).toBeUndefined();
+    expect(extractReview("这一轮没有值得沉淀的东西。")).toBeUndefined();
+  });
 });
 
 describe("学习账本（LearningStore）", () => {
   const proposal = (id: string, createdAt: number, status: MemoryProposal["status"] = "pending"): MemoryProposal => ({
     id,
+    kind: "memory",
     status,
     createdAt,
     updatedAt: createdAt,
@@ -343,6 +461,98 @@ describe("学习账本（LearningStore）", () => {
     expect(patched?.status).toBe("applied");
     expect(await reopened.getProposal("mem_missing")).toBeUndefined();
     expect(await reopened.patchProposal("mem_missing", { status: "applied" })).toBeUndefined();
+  });
+
+  it("技能提案与记忆提案共用账本，可按 kind 过滤并跨实例读回", async () => {
+    const file = join(dir, "kind-learning.json");
+    const skillProposal: SkillProposal = {
+      id: "skill_1",
+      kind: "skill",
+      status: "pending",
+      createdAt: 2000,
+      updatedAt: 2000,
+      memberId: "m_doc",
+      memberName: "调研员",
+      memberRole: "sub",
+      roomId: "room_main",
+      roomName: "测试作战室",
+      runId: "run_1",
+      rationale: "依据",
+      skill: {
+        name: "pnpm-migration",
+        description: "把一个 Node 仓库从 npm 切换到 pnpm",
+        instructions: "第一步：读取 package.json。第二步：生成锁文件。",
+        category: "engineering",
+        triggers: ["pnpm"],
+      },
+    };
+
+    const store = newStore(file);
+    await store.addProposals([proposal("mem_1", 1000), skillProposal]);
+    await store.flush();
+
+    const reopened = newStore(file);
+    expect((await reopened.listProposals()).map((item) => item.kind)).toEqual(["skill", "memory"]);
+    expect((await reopened.listProposals({ kind: "skill" })).map((item) => item.id)).toEqual(["skill_1"]);
+    expect((await reopened.listProposals({ kind: "memory" })).map((item) => item.id)).toEqual(["mem_1"]);
+    expect(skillOf(await reopened.getProposal("skill_1"))).toMatchObject({
+      memberRole: "sub",
+      skill: {
+        name: "pnpm-migration",
+        category: "engineering",
+        triggers: ["pnpm"],
+      },
+    });
+  });
+
+  it("P1 老账本没有 kind 的记录补成记忆提案，字段不全的技能记录整条丢弃", async () => {
+    const file = join(dir, "legacy-learning.json");
+    await writeFile(
+      file,
+      JSON.stringify({
+        proposals: [
+          {
+            id: "mem_legacy",
+            status: "pending",
+            createdAt: 1000,
+            memberId: "m_main",
+            memberName: "主智能体",
+            memberRole: "main",
+            roomId: "room_main",
+            roomName: "测试作战室",
+            runId: "run_1",
+            target: "account",
+            content: "老账本里的记忆事实",
+            triggers: ["pnpm"],
+            importance: 7,
+            rationale: "依据",
+          },
+          {
+            id: "skill_broken",
+            status: "pending",
+            createdAt: 2000,
+            kind: "skill",
+            skill: { name: "broken", description: "缺少说明" },
+          },
+          {
+            id: "skill_legacy",
+            status: "pending",
+            createdAt: 3000,
+            kind: "skill",
+            skill: { name: "legacy-skill", description: "旧技能", instructions: "步骤" },
+          },
+        ],
+        log: [],
+      }),
+      "utf8",
+    );
+
+    const listed = await newStore(file).listProposals();
+    expect(listed.map((item) => item.id)).toEqual(["skill_legacy", "mem_legacy"]);
+    expect(listed[0]).toMatchObject({ kind: "skill", skill: { category: "other" } });
+    expect(memoryOf(listed[1]).content).toBe("老账本里的记忆事实");
+    expect(normalizeProposal({ id: "mem_weird", status: "pending", createdAt: 1, kind: "weird", content: "按记忆处理" }))
+      .toMatchObject({ kind: "memory" });
   });
 
   it("坏 JSON 与畸形条目退回空账本而不是让工作区加载失败", async () => {
@@ -517,22 +727,22 @@ describe("复盘服务（LearningService）触发条件", () => {
 });
 
 describe("复盘服务（LearningService）产出与落地", () => {
-  it("propose 模式只产出待确认提案，绝不碰记忆文件", async () => {
+  it("propose 模式只产出待确认记忆提案，绝不碰记忆文件", async () => {
     const h = harness({ mode: "propose", handler: reviewHandler([oneEntry({ importance: 9 })]) });
     await h.service.afterRun(runInput());
 
     const pending = await h.store.listProposals({ status: "pending" });
     expect(pending).toHaveLength(1);
-    expect(pending[0]?.content).toBe("这个仓库统一使用 pnpm 作为包管理器，不要执行 npm install。");
-    expect(pending[0]?.target).toBe("account");
-    expect(pending[0]?.triggers).toEqual(["包管理器", "pnpm"]);
-    expect(pending[0]?.importance).toBe(9);
+    expect(memoryOf(pending[0]).content).toBe("这个仓库统一使用 pnpm 作为包管理器，不要执行 npm install。");
+    expect(memoryOf(pending[0]).target).toBe("account");
+    expect(memoryOf(pending[0]).triggers).toEqual(["包管理器", "pnpm"]);
+    expect(memoryOf(pending[0]).importance).toBe(9);
     expect(pending[0]?.memberId).toBe("m_main");
     expect(existsSync(join(dir, "MEMORY.md"))).toBe(false);
 
     const log = await h.store.listLog();
     expect(log[0]?.outcome).toBe("proposed");
-    expect(log[0]?.detail).toContain("产出 1 条待确认提案");
+    expect(log[0]?.detail).toContain("产出 1 条待确认记忆");
     expect(log[0]?.modelRef).toBe("demo/mock");
     expect(log[0]?.proposalIds).toEqual([pending[0]?.id]);
     expect(h.learned[0]?.proposals).toHaveLength(1);
@@ -557,7 +767,7 @@ describe("复盘服务（LearningService）产出与落地", () => {
       handler: reviewHandler([oneEntry({ content: "调研员负责的房间统一用中文命名。", rationale: "用户：房间名统一中文" })]),
     });
     await second.service.afterRun(runInput({ memberId: "m_doc", memberName: "调研员", memberRole: "sub" }));
-    expect((await second.store.listProposals())[0]?.target).toBe("member");
+    expect((await second.store.listProposals())[0]).toMatchObject({ kind: "memory", target: "member" });
     const own = await readFile(join(dir, "agents", "m_doc", "MEMORY.md"), "utf8");
     expect(own).toContain("调研员负责的房间统一用中文命名。");
     expect(await second.memory.readAgentFile("agents/m_doc/MEMORY.md", { full: true })).toMatchObject({
@@ -636,6 +846,194 @@ describe("复盘服务（LearningService）产出与落地", () => {
     expect((await h.store.listProposals())[0]).toMatchObject({ status: "dismissed", dismissReason: "成员已移除" });
     expect(await h.store.listLog()).toHaveLength(1);
     expect(await h.service.dropMember("m_nobody")).toBe(0);
+  });
+});
+
+describe("复盘服务（LearningService）技能提案", () => {
+  it("propose 模式同时产出记忆与技能提案，技能停在待确认", async () => {
+    const h = harness({ mode: "propose", handler: reviewHandler([oneEntry()], undefined, [oneSkill()]) });
+    await h.service.afterRun(runInput());
+
+    const pending = await h.store.listProposals({ status: "pending" });
+    expect(pending.map((item) => item.kind).sort()).toEqual(["memory", "skill"]);
+    const skill = skillOf(pending.find((item) => item.kind === "skill"));
+    expect(skill).toMatchObject({
+      memberId: "m_main",
+      status: "pending",
+      rationale: "本轮完整跑通了切换流程",
+      skill: {
+        name: "pnpm-migration",
+        category: "engineering",
+        triggers: ["迁移 pnpm", "包管理器"],
+      },
+    });
+    expect(h.skills.listPersonal("u_test")).toEqual([]);
+    const log = (await h.store.listLog())[0];
+    expect(log?.outcome).toBe("proposed");
+    expect(log?.detail).toContain("产出 1 条待确认记忆");
+    expect(log?.detail).toContain("1 条技能提案待确认");
+    expect(h.learned[0]?.proposals).toHaveLength(2);
+  });
+
+  it("auto 模式只自动写记忆，技能不会被自动创建且流水明确说明", async () => {
+    const h = harness({ mode: "auto", handler: reviewHandler([oneEntry()], undefined, [oneSkill()]) });
+    await h.service.afterRun(runInput());
+
+    const proposals = await h.store.listProposals();
+    expect(memoryOf(proposals.find((item) => item.kind === "memory"))).toMatchObject({
+      status: "applied",
+      appliedPath: "MEMORY.md",
+    });
+    expect(skillOf(proposals.find((item) => item.kind === "skill"))).toMatchObject({ status: "pending" });
+    expect(h.skills.listPersonal("u_test")).toEqual([]);
+    expect(await readFile(join(dir, "MEMORY.md"), "utf8")).toContain("pnpm");
+
+    const log = (await h.store.listLog())[0];
+    expect(log?.outcome).toBe("applied");
+    expect(log?.detail).toContain("自动写入 1/1 条记忆");
+    expect(log?.detail).toContain("1 条技能提案待确认（技能不会被自动创建）");
+    expect(log?.proposalIds).toHaveLength(1);
+  });
+
+  it("采纳技能提案创建个人技能，并通知工作区授权给来源成员", async () => {
+    const grants: Array<{ memberId: string; skillName: string }> = [];
+    const h = harness({
+      handler: reviewHandler([], undefined, [oneSkill()]),
+      deps: {
+        grantSkillToMember: async (memberId, skillName) => {
+          grants.push({ memberId, skillName });
+        },
+      },
+    });
+    await h.service.afterRun(runInput());
+    const [pending] = await h.store.listProposals();
+    const proposal = skillOf(pending);
+
+    const applied = await h.service.applyProposal(proposal.id);
+    expect(applied).toMatchObject({
+      status: "applied",
+      appliedPath: "技能库/pnpm-migration",
+      appliedSkillName: "pnpm-migration",
+    });
+    expect(applied.appliedSkillId).toMatch(/^sk_/);
+    expect(grants).toEqual([{ memberId: "m_main", skillName: "pnpm-migration" }]);
+
+    const personal = h.skills.listPersonal("u_test");
+    expect(personal).toHaveLength(1);
+    expect(personal[0]).toMatchObject({
+      name: "pnpm-migration",
+      scope: "personal",
+      ownerId: "u_test",
+      category: "engineering",
+      description: "把一个 Node 仓库从 npm 切换到 pnpm 并同步脚本与文档",
+    });
+    expect(personal[0]?.instructions).toContain("pnpm import");
+
+    // 重复采纳幂等；已创建的技能提案不能忽略。
+    expect(await h.service.applyProposal(proposal.id)).toMatchObject({ status: "applied" });
+    expect(h.skills.listPersonal("u_test")).toHaveLength(1);
+    await expect(h.service.dismissProposal(proposal.id)).rejects.toThrow(
+      "已创建的技能提案不能忽略，请在技能库里删除该技能",
+    );
+  });
+
+  it("授权失败不影响技能创建，只走 onError 提示", async () => {
+    const errors: string[] = [];
+    const h = harness({
+      handler: reviewHandler([], undefined, [oneSkill()]),
+      deps: {
+        grantSkillToMember: async () => {
+          throw new Error("总线忙");
+        },
+        onError: (message) => errors.push(message),
+      },
+    });
+    await h.service.afterRun(runInput());
+    const [pending] = await h.store.listProposals();
+    const applied = await h.service.applyProposal(skillOf(pending).id);
+    expect(applied).toMatchObject({ status: "applied" });
+    expect(errors[0]).toBe("技能已创建，但授权给 @主智能体 失败：总线忙");
+  });
+
+  it("技能名已存在或已在待确认提案里就不再提；单轮最多 1 个", async () => {
+    const existing = harness({ handler: reviewHandler([], undefined, [oneSkill()]) });
+    await existing.skills.create(
+      { id: "u_test", role: "admin" },
+      {
+        scope: "personal",
+        name: "pnpm-migration",
+        description: "已有技能",
+        instructions: "步骤".repeat(30),
+      },
+    );
+    await existing.service.afterRun(runInput());
+    expect(await existing.store.listProposals()).toEqual([]);
+    expect((await existing.store.listLog())[0]?.detail).toContain("技能库或待确认提案里已有 pnpm-migration");
+
+    const pending = harness({ handler: reviewHandler([], undefined, [oneSkill()]) });
+    await pending.service.afterRun(runInput());
+    expect(await pending.store.listProposals()).toHaveLength(1);
+    await pending.service.afterRun(runInput({ runId: "run_2" }));
+    expect(await pending.store.listProposals()).toHaveLength(1);
+    expect((await pending.store.listLog())[0]?.detail).toContain("技能库或待确认提案里已有 pnpm-migration");
+
+    const capped = harness({
+      handler: reviewHandler(
+        [],
+        undefined,
+        [oneSkill(), oneSkill({ name: "second-skill", description: "另一个可复用做法" })],
+      ),
+    });
+    await capped.service.afterRun(runInput());
+    const skills = await capped.store.listProposals({ kind: "skill" });
+    expect(skills).toHaveLength(LEARNING_RULES.maxSkillsPerReview);
+    expect(skillOf(skills[0]).skill.name).toBe("pnpm-migration");
+  });
+
+  it("技能候选不合规或含密钥时丢弃，只留 nothing 流水", async () => {
+    const h = harness({
+      handler: reviewHandler([], undefined, [
+        oneSkill({ instructions: `${"步骤".repeat(20)} password: hunter22` }),
+      ]),
+    });
+    await h.service.afterRun(runInput());
+    expect(await h.store.listProposals()).toEqual([]);
+    const log = (await h.store.listLog())[0];
+    expect(log?.outcome).toBe("nothing");
+    expect(log?.detail).toContain("技能说明疑似包含密钥或凭据");
+  });
+
+  it("技能库未接入时技能候选跳过并说明原因，不影响记忆提案", async () => {
+    const h = harness({
+      handler: reviewHandler([oneEntry()], undefined, [oneSkill()]),
+      deps: { skills: undefined, skillOwner: undefined },
+    });
+    await h.service.afterRun(runInput());
+    const proposals = await h.store.listProposals();
+    expect(proposals.map((item) => item.kind)).toEqual(["memory"]);
+    const log = (await h.store.listLog())[0];
+    expect(log?.detail).toContain("技能库未接入，技能候选已跳过");
+  });
+
+  it("复盘素材带上账号已有技能，提示模型不要重复提议", async () => {
+    let userContent = "";
+    const h = harness({
+      handler: reviewHandler([], (request) => {
+        userContent = String(request.messages[1]?.content ?? "");
+      }),
+    });
+    await h.skills.create(
+      { id: "u_test", role: "admin" },
+      {
+        scope: "personal",
+        name: "existing-skill",
+        description: "已有能力",
+        instructions: "步骤".repeat(30),
+      },
+    );
+    await h.service.afterRun(runInput());
+    expect(userContent).toContain("【已有技能（不要重复提议）】");
+    expect(userContent).toContain("existing-skill：已有能力");
   });
 });
 

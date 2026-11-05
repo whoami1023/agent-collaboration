@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { runAgentLoop, type ToolImpl } from "../src/agent/loop";
+import { fillMissingToolResults, runAgentLoop, type ToolImpl } from "../src/agent/loop";
+import type { LlmMessage } from "../src/provider/types";
 import { MockProvider, type MockHandler } from "../src/provider/mock";
 
 const echoTool: ToolImpl = {
@@ -129,6 +130,7 @@ describe("agent loop hardening", () => {
       },
     };
     let pulled = 0;
+    let followUp: LlmMessage[] | undefined;
     const handler: MockHandler = (request) => {
       const assistantSteps = request.messages.filter((m) => m.role === "assistant").length;
       if (assistantSteps === 0) {
@@ -140,6 +142,7 @@ describe("agent loop hardening", () => {
           ],
         };
       }
+      followUp = request.messages;
       const sawSteering = request.messages.some(
         (m) => m.role === "user" && m.content === "steer:打断",
       );
@@ -156,6 +159,40 @@ describe("agent loop hardening", () => {
     });
     expect(result.text).toBe("已按新指令处理");
     expect(order).toEqual(["a"]);
+    // 被释放的 b、c 也必须各有一条工具结果，且排在打断消息之前，否则真实接口会 400。
+    const sent = followUp ?? [];
+    const assistantAt = sent.findIndex((m) => m.role === "assistant" && (m.toolCalls?.length ?? 0) === 3);
+    expect(assistantAt).toBeGreaterThanOrEqual(0);
+    const ids = (sent[assistantAt]?.toolCalls ?? []).map((call) => call.id);
+    const results = sent
+      .slice(assistantAt + 1)
+      .filter((m) => m.role === "tool")
+      .map((m) => m.toolCallId);
+    expect(results).toEqual(ids);
+    const steeringAt = sent.findIndex((m) => m.role === "user" && m.content === "steer:打断");
+    expect(steeringAt).toBeGreaterThan(assistantAt + 3);
+  });
+
+  it("悬空的 tool_calls 会在请求前补上说明性结果", () => {
+    const messages: LlmMessage[] = [
+      { role: "system", content: "测试" },
+      { role: "user", content: "开始" },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          { id: "call_a", name: "seq", args: { id: "a" } },
+          { id: "call_b", name: "seq", args: { id: "b" } },
+        ],
+      },
+      { role: "tool", toolCallId: "call_a", content: "ok" },
+      { role: "user", content: "新消息" },
+    ];
+    fillMissingToolResults(messages);
+    expect(messages.map((m) => m.role)).toEqual(["system", "user", "assistant", "tool", "tool", "user"]);
+    const synthetic = messages[4];
+    expect(synthetic?.role === "tool" ? synthetic.toolCallId : undefined).toBe("call_b");
+    expect(messages[5]?.content).toBe("新消息");
   });
 
   it("工具抛错时按配置重试，最终返回失败信息", async () => {

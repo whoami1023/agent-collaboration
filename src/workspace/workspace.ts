@@ -19,6 +19,7 @@ import type {
   SessionArchiveDetail,
   SessionArchiveSummary,
   TaskCard,
+  UserRole,
 } from "../core/types";
 import { DEFAULT_MODEL_REF, SYSTEM_ID } from "../core/types";
 import { newId } from "../core/ids";
@@ -74,6 +75,8 @@ function roomCopy(pool: Member, roomId: string, status?: Member["status"]): Memb
 export interface WorkspaceOwner {
   id: string;
   displayName: string;
+  /** 账号角色：学习层创建个人技能只需要它；老测试可以只给 id 与显示名。 */
+  role?: UserRole;
 }
 
 function roomNameFor(displayName: string): string {
@@ -182,6 +185,21 @@ export class Workspace {
       getModelDeps: () => ({ settings: settingsRef.current, dataDir: dir }),
       memory,
       usage,
+      skills,
+      skillOwner: { id: owner.id, ...(owner.role ? { role: owner.role } : {}) },
+      // 技能提案被采纳后，若提案来源成员有技能白名单，就把新技能追加进去；
+      // 白名单为 undefined 的成员本来就跟随全部技能，不用动。
+      grantSkillToMember: async (memberId, skillName) => {
+        const workspace = workspaceRef;
+        if (!workspace) return;
+        const member = workspace.bus.getMember(memberId);
+        if (!member?.skillNames || member.skillNames.includes(skillName)) return;
+        member.skillNames = [...member.skillNames, skillName];
+        workspace.bus.updateMember(member);
+        await workspace.propagateMember(memberId);
+        await workspace.persist();
+        await memory.syncTeamFile();
+      },
       onLearned: ({ proposals, log }) => {
         const bus = workspaceRef?.rooms.get(log.roomId)?.bus;
         if (bus) bus.emit({ type: "learning", proposals, log });

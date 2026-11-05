@@ -118,6 +118,44 @@ function throwIfAborted(signal: AbortSignal): void {
 
 const REPEATED_TOOL_ERROR_MESSAGE = "检测到连续重复的工具调用，已中止本次运行";
 
+/** 工具调用被中断/释放时补的结果：缺了它，下一次请求会违反 tool_calls 配对约束。 */
+const MISSING_TOOL_RESULT =
+  "工具调用未执行：运行中收到新的群聊消息，该调用已被释放，没有结果；如仍需执行请重新发起。";
+
+/**
+ * OpenAI 兼容接口要求 assistant 的每个 tool_call 都有对应 tool 结果。
+ * 上下文裁剪或中途打断可能留下悬空调用，这里补一条说明性结果兜底，
+ * 避免整个请求被 400 拒绝。
+ */
+export function fillMissingToolResults(messages: LlmMessage[]): void {
+  for (let index = 0; index < messages.length; index += 1) {
+    const assistant = messages[index];
+    if (assistant?.role !== "assistant" || !assistant.toolCalls?.length) continue;
+    let frameEnd = index + 1;
+    while (frameEnd < messages.length && messages[frameEnd]?.role !== "assistant") frameEnd += 1;
+    const answered = new Set<string>();
+    for (let cursor = index + 1; cursor < frameEnd; cursor += 1) {
+      const message = messages[cursor];
+      if (message?.role === "tool" && message.toolCallId) answered.add(message.toolCallId);
+    }
+    const missing = assistant.toolCalls.filter((call) => call.id && !answered.has(call.id));
+    if (missing.length === 0) continue;
+    // 插在已有 tool 结果之后、下一条普通消息之前，保证结果紧跟调用。
+    let insertAt = index + 1;
+    while (insertAt < messages.length && messages[insertAt]?.role === "tool") insertAt += 1;
+    messages.splice(
+      insertAt,
+      0,
+      ...missing.map((call) => ({
+        role: "tool" as const,
+        toolCallId: call.id,
+        content: MISSING_TOOL_RESULT,
+      })),
+    );
+    index = insertAt + missing.length - 1;
+  }
+}
+
 export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   const messages: LlmMessage[] = [
     { role: "system", content: options.system },
@@ -154,6 +192,11 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     // Steering checkpoint: commit queued messages before the provider call.
     const pending = options.pullPending?.() ?? [];
     if (pending.length > 0) messages.push(...pending);
+
+    // Provider contract: every tool_calls entry must be answered by a tool message.
+    // Context trimming or an interrupted batch can otherwise leave a dangling call,
+    // which OpenAI-compatible APIs reject with HTTP 400.
+    fillMissingToolResults(messages);
 
     // Context budget: semantic compaction under token pressure, then a hard
     // byte bound on the model view (OpenClaw context-engine flow).
@@ -199,6 +242,8 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       }
     }
 
+    // Trimming may drop a result while keeping its call; re-check the final view.
+    fillMissingToolResults(messages);
     const streamed = await streamAgentResponse(options, messages);
     let visibleText = streamed.text;
     let calls = streamed.calls;
@@ -306,6 +351,7 @@ async function finalizeMaxSteps(
   steps: number,
 ): Promise<LoopResult> {
   throwIfAborted(options.signal);
+  fillMissingToolResults(messages);
   messages.push({ role: "user", content: MAX_STEPS_WRAP_UP_PROMPT });
   const streamed = await streamAgentResponse(options, messages, false);
   const text = streamed.text.trim() || accumulated.trim();
@@ -415,13 +461,21 @@ async function executeToolBatch(
   if (sequential) {
     // Sequential groups commit before preparing the next call; steering messages
     // committed between groups release the remaining calls (the model re-issues them).
-    for (const entry of resolved) {
+    for (let index = 0; index < resolved.length; index += 1) {
       throwIfAborted(options.signal);
       const pending = options.pullPending?.() ?? [];
       if (pending.length > 0) {
+        // 已提交的 assistant 消息带着整批 tool_calls：被释放的调用必须补结果，
+        // 否则下一次请求会被接口以「tool_calls 缺少对应工具消息」拒绝。
+        for (let remaining = index; remaining < resolved.length; remaining += 1) {
+          const call = resolved[remaining]?.call;
+          if (!call) continue;
+          messages.push({ role: "tool", toolCallId: call.id, content: MISSING_TOOL_RESULT });
+        }
         messages.push(...pending);
         break;
       }
+      const entry = resolved[index]!;
       options.onToolCall?.(entry.call);
       const result = await executeOne(options, messages, entry.call, entry.tool, retryOptions);
       options.onToolResult?.(entry.call, result);

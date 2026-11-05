@@ -21,12 +21,14 @@ import type {
 } from "../../src/cron/types";
 import type { ProviderApi } from "../../src/model/types";
 import type {
+  LearningProposal,
   LearningSettings,
   MemoryProposal,
   ReviewLog,
+  SkillProposal,
 } from "../../src/agent/learning/types";
 
-export type { LearningSettings, MemoryProposal, ReviewLog };
+export type { LearningProposal, LearningSettings, MemoryProposal, ReviewLog, SkillProposal };
 
 export type { RoomInfo, RoomKind, RoomMode };
 
@@ -408,8 +410,50 @@ export interface TemplateSnapshot {
   availableSkills: Array<{ name: string; description: string }>;
 }
 
+/** 个人模板导出文件：只带设定字段，可导入到任意账号的「我的模板」。 */
+export interface TemplateExportDocument {
+  format: "agent-collaboration/template";
+  version: number;
+  exportedAt: string;
+  template: {
+    key: string;
+    title: string;
+    category: SkillCategory;
+    description: string;
+    suggestedName: string;
+    brief: string;
+    emoji?: string;
+    vibe?: string;
+    workstyle?: string[];
+    skillNames?: string[];
+  };
+}
+
+export interface TemplateImportResult {
+  filename: string;
+  ok: boolean;
+  created: TemplateView[];
+  errors: string[];
+  warnings: string[];
+}
+
 export async function fetchTemplates(): Promise<TemplateSnapshot> {
   return request<TemplateSnapshot>("/api/templates");
+}
+
+export async function exportTemplate(templateId: string): Promise<TemplateExportDocument> {
+  return request<TemplateExportDocument>(
+    `/api/templates/${encodeURIComponent(templateId)}/export`,
+  );
+}
+
+export async function importTemplates(
+  files: Array<{ filename: string; content: string }>,
+): Promise<{ results: TemplateImportResult[] }> {
+  return request<{ results: TemplateImportResult[] }>("/api/templates/import", {
+    method: "POST",
+    body: JSON.stringify({ files }),
+  });
 }
 
 export async function createTemplate(input: TemplateInput): Promise<TemplateView> {
@@ -568,9 +612,9 @@ export async function fetchCronRuns(query: { jobId?: string; limit?: number } = 
   return request<CronRunPage>(`/api/crons/runs?${params.toString()}`);
 }
 
-/** 学习层：账号内所有房间 accumulated 的待确认提案与复盘流水。 */
+/** 学习层：账号内所有房间累计的待确认提案（记忆 + 技能）与复盘流水。 */
 export interface LearningSnapshot {
-  proposals: MemoryProposal[];
+  proposals: LearningProposal[];
   log: ReviewLog[];
 }
 
@@ -578,16 +622,16 @@ export async function fetchLearning(): Promise<LearningSnapshot> {
   return request<LearningSnapshot>("/api/learning");
 }
 
-/** 采纳提案：后端走受控追加通道写入长期记忆，返回写入库之后的提案（含落盘路径）。 */
-export async function applyLearningProposal(proposalId: string): Promise<MemoryProposal> {
-  const body = await request<{ proposal: MemoryProposal }>(
+/** 采纳提案：记忆走受控追加写入，技能在技能库里创建个人技能；返回落地后的提案。 */
+export async function applyLearningProposal(proposalId: string): Promise<LearningProposal> {
+  const body = await request<{ proposal: LearningProposal }>(
     `/api/learning/${encodeURIComponent(proposalId)}/apply`,
     { method: "POST", body: "{}" },
   );
   return body.proposal;
 }
 
-export async function dismissLearningProposal(proposalId: string): Promise<MemoryProposal> {
+export async function dismissLearningProposal(proposalId: string): Promise<LearningProposal> {
   const body = await request<{ proposal: MemoryProposal }>(
     `/api/learning/${encodeURIComponent(proposalId)}/dismiss`,
     { method: "POST", body: "{}" },
