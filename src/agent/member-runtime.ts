@@ -18,6 +18,7 @@ import type { WorkspaceFiles } from "../files/workspace-files";
 import { resolveTriggerRecall } from "../memory/recall";
 import { runAgentLoop } from "./loop";
 import type { LearningHost } from "./learning/types";
+import type { AdvisorService } from "./advisors/service";
 import { CRON_SENDER_ID } from "../cron/types";
 import type { CronService } from "../cron/service";
 import { resolveSilentReply } from "../cron/run-prompt";
@@ -28,6 +29,7 @@ import { buildTools } from "./tools";
 import { EvidenceLedger } from "./evidence";
 import { applyToolResultPolicy } from "./content/policy";
 import { scopeToolUnavailable } from "./run-scope";
+import { isPassText } from "../room/routing";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
 
 export interface MemberUsageRecord {
@@ -54,6 +56,8 @@ export interface RuntimeDeps {
   usage?: ModelUsageStore;
   /** 学习层：一轮成功交付之后的后台复盘（P1 只写长期记忆）。 */
   learning?: LearningHost;
+  /** 顾问扇出：动手之前先问参谋（默认关闭，见设置里的 advisors）。 */
+  advisors?: AdvisorService;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -212,15 +216,20 @@ export class MemberRuntime {
         }).catch(() => undefined);
         recallContext = recall?.context;
       }
-      const window = formatRoomWindow(bus.window(limits.maxRoomWindowChars));
+      const windowMessages = bus.window(limits.maxRoomWindowChars);
+      const window = formatRoomWindow(windowMessages);
       const messages: LlmMessage[] = [
         {
           role: "user",
           content:
             `${recallContext ? `${recallContext}\n\n` : ""}` +
-            `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(member, trigger, bus.roomMode)}`,
+            `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(member, trigger, bus.roomMode, bus.roomRouting)}`,
         },
       ];
+      // 顾问扇出（Hermes 的 MoA 群聊版）：动手之前先请几位在册成员出建议。
+      // 建议块作为**独立的一条用户消息**进本轮上下文，系统提示词一个字节都不动，前缀缓存照旧命中。
+      const guidance = await this.collectAdvice(member, trigger, windowMessages, controller);
+      if (guidance) messages.push({ role: "user", content: guidance });
       const transport = resolveModelRuntime(
         member.modelRef,
         {
@@ -342,7 +351,17 @@ export class MemberRuntime {
         trigger.senderId === CRON_SENDER_ID &&
         resolveSilentReply(result.text).quiet;
 
-      if (result.text && !silent) {
+      // pass（Hermes 的分流提质规则）：全员/自动分流派下来的消息不是命令，与自己无关的成员
+      // 用这一个词表示「这轮我沉默」。被点名的不算——那是派下来的活；主智能体也不算——它得兜底。
+      const passed =
+        !!result.text &&
+        this.member.role === "sub" &&
+        trigger.senderKind === "user" &&
+        bus.roomRouting !== "lead" &&
+        !trigger.mentions.includes(this.member.id) &&
+        isPassText(result.text);
+
+      if (result.text && !silent && !passed) {
         const message = bus.append({
           senderId: this.member.id,
           senderName: this.member.name,
@@ -360,7 +379,13 @@ export class MemberRuntime {
         if (trigger.taskId) board.linkMessage(trigger.taskId, message.id);
         this.emit({ type: "run-final", runId, memberId: this.member.id, text: result.text });
       } else {
-        this.emit({ type: "run-final", runId, memberId: this.member.id, text: result.text ?? "" });
+        // pass 这一轮什么都没交付：终局事件留空，前端不会为它渲染一条气泡。
+        this.emit({
+          type: "run-final",
+          runId,
+          memberId: this.member.id,
+          text: passed ? "" : (result.text ?? ""),
+        });
       }
       if (result.maxStepsReached) {
         this.notice(
@@ -377,8 +402,9 @@ export class MemberRuntime {
       }
       this.setStatus("idle");
       // 学习层（P1）：结论交付完之后才复盘，异步跑、不占运行槽；复盘失败不会影响本轮。
+      // 回 pass 的这一轮没有交付，不值得复盘。
       const learning = this.deps.learning;
-      if (learning && result.text) {
+      if (learning && result.text && !passed) {
         void learning.afterRun({
           memberId: this.member.id,
           memberName: member.name,
@@ -424,6 +450,38 @@ export class MemberRuntime {
       this.controller = null;
       this.silentAbort = false;
     }
+  }
+
+  /**
+   * 顾问扇出的调用点（Hermes MoA 的群聊版）：默认关闭，开了才有一次外部调用。
+   * 失败一律吞掉——参谋只能让这一轮更好，不能让它更贵地卡住或报错。
+   */
+  private async collectAdvice(
+    member: Member,
+    trigger: RoomMessage,
+    window: RoomMessage[],
+    controller: AbortController,
+  ): Promise<string | undefined> {
+    const service = this.deps.advisors;
+    if (!service) return undefined;
+    let outcome;
+    try {
+      outcome = await service.run({
+        acting: member,
+        members: this.deps.bus.listMembers(),
+        messages: window,
+        taskText: trigger.text,
+        roomId: this.deps.bus.roomId,
+        turnKey: trigger.chainRootId ?? trigger.id,
+        getModelDeps: this.deps.getModelDeps,
+        signal: controller.signal,
+      });
+    } catch {
+      return undefined;
+    }
+    // 已经被取消的这一轮不必再补一句参谋说明。
+    if (outcome.note && !controller.signal.aborted) this.notice(`顾问扇出：${outcome.note}`);
+    return outcome.guidance;
   }
 
   private setStatus(status: Member["status"]): void {

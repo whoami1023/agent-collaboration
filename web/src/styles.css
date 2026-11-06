@@ -428,6 +428,11 @@ select {
   outline-offset: 1px;
 }
 
+/* 取人方式和任务完成模式并列在同一行标题里，选项多、字号小，比模式开关再紧一档。 */
+.routing-switch .mode-option {
+  padding: 0 7px;
+}
+
 .role-pill {
   padding: 0 6px;
   border-radius: 999px;
@@ -1144,6 +1149,18 @@ body.pane-dragging * {
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--bg) 82%, transparent);
   backdrop-filter: blur(12px) saturate(1.6);
+}
+
+/* 模式开关和取人方式各占一组，窄屏下换成两行，谁也不会被挤掉。 */
+@media (max-width: 1180px) {
+  .content-header {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    height: auto;
+    min-height: 52px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
 }
 
 .content-title {
@@ -5191,6 +5208,14 @@ body.pane-dragging * {
   }
 
   .mode-pill.free {
+    border-color: transparent;
+    background: var(--accent-subtle);
+    color: var(--accent);
+  }
+
+  /* 取人方式离开默认的主智能体兜底时高亮，一眼看出这条没点名的消息会走向哪里。 */
+  .mode-pill.everyone,
+  .mode-pill.auto {
     border-color: transparent;
     background: var(--accent-subtle);
     color: var(--accent);

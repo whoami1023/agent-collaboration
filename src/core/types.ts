@@ -21,6 +21,28 @@ export type UserRole = "admin" | "user";
  */
 export type RoomMode = "delegate" | "free";
 /**
+ * 房间的取人方式（移植 Hermes 的 ROUTING_MODES）：决定一条没有点名任何人的用户消息交给谁。
+ * - lead：交给主智能体，由它拆解与 @ 分派——本项目的既有行为，因此是默认值；
+ * - everyone：本条消息唤醒花名册上所有成员，不相关的成员回 `pass` 保持沉默；
+ * - auto：先用一次不带工具、低温、短输出的小调用从花名册里挑人，挑不出来回落到 lead。
+ *
+ * 它是房间属性而不是功能开关：任何「一条消息该由谁接」的场景（问答、分工、讨论）都走同一套规则。
+ */
+export type RoomRoutingMode = "everyone" | "lead" | "auto";
+
+export const ROOM_ROUTING_MODES: readonly RoomRoutingMode[] = ["everyone", "lead", "auto"];
+
+export function isRoomRoutingMode(value: unknown): value is RoomRoutingMode {
+  return (ROOM_ROUTING_MODES as readonly unknown[]).includes(value);
+}
+
+export const ROOM_ROUTING_LABELS: Record<RoomRoutingMode, string> = {
+  lead: "主智能体",
+  everyone: "全员",
+  auto: "自动选人",
+};
+
+/**
  * 房间类型：
  * - warroom：账号绑定的作战室（`room_main`），成员名册就是账号的成员池，任务与归档都以它为主；
  * - group：「群聊区」里自建的群聊，只能从成员池拉人进来讨论，界面与作战室一致。
@@ -40,6 +62,7 @@ export interface RoomDescriptor {
 /** 房间清单对外的一行：附带实时人数、消息量与模式，供侧边栏群聊列表展示。 */
 export interface RoomInfo extends RoomDescriptor {
   mode: RoomMode;
+  routing: RoomRoutingMode;
   memberIds: string[];
   memberCount: number;
   messageCount: number;
@@ -351,6 +374,7 @@ export type RoomEvent =
   | { type: "session-archived"; archive: SessionArchiveSummary }
   | { type: "session-restored"; archive: SessionArchiveSummary }
   | { type: "mode"; mode: RoomMode }
+  | { type: "routing"; routing: RoomRoutingMode }
   | { type: "member"; member: Member }
   | { type: "member-removed"; memberId: string }
   | { type: "task"; task: TaskCard }

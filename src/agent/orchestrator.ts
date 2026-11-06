@@ -1,5 +1,5 @@
-import type { Limits, Member, RoomMessage, RoomMode, RunScopeKind } from "../core/types";
-import { DEFAULT_MODEL_REF, SYSTEM_ID, USER_ID } from "../core/types";
+import type { Limits, Member, RoomMessage, RoomMode, RoomRoutingMode, RunScopeKind } from "../core/types";
+import { DEFAULT_MODEL_REF, ROOM_ROUTING_LABELS, SYSTEM_ID, USER_ID } from "../core/types";
 import type { Settings } from "../core/settings";
 import type { ModelUsageStore } from "../model/usage-store";
 import type { MemberUsageRecord } from "./member-runtime";
@@ -7,12 +7,21 @@ import { newId } from "../core/ids";
 import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
 import { decideWakes } from "../room/wake";
+import {
+  ROUTING_LIMITS,
+  ROUTING_SWITCH_NOTICES,
+  rotateBy,
+  routingCandidates,
+  routingNeeded,
+} from "../room/routing";
+import { routeMembers } from "./route-service";
 import type { SkillLibrary } from "../skills/library";
 import { selectSkillsForText } from "../skills/matching";
 import type { MemberProfileHints } from "../memory/bootstrap-files";
 import type { MemorySearchManager } from "../memory/manager";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import { MemberRuntime } from "./member-runtime";
+import { AdvisorService } from "./advisors/service";
 import type { LearningHost } from "./learning/types";
 import { CRON_SENDER_ID } from "../cron/types";
 import type { CronTurnOutcome } from "../cron/types";
@@ -77,10 +86,19 @@ export class Orchestrator {
   /** 自由交流模式的汇总定时器与最后一次成员报告。 */
   private collectorTimer: NodeJS.Timeout | null = null;
   private collectorDue: RoomMessage | null = null;
+  /** 已经发过分流调用的消息 ID：同一条消息只问一次，重启/重放也不重复花钱。 */
+  private readonly routed = new Set<string>();
   /** 定时任务调度器：宿主需要编排器，所以由工作区在两边都建好之后回灌。 */
   private cronService?: CronService;
+  /** 顾问扇出：动手之前先问参谋；每房间一个实例，回合缓存因此不会跨房间串。 */
+  private readonly advisors: AdvisorService;
 
   constructor(private readonly deps: OrchestratorDeps) {
+    this.advisors = new AdvisorService({
+      getSettings: deps.getSettings,
+      ...(deps.usage ? { usage: deps.usage } : {}),
+      onUsageRecord: (record) => this.deps.bus.emit({ type: "model-usage", usage: record }),
+    });
     deps.bus.subscribe((event) => {
       if (event.type !== "message" || event.message.senderKind === "system") return;
       queueMicrotask(() => {
@@ -222,6 +240,24 @@ export class Orchestrator {
           : "已切换到「委派」模式：主智能体负责拆解与分派，成员只对分内任务汇报，跨成员协调经过主智能体。",
     });
     return mode;
+  }
+
+  /**
+   * 切换房间的取人方式（移植 Hermes 的 ROUTING_MODES）；随房间状态持久化，下一条消息立即生效。
+   * 只改「一条没点名的消息交给谁」，显式 @ 与成员之间的汇报链路一律不动。
+   */
+  setRoomRouting(routing: RoomRoutingMode): RoomRoutingMode {
+    const bus = this.deps.bus;
+    if (bus.roomRouting === routing) return routing;
+    bus.setRouting(routing);
+    bus.append({
+      senderId: SYSTEM_ID,
+      senderName: "系统",
+      senderKind: "system",
+      kind: "system",
+      text: `取人方式已改为「${ROOM_ROUTING_LABELS[routing]}」：${ROUTING_SWITCH_NOTICES[routing]}`,
+    });
+    return routing;
   }
 
   /** 清空聊天记录前中止所有在跑的成员：静默取消，且丢弃它们排队中的 steer。 */
@@ -407,14 +443,101 @@ export class Orchestrator {
       }
       return;
     }
-    const mode = this.deps.bus.roomMode;
-    const { wakes } = decideWakes(message, this.deps.bus.listMembers(), mode);
-    for (const memberId of wakes) this.wake(memberId, message);
+    const bus = this.deps.bus;
+    const mode = bus.roomMode;
+    const routing = bus.roomRouting;
+    const members = bus.listMembers();
+    const candidates = routingCandidates(message, members);
+    // 分流要等一次小模型调用才有结果，这一条先不唤醒任何人：routeAndWake 里要么派给挑中的人，
+    // 要么回落到主智能体。旁路条件（已 @、成员或系统消息、计划轮、可选的人太少）由 routingNeeded 判定。
+    if (routingNeeded(message, routing, candidates)) {
+      void this.routeAndWake(message, candidates);
+    } else {
+      const { wakes } = decideWakes(message, members, mode, {
+        routing,
+        // 只有开了分流（或自由交流）才需要「谁还没开口」：同级互相接话的提质规则用它。
+        unspoken: routing === "lead" && mode !== "free" ? undefined : this.unspokenMemberIds(members),
+      });
+      for (const memberId of wakes) this.wake(memberId, message);
+    }
     // 自由交流：成员报告不逐条唤醒主智能体，等讨论安静后统一收集（OpenClaw collector 语义）。
     if (mode === "free" && message.kind === "announce" && message.senderKind === "member") {
       const sender = this.deps.bus.getMember(message.senderId);
       if (sender?.role === "sub") this.scheduleCollector(message);
     }
+  }
+
+  /** 本轮（最近一条用户消息之后）还没开过口的子成员：分流把「被点名但没发言」的人拉进下一轮。 */
+  private unspokenMemberIds(members: Member[]): string[] {
+    const { spoken } = this.deps.bus.discussionState();
+    return members
+      .filter((member) => member.role === "sub" && member.status !== "cancelled" && !spoken.has(member.id))
+      .map((member) => member.id);
+  }
+
+  /**
+   * 分流调用（移植 Hermes 的 `group_router`）：这条没点名的消息该谁接。
+   * 调用回来时群况可能已经变了，所以唤醒前重新核对：房间还开着分流、消息没被 /stop 抹掉、
+   * 用户没有接着发更新的一条、挑中的人还在册——任何一条不成立就不越权。
+   * 挑不出来（解析失败、模型不可用、超时）一律回落到主智能体：分流只能让答复更准，不能没人答。
+   */
+  private async routeAndWake(message: RoomMessage, candidates: Member[]): Promise<void> {
+    if (this.routed.has(message.id)) return;
+    this.routed.add(message.id);
+    if (this.routed.size > 500) this.routed.clear();
+    const bus = this.deps.bus;
+    const main = bus.listMembers().find((member) => member.role === "main");
+    let picks: string[] = [];
+    let fellBack = false;
+    if (!this.stopped) {
+      try {
+        const outcome = await routeMembers({
+          message,
+          candidates,
+          recent: bus.listMessages(ROUTING_LIMITS.recentMessages + 1),
+          getModelDeps: () => this.modelRuntimeDeps(),
+          // 分流借用主智能体的模型引用：它只做判断，不该比正文更贵。
+          ...(main ? { modelRef: main.modelRef } : {}),
+          ...(this.deps.usage ? { usage: this.deps.usage } : {}),
+          onUsageRecord: (record) => bus.emit({ type: "model-usage", usage: record }),
+        });
+        picks = outcome.picks;
+        fellBack = outcome.reason !== "picked";
+      } catch {
+        picks = [];
+        fellBack = true;
+      }
+    }
+    if (this.stopped || message.seq <= this.stoppedThroughSeq) return;
+    if (bus.roomRouting !== "auto") return;
+    // 用户又发了更新的一条：让最新那条决定，旧的不再补刀。
+    if (bus.discussionState().sinceSeq > message.seq) return;
+    const live = new Set(
+      bus
+        .listMembers()
+        .filter((member) => member.status !== "cancelled")
+        .map((member) => member.id),
+    );
+    const chosen = picks.filter((id) => live.has(id));
+    if (chosen.length > 0) {
+      for (const memberId of rotateBy(chosen, message.seq)) this.wake(memberId, message);
+      return;
+    }
+    if (fellBack) {
+      // 回落提示一个房间只播一次：模型一直不通时每问一条都提示一遍只是刷屏。
+      const key = "routing-fallback";
+      if (!this.notices.has(key)) {
+        this.notices.add(key);
+        bus.append({
+          senderId: SYSTEM_ID,
+          senderName: "系统",
+          senderKind: "system",
+          kind: "system",
+          text: "分流没挑出人（模型不可用、超时或答复不合格式），这条消息按「主智能体」处理。",
+        });
+      }
+    }
+    if (main) this.wake(main.id, message);
   }
 
   private scheduleCollector(trigger: RoomMessage): void {
@@ -498,6 +621,16 @@ export class Orchestrator {
     timer.unref();
   }
 
+  /** 模型装配依赖：成员运行与分流调用共用同一套（含 mock、密钥引用与工作区目录）。 */
+  private modelRuntimeDeps() {
+    const deps = this.deps;
+    return {
+      settings: deps.getSettings(),
+      ...(deps.mockHandler ? { mockHandler: deps.mockHandler } : {}),
+      ...(deps.dataDir ? { dataDir: deps.dataDir } : {}),
+    };
+  }
+
   private runtimeFor(member: Member): MemberRuntime {
     let runtime = this.runtimes.get(member.id);
     if (!runtime) {
@@ -505,11 +638,7 @@ export class Orchestrator {
       runtime = new MemberRuntime(member, {
         bus: deps.bus,
         board: deps.board,
-        getModelDeps: () => ({
-          settings: deps.getSettings(),
-          ...(deps.mockHandler ? { mockHandler: deps.mockHandler } : {}),
-          ...(deps.dataDir ? { dataDir: deps.dataDir } : {}),
-        }),
+        getModelDeps: () => this.modelRuntimeDeps(),
         getLimits: () => deps.getSettings().limits,
         skills: deps.skills,
         ownerId: deps.ownerId,
@@ -519,6 +648,7 @@ export class Orchestrator {
         ...(deps.usage ? { usage: deps.usage } : {}),
         ...(deps.onUsageRecord ? { onUsageRecord: deps.onUsageRecord } : {}),
         ...(deps.learning ? { learning: deps.learning } : {}),
+        advisors: this.advisors,
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });
       this.runtimes.set(member.id, runtime);

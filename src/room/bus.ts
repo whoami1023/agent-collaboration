@@ -1,12 +1,14 @@
-import type {
-  Member,
-  MessageKind,
-  ResumeHint,
-  RoomEvent,
-  RoomMessage,
-  RoomMode,
-  RunScopeKind,
-  SenderKind,
+import {
+  isRoomRoutingMode,
+  type Member,
+  type MessageKind,
+  type ResumeHint,
+  type RoomEvent,
+  type RoomMessage,
+  type RoomMode,
+  type RoomRoutingMode,
+  type RunScopeKind,
+  type SenderKind,
 } from "../core/types";
 import { newId } from "../core/ids";
 import { resolveMentions } from "./mentions";
@@ -39,6 +41,7 @@ export class RoomBus {
   private listeners = new Set<(event: RoomEvent) => void>();
   private seq = 0;
   private mode: RoomMode = "delegate";
+  private routing: RoomRoutingMode = "lead";
 
   constructor(roomId: string, roomName: string) {
     this.roomId = roomId;
@@ -61,6 +64,16 @@ export class RoomBus {
 
   rename(roomName: string): void {
     this.name = roomName;
+  }
+
+  get roomRouting(): RoomRoutingMode {
+    return this.routing;
+  }
+
+  setRouting(routing: RoomRoutingMode): void {
+    if (this.routing === routing) return;
+    this.routing = routing;
+    this.emit({ type: "routing", routing });
   }
 
   subscribe(listener: (event: RoomEvent) => void): () => void {
@@ -168,13 +181,41 @@ export class RoomBus {
     return picked;
   }
 
-  snapshot(): { seq: number; messages: RoomMessage[]; mode: RoomMode } {
-    return { seq: this.seq, messages: this.messages, mode: this.mode };
+  /**
+   * 本轮讨论的发言情况（路由的公平性判定用）：最近一条用户消息的序号，加上那之后开过口的成员。
+   * 「被同伴点名却还没发言」的成员要不要拉进下一轮，只看这两个数，不需要额外的轮次状态。
+   */
+  discussionState(): { sinceSeq: number; spoken: Set<string> } {
+    let sinceSeq = 0;
+    for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+      const message = this.messages[i];
+      if (message && message.senderKind === "user") {
+        sinceSeq = message.seq;
+        break;
+      }
+    }
+    const spoken = new Set<string>();
+    for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+      const message = this.messages[i];
+      if (!message || message.seq <= sinceSeq) break;
+      if (message.senderKind === "member") spoken.add(message.senderId);
+    }
+    return { sinceSeq, spoken };
   }
 
-  hydrate(state: { seq?: number; messages?: RoomMessage[]; mode?: RoomMode }): void {
+  snapshot(): { seq: number; messages: RoomMessage[]; mode: RoomMode; routing: RoomRoutingMode } {
+    return { seq: this.seq, messages: this.messages, mode: this.mode, routing: this.routing };
+  }
+
+  hydrate(state: {
+    seq?: number;
+    messages?: RoomMessage[];
+    mode?: RoomMode;
+    routing?: RoomRoutingMode;
+  }): void {
     this.messages = state.messages ?? [];
     this.seq = state.seq ?? this.messages.length;
     this.mode = state.mode === "free" ? "free" : "delegate";
+    this.routing = isRoomRoutingMode(state.routing) ? state.routing : "lead";
   }
 }

@@ -1,10 +1,10 @@
 import { PLAN_WRITABLE_PREFIX } from "../core/types";
-import type { Member, RoomMessage, RoomMode } from "../core/types";
+import type { Member, RoomMessage, RoomMode, RoomRoutingMode } from "../core/types";
 import type { SkillSummary } from "../skills/library";
 import { buildMemoryPromptSection } from "../memory/prompt";
 import { buildSubagentStandingInstructions } from "./spawn/system-prompt";
 
-function clock(ts: number): string {
+export function clock(ts: number): string {
   const date = new Date(ts);
   return [date.getHours(), date.getMinutes(), date.getSeconds()]
     .map((n) => String(n).padStart(2, "0"))
@@ -251,9 +251,32 @@ export function buildInstruction(
   member: Member,
   trigger: RoomMessage,
   mode: RoomMode = "delegate",
+  routing: RoomRoutingMode = "lead",
 ): string {
   const base = instructionFor(member, trigger, mode);
-  return trigger.runScope === "plan" ? `${PLAN_ROUND_RULES}\n\n${base}` : base;
+  const rules = trigger.runScope === "plan" ? PLAN_ROUND_RULES : routingRoundRules(member, trigger, routing);
+  return rules ? `${rules}\n\n${base}` : base;
+}
+
+/**
+ * 分流规则（移植 Hermes 的分流提质条款）：只在「房间开了分流、这条用户消息没点名到你」时下发，
+ * 走的仍是逐轮消息通道，系统提示词一个字节不动（和计划轮同一套做法，不破坏前缀缓存）。
+ *
+ * 两条条款各解决一个真实故障：`pass` 治「全员广播时每个人都回一句」，
+ * 「只答自己那部分」治「四个人交回同一份总结」。
+ */
+function routingRoundRules(member: Member, trigger: RoomMessage, routing: RoomRoutingMode): string {
+  if (routing === "lead" || trigger.senderKind !== "user") return "";
+  if (trigger.mentions.includes(member.id)) return "";
+  if (member.role === "main") {
+    return `本轮消息由分流送到你面前（用户没有点名任何人）
+- 你不能沉默：这条消息最后总得有人答复，没人接时由你回答或分派。
+- 同一条消息可能同时给了好几位成员：先判断谁的结论还缺，只补那一块，或 @ 点一次该接手的人；别人已经答完整的，只给用户一句综合，不要重复汇报。`;
+  }
+  return `本轮消息由分流送到你面前（用户没有点名你）
+- 这条消息与你无关时，整条回复只写一个词：pass（群里不会发出你这条，也不需要解释）。
+- 与你有关就正常接手：一次完整结论，证据照旧带可核验的把手。
+- 同一条消息可能同时给了好几位成员：只答自己负责的那部分，不要替别人总结，也不要复述别人的结论。`;
 }
 
 function instructionFor(member: Member, trigger: RoomMessage, mode: RoomMode): string {

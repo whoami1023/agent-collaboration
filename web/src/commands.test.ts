@@ -114,12 +114,14 @@ const settings: MaskedSettings = {
     maxConcurrent: 8,
   },
   learning: { mode: "propose", everyNRuns: 2, dailyCap: 20 },
+  advisors: { enabled: false, maxAdvisors: 2, cadence: "user_turn", everyN: 3, degraded: "loud" },
 };
 
 function data(overrides: Partial<CommandData> = {}): CommandData {
   return {
     roomName: "老板 的作战室",
     mode: "delegate",
+    routing: "lead",
     members: [member("running", "主智能体"), member("idle", "调研员")],
     messages: [message("旧消息", 1), message("新消息", 2)],
     tasks: [task("todo", "调研"), task("done", "汇总")],

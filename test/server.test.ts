@@ -178,6 +178,37 @@ describe("多用户 API", () => {
     expect(bad.status).toBe(400);
   });
 
+  it("取人方式：默认 lead，everyone / auto 可切换并留系统提示，非法值 400", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const cookie = setup.cookie as string;
+
+    const initial = await call("/api/state", { cookie });
+    expect((initial.body["room"] as Record<string, unknown>)["routing"]).toBe("lead");
+
+    for (const routing of ["everyone", "auto", "lead"]) {
+      const switched = await call("/api/room", { method: "PATCH", cookie, body: { routing } });
+      expect(switched.status).toBe(200);
+      expect((switched.body["room"] as Record<string, unknown>)["routing"]).toBe(routing);
+    }
+
+    const after = await call("/api/state", { cookie });
+    expect((after.body["room"] as Record<string, unknown>)["routing"]).toBe("lead");
+    const last = (after.body["messages"] as Array<{ text: string }>).at(-1);
+    expect(last?.text).toContain("取人方式已改为「主智能体」");
+
+    const both = await call("/api/room", { method: "PATCH", cookie, body: { mode: "free", routing: "auto" } });
+    expect(both.status).toBe(200);
+    expect((both.body["room"] as Record<string, unknown>)["mode"]).toBe("free");
+    expect((both.body["room"] as Record<string, unknown>)["routing"]).toBe("auto");
+
+    for (const body of [{ routing: "round-robin" }, { routing: 1 }, {}]) {
+      expect((await call("/api/room", { method: "PATCH", cookie, body })).status).toBe(400);
+    }
+  });
+
   it("运行姿态是外部输入：只认已登记的取值，其余按普通轮", async () => {
     const setup = await call("/api/auth/setup", {
       method: "POST",
@@ -1945,6 +1976,67 @@ describe("模型设置保存与探针", () => {
     const removed = await call("/api/settings/providers/bare", { method: "DELETE", cookie });
     expect(removed.status).toBe(200);
     expect(defaultModelOf(removed.body)).toBe("demo/mock");
+  });
+
+  it("顾问扇出设置：只覆盖提交过的字段，非法值 400 并说清范围", async () => {
+    const cookie = await login();
+
+    const saved = await call("/api/settings", {
+      method: "PUT",
+      cookie,
+      body: { advisors: { enabled: true, maxAdvisors: 3, cadence: "every_n", everyN: 4 } },
+    });
+    expect(saved.status).toBe(200);
+    expect(settingsOf(saved.body)["advisors"]).toEqual({
+      enabled: true,
+      maxAdvisors: 3,
+      cadence: "every_n",
+      everyN: 4,
+      degraded: "loud",
+    });
+
+    const tuned = await call("/api/settings", {
+      method: "PUT",
+      cookie,
+      body: { advisors: { degraded: "silent", modelRef: "  demo/mock  " } },
+    });
+    expect(tuned.status).toBe(200);
+    expect(settingsOf(tuned.body)["advisors"]).toEqual({
+      enabled: true,
+      maxAdvisors: 3,
+      cadence: "every_n",
+      everyN: 4,
+      degraded: "silent",
+      modelRef: "demo/mock",
+    });
+
+    // 模型引用留空 = 跟随动手成员自己的模型，不是「存一个空串」
+    const cleared = await call("/api/settings", {
+      method: "PUT",
+      cookie,
+      body: { advisors: { modelRef: "" } },
+    });
+    expect(cleared.status).toBe(200);
+    expect(settingsOf(cleared.body)["advisors"]).not.toHaveProperty("modelRef");
+
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ enabled: "yes" }, /布尔值/],
+      [{ maxAdvisors: 0 }, /1–3/],
+      [{ maxAdvisors: 4 }, /1–3/],
+      [{ cadence: "always" }, /user_turn \/ per_iteration \/ every_n/],
+      [{ everyN: 1 }, /2–8/],
+      [{ degraded: "quiet" }, /loud 或 silent/],
+      [{ workers: 2 }, /未知的顾问扇出字段/],
+    ];
+    for (const [advisors, message] of cases) {
+      const bad = await call("/api/settings", { method: "PUT", cookie, body: { advisors } });
+      expect(bad.status).toBe(400);
+      expect(String(bad.body["error"])).toMatch(message);
+    }
+
+    // 保存失败不会把上一次的合法配置改掉
+    const stillThere = await call("/api/settings", { method: "PUT", cookie, body: {} });
+    expect(settingsOf(stillThere.body)["advisors"]).toMatchObject({ cadence: "every_n", degraded: "silent" });
   });
 });
 

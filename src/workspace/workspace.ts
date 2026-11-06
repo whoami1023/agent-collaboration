@@ -16,6 +16,7 @@ import type {
   RoomInfo,
   RoomMessage,
   RoomMode,
+  RoomRoutingMode,
   SessionArchiveDetail,
   SessionArchiveSummary,
   TaskCard,
@@ -48,6 +49,7 @@ interface PersistedState {
   seq: number;
   tasks: TaskCard[];
   mode?: RoomMode;
+  routing?: RoomRoutingMode;
 }
 
 /** v3 及更早的成员档案用 `providerId`，v4 统一为 `modelRef`（`provider/model` 或别名）。 */
@@ -100,6 +102,7 @@ const SAVE_TRIGGERS: RoomEvent["type"][] = [
   "session-archived",
   "session-restored",
   "mode",
+  "routing",
   "member",
   "member-removed",
 ];
@@ -148,7 +151,12 @@ export class Workspace {
 
     const mainBus = new RoomBus(MAIN_ROOM_ID, mainDescriptor.name);
     if (state) {
-      mainBus.hydrate({ seq: state.seq, messages: state.messages, mode: state.mode });
+      mainBus.hydrate({
+        seq: state.seq,
+        messages: state.messages,
+        mode: state.mode,
+        routing: state.routing,
+      });
       for (const member of state.members) mainBus.addMember(hydrateMember(member));
     }
     ensureMainMember(mainBus);
@@ -287,7 +295,12 @@ export class Workspace {
     if (isMain) {
       if (persisted) board.hydrate(persisted.tasks ?? []);
     } else if (persisted) {
-      bus.hydrate({ seq: persisted.seq, messages: persisted.messages, mode: persisted.mode });
+      bus.hydrate({
+        seq: persisted.seq,
+        messages: persisted.messages,
+        mode: persisted.mode,
+        routing: persisted.routing,
+      });
       // 群成员是成员池的引用：池里已经不存在的人不再复活，档案（模型、技能）以池为准。
       for (const persistedMember of persisted.members) {
         const pool = this.bus.getMember(persistedMember.id);
@@ -577,6 +590,11 @@ export class Workspace {
     return this.room(roomId).orchestrator.setRoomMode(mode);
   }
 
+  /** 房间取人方式（everyone|lead|auto）：作战室与每间群聊各自独立。 */
+  setRoomRouting(routing: RoomRoutingMode, roomId = MAIN_ROOM_ID): RoomRoutingMode {
+    return this.room(roomId).orchestrator.setRoomRouting(routing);
+  }
+
   /**
    * /clear：先静默中止本房间的在跑成员，把群聊记录与任务卡归档，再清空这间房。
    * 文件工作区是账号共享的：只有作战室的清空会把成果一起搬进归档，
@@ -698,6 +716,7 @@ export class Workspace {
     return {
       ...room.descriptor,
       mode: room.bus.roomMode,
+      routing: room.bus.roomRouting,
       memberIds: members.map((member) => member.id),
       memberCount: members.length,
       messageCount: room.bus.messageCount,
@@ -753,6 +772,7 @@ export class Workspace {
       seq: snapshot.seq,
       tasks: room.board.snapshot(),
       mode: snapshot.mode,
+      routing: snapshot.routing,
     } satisfies PersistedState);
   }
 

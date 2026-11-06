@@ -14,12 +14,13 @@ import type {
   RoomEvent,
   RoomMessage,
   RoomMode,
+  RoomRoutingMode,
   SessionArchiveDetail,
   SessionArchiveSummary,
   TaskCard,
   TaskEvidenceKind,
 } from "../../src/core/types";
-import { DEFAULT_LIMITS, LIMIT_FIELDS, RUN_SCOPE_LABELS } from "../../src/core/types";
+import { DEFAULT_LIMITS, LIMIT_FIELDS, ROOM_ROUTING_LABELS, RUN_SCOPE_LABELS } from "../../src/core/types";
 import { Icon, type IconName } from "./icons";
 import {
   LAYOUT_KEY,
@@ -99,12 +100,14 @@ import {
   setActiveRoom,
   setMemberModel,
   setRoomMode,
+  setRoomRouting,
   setupAdmin,
   startNewSession,
   subscribeEvents,
   updateProfile,
   uploadWorkspaceFile,
   workspaceFileDownloadUrl,
+  type AdvisorSettings,
   type AgentFileContent,
   type AgentFileEntry,
   type LearningSettings,
@@ -122,7 +125,7 @@ import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdo
 import { CsvPreview, RichPreviewBody } from "./FilePreviews";
 
 type ThemeMode = "light" | "dark";
-type SettingsTab = "profile" | "model" | "limits" | "learning" | "appearance";
+type SettingsTab = "profile" | "model" | "limits" | "learning" | "advisors" | "appearance";
 /** 右侧面板的三个视图：任务看板、文件工作区、归档区。 */
 type RightTab = "tasks" | "files" | "archives";
 
@@ -222,6 +225,16 @@ const RIGHT_TAB_META: Record<RightTab, { title: string; icon: IconName }> = {
   tasks: { title: "任务看板", icon: "columns" },
   files: { title: "文件工作区", icon: "folder" },
   archives: { title: "归档区", icon: "archive" },
+};
+
+/** 取人方式的展示顺序：主智能体是默认，放第一个。 */
+const ROUTING_ORDER: readonly RoomRoutingMode[] = ["lead", "everyone", "auto"];
+
+const ROUTING_TITLES: Record<RoomRoutingMode, string> = {
+  lead: "主智能体：没点名的消息交给主智能体，由它拆解并 @ 分派成员。",
+  everyone:
+    "全员：没点名的消息同时唤醒在场成员（最多 6 人），与自己无关的成员回一个 pass 就保持沉默。",
+  auto: "自动选人：没点名的消息先由一次不带工具的小调用从花名册挑人（最多 6 人），挑不出来就交回主智能体。",
 };
 
 /**
@@ -958,6 +971,7 @@ function RoomView({
   const members = state?.members ?? [];
   const tasks = state?.tasks ?? [];
   const roomMode = state?.room.mode ?? "delegate";
+  const roomRouting = state?.room.routing ?? "lead";
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -1192,6 +1206,7 @@ function RoomView({
     return {
       roomName: state?.room.name ?? "作战室",
       mode: roomMode,
+      routing: roomRouting,
       members,
       messages,
       tasks,
@@ -1207,6 +1222,19 @@ function RoomView({
       const room = await setRoomMode(mode);
       setState((current) =>
         current ? { ...current, room: { ...current.room, mode: room.mode } } : current,
+      );
+    } catch (err) {
+      setError(messageOf(err));
+    }
+  }
+
+  async function handleRoomRouting(routing: RoomRoutingMode) {
+    if (!state || state.room.routing === routing) return;
+    setError(null);
+    try {
+      const room = await setRoomRouting(routing);
+      setState((current) =>
+        current ? { ...current, room: { ...current.room, routing: room.routing } } : current,
       );
     } catch (err) {
       setError(messageOf(err));
@@ -2137,7 +2165,7 @@ function RoomView({
                 >
                   <Icon name="settings" />
                   <span className="menu-label">设置</span>
-                  <span className="menu-hint">资料 · 模型 · 限额 · 学习 · 外观</span>
+                  <span className="menu-hint">资料 · 模型 · 限额 · 学习 · 顾问 · 外观</span>
                 </button>
                 {user.role === "admin" && (
                   <button
@@ -2212,6 +2240,21 @@ function RoomView({
         >
           {roomMode === "delegate" ? "委派" : "自由"}
         </button>
+        {members.length > 1 && (
+          <button
+            type="button"
+            className={`mode-pill routing ${roomRouting}`}
+            aria-label={`当前取人方式：${ROOM_ROUTING_LABELS[roomRouting]}，点击切换`}
+            title="切换未点名消息的取人方式"
+            onClick={() =>
+              void handleRoomRouting(
+                ROUTING_ORDER[(ROUTING_ORDER.indexOf(roomRouting) + 1) % ROUTING_ORDER.length],
+              )
+            }
+          >
+            {ROOM_ROUTING_LABELS[roomRouting]}
+          </button>
+        )}
         <button
           type="button"
           className="btn icon ghost"
@@ -2282,6 +2325,26 @@ function RoomView({
               自由交流
             </button>
           </div>
+          {members.length > 1 && (
+            <div
+              className="mode-switch routing-switch"
+              role="group"
+              aria-label="未点名消息的取人方式"
+            >
+              {ROUTING_ORDER.map((routing) => (
+                <button
+                  key={routing}
+                  type="button"
+                  className={`mode-option${roomRouting === routing ? " active" : ""}`}
+                  aria-pressed={roomRouting === routing}
+                  title={ROUTING_TITLES[routing]}
+                  onClick={() => void handleRoomRouting(routing)}
+                >
+                  {ROOM_ROUTING_LABELS[routing]}
+                </button>
+              ))}
+            </div>
+          )}
           {skillsOpen ? (
             <button
               type="button"
@@ -4082,6 +4145,10 @@ function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnaps
     if (current.room.mode === event.mode) return current;
     return { ...current, room: { ...current.room, mode: event.mode } };
   }
+  if (event.type === "routing") {
+    if (current.room.routing === event.routing) return current;
+    return { ...current, room: { ...current.room, routing: event.routing } };
+  }
   if (event.type === "message") {
     if (current.messages.some((message) => message.id === event.message.id)) return current;
     return { ...current, messages: [...current.messages, event.message].slice(-400) };
@@ -4461,7 +4528,7 @@ function SettingsDialog({
         <div className="modal-head">
           <div>
             <strong>设置</strong>
-            <span className="modal-sub">账号资料、模型、运行限额与界面偏好</span>
+            <span className="modal-sub">账号资料、模型、运行限额、学习、顾问与界面偏好</span>
           </div>
           <button type="button" className="btn icon ghost" aria-label="关闭" onClick={onClose}>
             <Icon name="close" />
@@ -4503,6 +4570,14 @@ function SettingsDialog({
             </button>
             <button
               type="button"
+              className={`settings-tab${tab === "advisors" ? " active" : ""}`}
+              onClick={() => setTab("advisors")}
+            >
+              <Icon name="chat" />
+              顾问扇出
+            </button>
+            <button
+              type="button"
               className={`settings-tab${tab === "appearance" ? " active" : ""}`}
               onClick={() => setTab("appearance")}
             >
@@ -4518,6 +4593,13 @@ function SettingsDialog({
             {tab === "limits" && <LimitsSection settings={settings} onSaved={onSettingsSaved} />}
             {tab === "learning" && (
               <LearningSection
+                settings={settings}
+                modelChoices={modelChoices}
+                onSaved={onSettingsSaved}
+              />
+            )}
+            {tab === "advisors" && (
+              <AdvisorSection
                 settings={settings}
                 modelChoices={modelChoices}
                 onSaved={onSettingsSaved}
@@ -4945,6 +5027,194 @@ function LearningSection({
       <div className="modal-actions">
         <button className="btn primary" disabled={busy} onClick={() => void handleSave()}>
           {busy ? "保存中…" : "保存学习设置"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 顾问扇出（Hermes 的 MoA 群聊版）。
+ * 取值区间与服务端 `sanitizeAdvisors()` 同源，界面不会比校验宽。
+ */
+const ADVISOR_CADENCE_LABELS: Record<AdvisorSettings["cadence"], string> = {
+  user_turn: "每个用户回合一次",
+  per_iteration: "每次运行都问",
+  every_n: "每 N 次运行问一次",
+};
+
+function AdvisorSection({
+  settings,
+  modelChoices,
+  onSaved,
+}: {
+  settings: MaskedSettings;
+  modelChoices: { ref: string; label: string }[];
+  onSaved: (next: MaskedSettings) => void;
+}) {
+  const advisors = settings.advisors;
+  const [enabled, setEnabled] = useState(advisors?.enabled ?? false);
+  const [maxAdvisors, setMaxAdvisors] = useState(String(advisors?.maxAdvisors ?? 2));
+  const [cadence, setCadence] = useState<AdvisorSettings["cadence"]>(
+    advisors?.cadence ?? "user_turn",
+  );
+  const [everyN, setEveryN] = useState(String(advisors?.everyN ?? 3));
+  const [degraded, setDegraded] = useState<AdvisorSettings["degraded"]>(
+    advisors?.degraded ?? "loud",
+  );
+  const [modelRef, setModelRef] = useState(advisors?.modelRef ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  async function handleSave() {
+    if (busy) return;
+    setError(null);
+    setNote(null);
+    const count = Number(maxAdvisors.trim());
+    if (!Number.isInteger(count) || count < 1 || count > 3) {
+      setError("顾问人数需在 1–3 位之间（整数）");
+      return;
+    }
+    const interval = Number(everyN.trim());
+    if (!Number.isInteger(interval) || interval < 2 || interval > 8) {
+      setError("询问间隔需在 2–8 次运行之间（整数）");
+      return;
+    }
+    setBusy(true);
+    try {
+      const next = await saveSettings({
+        advisors: {
+          enabled,
+          maxAdvisors: count,
+          cadence,
+          everyN: interval,
+          degraded,
+          modelRef: modelRef.trim(),
+        },
+      });
+      onSaved(next);
+      const saved = next.advisors;
+      setEnabled(saved.enabled);
+      setMaxAdvisors(String(saved.maxAdvisors));
+      setCadence(saved.cadence);
+      setEveryN(String(saved.everyN));
+      setDegraded(saved.degraded);
+      setModelRef(saved.modelRef ?? "");
+      setNote("已保存，成员下一轮运行起生效");
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="settings-form">
+      <div className="section-label">顾问扇出</div>
+      <p className="hint">
+        动手的成员在执行前，先请在册成员以「顾问」身份各出一份主意：顾问拿到的是一份不含系统提示词、
+        工具调用折成一行的群聊视角，不许调用工具、也绝不声称自己做了事。意见带标签交给动手的成员，
+        由它自己判断采纳哪边。开启后每次运行会多几次模型调用，成本照常进账本。
+      </p>
+      <label className="field">
+        <span>
+          顾问扇出
+          <em>（默认关闭：不开就多一次调用都不花）</em>
+        </span>
+        <select
+          value={enabled ? "on" : "off"}
+          onChange={(event) => setEnabled(event.target.value === "on")}
+        >
+          <option value="off">关闭（执行前不问顾问）</option>
+          <option value="on">开启（执行前先听参谋意见）</option>
+        </select>
+      </label>
+      <label className="field">
+        <span>
+          顾问人数
+          <em>（1–3 位 · 按花名册顺序挑人，自动排除动手的成员本身）</em>
+        </span>
+        <input
+          type="number"
+          value={maxAdvisors}
+          min={1}
+          max={3}
+          step={1}
+          disabled={!enabled}
+          onChange={(event) => setMaxAdvisors(event.target.value)}
+        />
+      </label>
+      <label className="field">
+        <span>
+          询问节奏
+          <em>（越密越贵：同一个用户回合内还会复用一次结果）</em>
+        </span>
+        <select
+          value={cadence}
+          disabled={!enabled}
+          onChange={(event) => setCadence(event.target.value as AdvisorSettings["cadence"])}
+        >
+          {(Object.keys(ADVISOR_CADENCE_LABELS) as AdvisorSettings["cadence"][]).map((key) => (
+            <option key={key} value={key}>
+              {ADVISOR_CADENCE_LABELS[key]}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="field">
+        <span>
+          询问间隔
+          <em>（2–8 · 仅「每 N 次运行问一次」时生效）</em>
+        </span>
+        <input
+          type="number"
+          value={everyN}
+          min={2}
+          max={8}
+          step={1}
+          disabled={!enabled || cadence !== "every_n"}
+          onChange={(event) => setEveryN(event.target.value)}
+        />
+      </label>
+      <label className="field">
+        <span>
+          顾问没回话时
+          <em>（个别顾问失败只会在建议块里标注，不影响执行）</em>
+        </span>
+        <select
+          value={degraded}
+          disabled={!enabled}
+          onChange={(event) => setDegraded(event.target.value as AdvisorSettings["degraded"])}
+        >
+          <option value="loud">在群里说明一声</option>
+          <option value="silent">安静跳过</option>
+        </select>
+      </label>
+      <label className="field">
+        <span>
+          顾问模型
+          <em>（留空则跟随动手成员自己用的模型）</em>
+        </span>
+        <select value={modelRef} disabled={!enabled} onChange={(event) => setModelRef(event.target.value)}>
+          <option value="">跟随动手成员的模型</option>
+          {modelChoices
+            .filter((choice) => choice.ref !== "default")
+            .map((choice) => (
+              <option key={choice.ref} value={choice.ref}>
+                {choice.label}
+              </option>
+            ))}
+        </select>
+        <span className="hint">
+          三位顾问只靠提问角度和温度区分（稳妥 / 发散 / 挑刺），同一个密钥也能用；换个小模型能压住额外开销。
+        </span>
+      </label>
+      {error && <p className="form-error">{error}</p>}
+      {note && <p className="form-note">{note}</p>}
+      <div className="modal-actions">
+        <button className="btn primary" disabled={busy} onClick={() => void handleSave()}>
+          {busy ? "保存中…" : "保存顾问设置"}
         </button>
       </div>
     </div>

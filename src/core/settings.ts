@@ -66,6 +66,49 @@ export const DEFAULT_LEARNING: LearningSettings = {
   dailyCap: 20,
 };
 
+/** 顾问扇出的开销节奏：每次用户回合一次 / 每次动手都问 / 每 N 次动手问一次。 */
+export type AdvisorCadence = "user_turn" | "per_iteration" | "every_n";
+
+export const ADVISOR_CADENCES: readonly AdvisorCadence[] = [
+  "user_turn",
+  "per_iteration",
+  "every_n",
+];
+
+export const ADVISOR_CADENCE_LABELS: Record<AdvisorCadence, string> = {
+  user_turn: "每个用户回合一次",
+  per_iteration: "每次运行都问",
+  every_n: "每 N 次运行问一次",
+};
+
+/** 顾问调用整体失败时在群里说到什么程度：讲一句，还是只悄悄留个失败标记。 */
+export type AdvisorDegraded = "loud" | "silent";
+
+/**
+ * 顾问扇出（移植 Hermes 的 Mixture-of-Agents 循环）：动手的成员在执行前先拿几份
+ * 「只出主意、不执行」的参谋意见。默认关闭——开了就是每次运行多几次模型调用，得由用户自己决定。
+ */
+export interface AdvisorSettings {
+  enabled: boolean;
+  /** 一次请几位顾问（1–3，默认 2）；再多就是三个人的活五个人参谋。 */
+  maxAdvisors: number;
+  cadence: AdvisorCadence;
+  /** cadence 为 every_n 时的间隔（2–8）。 */
+  everyN: number;
+  /** 顾问全失败时是否在群里说明。 */
+  degraded: AdvisorDegraded;
+  /** 顾问统一使用的模型引用；留空跟随动手成员自己的模型。 */
+  modelRef?: string;
+}
+
+export const DEFAULT_ADVISORS: AdvisorSettings = {
+  enabled: false,
+  maxAdvisors: 2,
+  cadence: "user_turn",
+  everyN: 3,
+  degraded: "loud",
+};
+
 export const DEFAULT_SETTINGS: Settings = {
   settingsVersion: SETTINGS_VERSION,
   providers: [
@@ -86,6 +129,7 @@ export const DEFAULT_SETTINGS: Settings = {
   selection: DEFAULT_SELECTION,
   limits: { ...DEFAULT_LIMITS },
   learning: { ...DEFAULT_LEARNING },
+  advisors: { ...DEFAULT_ADVISORS },
 };
 
 export interface Settings {
@@ -96,6 +140,8 @@ export interface Settings {
   limits: Limits;
   /** 学习层（回合后复盘）的开关与节流；旧设置缺失时按默认值补齐。 */
   learning: LearningSettings;
+  /** 顾问扇出（动手前先问参谋）的开关与节流；默认关闭，旧设置缺失时补默认值。 */
+  advisors: AdvisorSettings;
 }
 
 /** 每次返回一份全新的默认设置：DEFAULT_SETTINGS 是共享常量，调用方不要直接改它。 */
@@ -134,6 +180,7 @@ export interface MaskedSettings {
   selection: ModelSelection;
   limits: Limits;
   learning: LearningSettings;
+  advisors: AdvisorSettings;
 }
 
 function maskModel(model: ModelDefinition): MaskedModelDefinition {
@@ -171,6 +218,7 @@ export function maskSettings(settings: Settings): MaskedSettings {
     selection: structuredClone(settings.selection),
     limits: settings.limits,
     learning: structuredClone(settings.learning),
+    advisors: structuredClone(settings.advisors),
   };
 }
 
@@ -210,6 +258,7 @@ interface LegacySettings {
   selection?: Partial<ModelSelection>;
   limits?: Partial<Limits>;
   learning?: Partial<LearningSettings>;
+  advisors?: Partial<AdvisorSettings>;
 }
 
 /**
@@ -296,6 +345,14 @@ function migrateSettings(raw: Partial<Settings>): Partial<Settings> {
         return { ...DEFAULT_LEARNING };
       }
     })(),
+    // 顾问扇出同理：老文件没有这个字段，补默认（默认关闭，不会凭空多花钱）。
+    advisors: (() => {
+      try {
+        return { ...DEFAULT_ADVISORS, ...sanitizeAdvisors(legacy.advisors ?? {}) };
+      } catch {
+        return { ...DEFAULT_ADVISORS };
+      }
+    })(),
   };
 }
 
@@ -336,6 +393,7 @@ interface SettingsPatch {
   selection?: Partial<ModelSelection>;
   limits?: Partial<Limits>;
   learning?: Partial<LearningSettings>;
+  advisors?: Partial<AdvisorSettings>;
 }
 
 /**
@@ -372,6 +430,66 @@ export function sanitizeLearning(input: unknown): Partial<LearningSettings> {
   }
   if (record.modelRef !== undefined) {
     if (typeof record.modelRef !== "string") throw new Error("复盘模型引用必须是字符串");
+    const ref = record.modelRef.trim();
+    result.modelRef = ref || undefined;
+  }
+  return result;
+}
+
+/**
+ * 校验顾问扇出设置：开关只认真假，顾问数与间隔按整数与区间收口，
+ * 节奏与降级策略只认枚举值，`modelRef` 空串视为「跟随动手成员的模型」。
+ */
+export function sanitizeAdvisors(input: unknown): Partial<AdvisorSettings> {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("advisors 必须是对象");
+  }
+  const record = input as Record<string, unknown>;
+  const known = ["enabled", "maxAdvisors", "cadence", "everyN", "degraded", "modelRef"];
+  for (const key of Object.keys(record)) {
+    if (!known.includes(key)) throw new Error(`未知的顾问扇出字段 ${key}`);
+  }
+  const result: Partial<AdvisorSettings> = {};
+  if (record.enabled !== undefined) {
+    if (typeof record.enabled !== "boolean") throw new Error("顾问扇出开关必须是布尔值");
+    result.enabled = record.enabled;
+  }
+  if (record.maxAdvisors !== undefined) {
+    if (
+      typeof record.maxAdvisors !== "number" ||
+      !Number.isInteger(record.maxAdvisors) ||
+      record.maxAdvisors < 1 ||
+      record.maxAdvisors > 3
+    ) {
+      throw new Error("顾问人数需在 1–3 位之间（整数）");
+    }
+    result.maxAdvisors = record.maxAdvisors;
+  }
+  if (record.cadence !== undefined) {
+    if (typeof record.cadence !== "string" || !ADVISOR_CADENCES.includes(record.cadence as AdvisorCadence)) {
+      throw new Error(`顾问询问节奏只能是 ${ADVISOR_CADENCES.join(" / ")}`);
+    }
+    result.cadence = record.cadence as AdvisorCadence;
+  }
+  if (record.everyN !== undefined) {
+    if (
+      typeof record.everyN !== "number" ||
+      !Number.isInteger(record.everyN) ||
+      record.everyN < 2 ||
+      record.everyN > 8
+    ) {
+      throw new Error("every_n 节奏的间隔需在 2–8 次运行之间（整数）");
+    }
+    result.everyN = record.everyN;
+  }
+  if (record.degraded !== undefined) {
+    if (record.degraded !== "loud" && record.degraded !== "silent") {
+      throw new Error("顾问失败的处理方式只能是 loud 或 silent");
+    }
+    result.degraded = record.degraded;
+  }
+  if (record.modelRef !== undefined) {
+    if (typeof record.modelRef !== "string") throw new Error("顾问模型引用必须是字符串");
     const ref = record.modelRef.trim();
     result.modelRef = ref || undefined;
   }
@@ -473,6 +591,11 @@ export function mergeSettings(base: Settings, patch: SettingsPatch): Settings {
       ...DEFAULT_LEARNING,
       ...base.learning,
       ...(patch.learning ?? {}),
+    },
+    advisors: {
+      ...DEFAULT_ADVISORS,
+      ...base.advisors,
+      ...(patch.advisors ?? {}),
     },
   };
 }

@@ -7,6 +7,7 @@ import {
   maskSettings,
   mergeSettings,
   removeProvider,
+  sanitizeAdvisors,
   sanitizeLearning,
   sanitizeLimits,
   type Settings,
@@ -40,6 +41,7 @@ import { MAX_UPLOAD_BYTES, WorkspaceFileError } from "../files/workspace-files";
 import { summaryOf } from "../archive/session-archive";
 import { buildRichPreview } from "../files/rich-preview";
 import { RoomError, roomIdFromQuery } from "../room/registry";
+import { ROOM_ROUTING_MODES, isRoomRoutingMode } from "../core/types";
 import type { RoomInstance, Workspace, WorkspaceRegistry } from "../workspace/workspace";
 import type { RoomInfo } from "../core/types";
 
@@ -186,6 +188,7 @@ export function createApp(deps: AppDeps): express.Express {
     kind: room.descriptor.kind,
     ...(room.descriptor.topic ? { topic: room.descriptor.topic } : {}),
     mode: room.bus.roomMode,
+    routing: room.bus.roomRouting,
   });
 
   const skillView = (record: SkillRecord) => {
@@ -572,16 +575,28 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
-  // 作战室任务完成模式：delegate（主智能体委派） / free（成员自由交流，主智能体收集总结）。
+  // 房间的两个独立开关：mode = delegate（主智能体委派）/ free（成员自由交流）；
+  // routing = lead（没点名就交给主智能体）/ everyone（唤醒全员，不相关的回 pass）/ auto（先小调用挑人）。
+  // 两者都支持 ?room=，所以作战室和每间群聊各调各的。
   app.patch("/api/room", async (req: Request, res: Response) => {
     const mode = bodyOf(req)["mode"];
-    if (mode !== "delegate" && mode !== "free") {
+    const routing = bodyOf(req)["routing"];
+    if (mode === undefined && routing === undefined) {
+      res.status(400).json({ error: "请至少提供 mode 或 routing" });
+      return;
+    }
+    if (mode !== undefined && mode !== "delegate" && mode !== "free") {
       res.status(400).json({ error: "mode 必须是 delegate 或 free" });
+      return;
+    }
+    if (routing !== undefined && !isRoomRoutingMode(routing)) {
+      res.status(400).json({ error: `routing 必须是 ${ROOM_ROUTING_MODES.join(" / ")}` });
       return;
     }
     const scope = await roomScope(req, res);
     if (!scope) return;
-    scope.workspace.setRoomMode(mode, scope.room.bus.roomId);
+    if (mode !== undefined) scope.workspace.setRoomMode(mode, scope.room.bus.roomId);
+    if (routing !== undefined) scope.workspace.setRoomRouting(routing, scope.room.bus.roomId);
     await scope.workspace.persistRoom(scope.room.bus.roomId);
     res.json({ room: roomView(scope.room) });
   });
@@ -1136,11 +1151,13 @@ export function createApp(deps: AppDeps): express.Express {
           : undefined;
       const limits = body.limits !== undefined ? sanitizeLimits(body.limits) : undefined;
       const learning = body.learning !== undefined ? sanitizeLearning(body.learning) : undefined;
+      const advisors = body.advisors !== undefined ? sanitizeAdvisors(body.advisors) : undefined;
       const next = mergeSettings(current, {
         ...(providers ? { providers } : {}),
         ...(selection ? { selection } : {}),
         ...(limits ? { limits } : {}),
         ...(learning ? { learning } : {}),
+        ...(advisors ? { advisors } : {}),
       });
       // 默认模型失效（指向已删/已停用的模型）时先回落到仍然可用的引用，再校验。
       const ready = repairDefaultModel(next);

@@ -7,6 +7,7 @@ import type {
   RoomKind,
   RoomMessage,
   RoomMode,
+  RoomRoutingMode,
   RunScopeKind,
   SessionArchiveDetail,
   SessionArchiveSummary,
@@ -21,6 +22,7 @@ import type {
   CronSchedule,
 } from "../../src/cron/types";
 import type { ProviderApi } from "../../src/model/types";
+import type { AdvisorSettings } from "../../src/core/settings";
 import type {
   LearningProposal,
   LearningSettings,
@@ -30,8 +32,9 @@ import type {
 } from "../../src/agent/learning/types";
 
 export type { LearningProposal, LearningSettings, MemoryProposal, ReviewLog, SkillProposal };
+export type { AdvisorSettings };
 
-export type { RoomInfo, RoomKind, RoomMode };
+export type { RoomInfo, RoomKind, RoomMode, RoomRoutingMode };
 
 export interface MaskedModel {
   id: string;
@@ -72,10 +75,18 @@ export interface MaskedSettings {
   selection: ModelSelectionView;
   limits: Limits;
   learning: LearningSettings;
+  advisors: AdvisorSettings;
 }
 
 export interface StateSnapshot {
-  room: { id: string; name: string; kind: RoomKind; topic?: string; mode: RoomMode };
+  room: {
+    id: string;
+    name: string;
+    kind: RoomKind;
+    topic?: string;
+    mode: RoomMode;
+    routing: RoomRoutingMode;
+  };
   members: Member[];
   messages: RoomMessage[];
   tasks: TaskCard[];
@@ -714,11 +725,23 @@ export async function kickRoomMember(roomId: string, memberId: string): Promise<
 
 export async function setRoomMode(
   mode: RoomMode,
-): Promise<{ id: string; name: string; kind: RoomKind; mode: RoomMode }> {
-  const body = await request<{ room: { id: string; name: string; kind: RoomKind; mode: RoomMode } }>(
-    withRoom("/api/room"),
-    { method: "PATCH", body: JSON.stringify({ mode }) },
-  );
+): Promise<{ id: string; name: string; kind: RoomKind; mode: RoomMode; routing: RoomRoutingMode }> {
+  const body = await request<{
+    room: { id: string; name: string; kind: RoomKind; mode: RoomMode; routing: RoomRoutingMode };
+  }>(withRoom("/api/room"), { method: "PATCH", body: JSON.stringify({ mode }) });
+  return body.room;
+}
+
+/**
+ * 房间取人方式：一条没点名的用户消息交给谁。
+ * 和 mode 一样按当前房间走（`withRoom` 自动带 `?room=`），所以作战室和每间群聊各调各的。
+ */
+export async function setRoomRouting(
+  routing: RoomRoutingMode,
+): Promise<{ id: string; name: string; kind: RoomKind; mode: RoomMode; routing: RoomRoutingMode }> {
+  const body = await request<{
+    room: { id: string; name: string; kind: RoomKind; mode: RoomMode; routing: RoomRoutingMode };
+  }>(withRoom("/api/room"), { method: "PATCH", body: JSON.stringify({ routing }) });
   return body.room;
 }
 
@@ -1054,6 +1077,8 @@ export async function saveSettings(patch: {
   limits?: Partial<Limits>;
   /** 学习层开关：模式 / 复盘频率 / 每日上限 / 复盘模型。 */
   learning?: Partial<LearningSettings>;
+  /** 顾问扇出开关：是否启用 / 顾问人数 / 询问节奏 / every_n 间隔 / 失败处理 / 顾问模型。 */
+  advisors?: Partial<AdvisorSettings>;
 }): Promise<MaskedSettings> {
   const body = await request<{ settings: MaskedSettings }>("/api/settings", {
     method: "PUT",

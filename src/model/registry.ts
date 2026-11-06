@@ -82,11 +82,17 @@ class FailoverProvider implements LlmProvider {
         for await (const event of entry.provider.stream({
           ...request,
           model: entry.request.model ?? request.model,
-          ...(entry.request.params ? { params: entry.request.params } : {}),
+          // 传输装配出来的是「这个模型默认怎么发」，调用方显式给的采样与上限是这一轮的主张：
+          // 分流要 temperature=0、顾问要各自的槽位温度、两者都要更小的 maxTokens，不能被默认形状盖掉。
+          ...(entry.request.params || request.params
+            ? { params: { ...(entry.request.params ?? {}), ...(request.params ?? {}) } }
+            : {}),
           ...(entry.request.headers ? { headers: entry.request.headers } : {}),
           ...(entry.request.baseUrl ? { baseUrl: entry.request.baseUrl } : {}),
           ...(entry.request.timeoutMs !== undefined ? { timeoutMs: entry.request.timeoutMs } : {}),
-          ...(entry.request.maxTokens !== undefined ? { maxTokens: entry.request.maxTokens } : {}),
+          ...(request.maxTokens ?? entry.request.maxTokens) !== undefined
+            ? { maxTokens: request.maxTokens ?? entry.request.maxTokens }
+            : {},
         })) {
           emitted = true;
           yield event;
