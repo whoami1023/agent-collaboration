@@ -1,7 +1,7 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import { createReadStream, existsSync } from "node:fs";
 import { join } from "node:path";
-import type { Member, TaskStatus } from "../core/types";
+import type { Member, RunScopeKind, TaskStatus } from "../core/types";
 import {
   clearProviderKey,
   maskSettings,
@@ -623,8 +623,11 @@ export function createApp(deps: AppDeps): express.Express {
     }
     const scope = await roomScope(req, res);
     if (!scope) return;
+    // 运行姿态是外部输入：只认已登记的取值，别的（含拼错的 plan）一律按普通轮处理。
+    const rawRunScope = stringField(bodyOf(req), "runScope");
+    const runScope: RunScopeKind | undefined = rawRunScope === "plan" ? "plan" : undefined;
     try {
-      const message = scope.room.orchestrator.sendUserMessage(text);
+      const message = scope.room.orchestrator.sendUserMessage(text, runScope);
       res.status(201).json({ message });
     } catch (err) {
       res.status(400).json({ error: errorMessage(err) });

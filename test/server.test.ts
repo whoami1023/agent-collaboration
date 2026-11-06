@@ -178,6 +178,38 @@ describe("多用户 API", () => {
     expect(bad.status).toBe(400);
   });
 
+  it("运行姿态是外部输入：只认已登记的取值，其余按普通轮", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", displayName: "老板", password: "secret123" },
+    });
+    const cookie = setup.cookie as string;
+
+    const planned = await call("/api/messages", {
+      method: "POST",
+      cookie,
+      body: { text: "先别动手，出个计划", runScope: "plan" },
+    });
+    expect(planned.status).toBe(201);
+    const planMessage = (planned.body["message"] as Record<string, unknown>)["runScope"];
+    expect(planMessage).toBe("plan");
+
+    // 拼错或伪造的取值不进入姿态表：这一轮照常是普通轮，不会拿到一个「未知姿态」的空规则集。
+    for (const value of ["Plan", "planner", "", "  plan  ", 42, true]) {
+      const posted = await call("/api/messages", {
+        method: "POST",
+        cookie,
+        body: { text: `带姿态 ${JSON.stringify(value)} 的消息`, runScope: value },
+      });
+      expect(posted.status).toBe(201);
+      expect((posted.body["message"] as Record<string, unknown>)["runScope"]).toBeUndefined();
+    }
+
+    const after = await call("/api/state", { cookie });
+    const messages = after.body["messages"] as Array<{ text: string; runScope?: string }>;
+    expect(messages.filter((item) => item.runScope === "plan")).toHaveLength(1);
+  });
+
   it("个人资料更新：房间名同步、其他会话失效、新密码可登录", async () => {
     const setup = await call("/api/auth/setup", {
       method: "POST",

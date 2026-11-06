@@ -234,7 +234,25 @@ export interface RoomMessage {
   chainRootId?: string;
   depthTurn?: number;
   resume?: ResumeHint;
+  /**
+   * 本轮的运行姿态（run scope）。由用户消息带上，该轮里智能体发回的消息继承同一个值，
+   * 于是「这一轮被收窄成什么」既能决定工具清单，也能决定唤醒规则。缺省等于 normal。
+   */
+  runScope?: RunScopeKind;
 }
+
+/**
+ * 运行姿态：对「这一轮允许做什么」的一次性声明，移植自 Hermes 的 plan mode，
+ * 但做成通用闸门而不是某个命令的专属逻辑——姿态表决定只读工具白名单与写入前缀，
+ * 将来「危险动作先要批准」「无人值守不许删」都往这里加，不新增别的语义。
+ */
+export type RunScopeKind = "plan";
+
+/** 计划轮允许写入的文件前缀（相对文件工作区根）；其余一律只读。 */
+export const PLAN_WRITABLE_PREFIX = "plans/";
+
+/** 姿态在界面上的标记：让「这一轮被收窄成什么」看得见，而不是只藏在工具清单里。 */
+export const RUN_SCOPE_LABELS: Record<RunScopeKind, string> = { plan: "计划轮" };
 
 export interface ArtifactRef {
   name: string;

@@ -334,6 +334,10 @@ describe("复盘提示词（prompt）", () => {
     expect(LEARNING_SYSTEM_PROMPT).toContain(String(LEARNING_RULES.maxSkillsPerReview));
     expect(LEARNING_SYSTEM_PROMPT).not.toContain("pnpm");
     expect(LEARNING_SYSTEM_PROMPT).not.toContain("room_main");
+    // Hermes 的 DO_NOT_CAPTURE：失败序列不得包装成可靠流程。
+    expect(LEARNING_SYSTEM_PROMPT).toContain("没跑通的做法不是技能");
+    expect(LEARNING_SYSTEM_PROMPT).toContain("不要写死路");
+    expect(LEARNING_SYSTEM_PROMPT).toContain("指不出出处的「事实」不要记");
   });
 
   it("用户素材分区拼装并各自截断，末尾固定要求输出 JSON", () => {

@@ -1,4 +1,4 @@
-import type { Limits, Member, RoomMessage, RoomMode } from "../core/types";
+import type { Limits, Member, RoomMessage, RoomMode, RunScopeKind } from "../core/types";
 import { DEFAULT_MODEL_REF, SYSTEM_ID, USER_ID } from "../core/types";
 import type { Settings } from "../core/settings";
 import type { ModelUsageStore } from "../model/usage-store";
@@ -99,7 +99,7 @@ export class Orchestrator {
     return this.active;
   }
 
-  sendUserMessage(text: string): RoomMessage {
+  sendUserMessage(text: string, runScope?: RunScopeKind): RoomMessage {
     const trimmed = text.trim();
     if (!trimmed) throw new Error("消息不能为空");
     return this.deps.bus.append({
@@ -109,6 +109,7 @@ export class Orchestrator {
       kind: "chat",
       text: trimmed,
       depthTurn: 0,
+      ...(runScope ? { runScope } : {}),
     });
   }
 

@@ -7,6 +7,7 @@ import type {
   RoomKind,
   RoomMessage,
   RoomMode,
+  RunScopeKind,
   SessionArchiveDetail,
   SessionArchiveSummary,
   TaskCard,
@@ -721,10 +722,17 @@ export async function setRoomMode(
   return body.room;
 }
 
-export async function sendMessage(text: string): Promise<RoomMessage> {
+/**
+ * 发一条群聊消息。runScope 把这一轮收窄成某种运行姿态（如计划轮）：
+ * 服务端据此挑工具清单与唤醒规则，这一轮智能体发回的消息都继承同一个姿态。
+ */
+export async function sendMessage(
+  text: string,
+  runScope?: RunScopeKind,
+): Promise<RoomMessage> {
   const body = await request<{ message: RoomMessage }>(withRoom("/api/messages"), {
     method: "POST",
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(runScope ? { text, runScope } : { text }),
   });
   return body.message;
 }

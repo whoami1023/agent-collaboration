@@ -25,6 +25,7 @@ import { DEFAULT_COMPACTION_SETTINGS } from "./context/compaction";
 import { resolveMaxActiveTranscriptBytes, type TranscriptByteCompactionLatch } from "./context/bounded-context";
 import type { ContextBudgetConfig } from "./context/budget";
 import { buildTools } from "./tools";
+import { scopeToolUnavailable } from "./run-scope";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
 
 export interface MemberUsageRecord {
@@ -159,10 +160,13 @@ export class MemberRuntime {
         this.deps.skills.listForAgent(this.deps.ownerId),
         member.skillNames,
       );
+      // 运行姿态（本轮工具集收窄）由触发消息带下来；同一轮里成员自己发的消息也继承这个姿态。
+      const runScope = trigger.runScope;
       const tools = buildTools(member, {
         bus,
         board,
         skills: this.deps.skills,
+        runScope,
         userId: this.deps.ownerId,
         getCron: () => this.deps.getCron?.(),
         ...(this.deps.memory ? { memory: this.deps.memory } : {}),
@@ -276,6 +280,7 @@ export class MemberRuntime {
         system,
         messages,
         tools,
+        ...(runScope ? { toolUnavailable: (name: string) => scopeToolUnavailable(runScope, name) } : {}),
         maxSteps: limits.maxStepsPerRun,
         signal: controller.signal,
         budget,
@@ -341,6 +346,8 @@ export class MemberRuntime {
           chainRootId: trigger.chainRootId ?? trigger.id,
           depthTurn: (trigger.depthTurn ?? 0) + 1,
           ...(trigger.taskId ? { taskId: trigger.taskId } : {}),
+          // 姿态跟着这一轮产出的消息走：唤醒规则用它挡住计划轮的 @，界面也靠它标出「计划轮」。
+          ...(trigger.runScope ? { runScope: trigger.runScope } : {}),
         });
         if (trigger.taskId) board.linkMessage(trigger.taskId, message.id);
         this.emit({ type: "run-final", runId, memberId: this.member.id, text: result.text });

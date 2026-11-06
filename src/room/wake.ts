@@ -22,6 +22,12 @@ export function decideWakes(
       skipped.push({ memberId, reason: "自己 @ 自己，忽略" });
       continue;
     }
+    // 运行姿态闸门：计划轮（以及以后任何只读姿态）里智能体发出的 @ 不唤醒成员。
+    // 用户自己发的 /plan 消息仍可唤醒主智能体去出计划，挡的是这一轮把活真的派下去。
+    if (message.runScope && message.senderKind !== "user") {
+      skipped.push({ memberId, reason: "本轮是计划轮（只读），@ 不会唤醒成员；等用户批准后再派活" });
+      continue;
+    }
     if (message.senderKind === "user") {
       wakes.add(memberId);
       continue;

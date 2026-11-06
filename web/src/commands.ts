@@ -4,6 +4,7 @@ import {
   type Member,
   type RoomMessage,
   type RoomMode,
+  type RunScopeKind,
   type TaskCard,
 } from "../../src/core/types";
 import type { MaskedSettings } from "./api";
@@ -12,11 +13,25 @@ export interface SlashCommandDef {
   name: string;
   usage: string;
   summary: string;
+  /** 该命令是否接受参数；不接受参数的命令带着参数输入会被挡下，不给错的执行。 */
+  acceptsArgs?: boolean;
+  /**
+   * 该命令把这一轮收窄成某种运行姿态：命令文字照常发给智能体，但服务端按姿态表挑工具清单
+   * 与唤醒规则。这是「命令 → 姿态」的一张表，加一种姿态只改这里，不改命令分发逻辑。
+   */
+  runScope?: RunScopeKind;
 }
 
 /** 前端本地命令表：解析、帮助文案与可用性共用一份，避免散落的正则。 */
 export const SLASH_COMMANDS: SlashCommandDef[] = [
   { name: "help", usage: "/help", summary: "查看可用命令与说明" },
+  {
+    name: "plan",
+    usage: "/plan <要规划的事>",
+    summary: "计划轮：只读地把这一轮的活查清楚、写成 plans/ 下的计划与任务卡，等你批准再执行",
+    acceptsArgs: true,
+    runScope: "plan",
+  },
   {
     name: "new",
     usage: "/new",
@@ -29,6 +44,7 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
     name: "model",
     usage: "/model [@成员] [模型引用]",
     summary: "查看可选模型与成员当前模型；带引用即为该成员切换模型",
+    acceptsArgs: true,
   },
   {
     name: "context",
@@ -283,11 +299,18 @@ export function buildModelReport(data: CommandData): string {
 }
 
 export function buildHelpReport(): string {
+  const posted = SLASH_COMMANDS.filter((command) => command.runScope);
+  const local = SLASH_COMMANDS.filter((command) => !command.runScope);
+  const line = (command: SlashCommandDef) => `· ${command.usage} — ${command.summary}`;
   return [
-    "可用命令（在本机执行，不会作为聊天消息发给智能体）",
-    ...SLASH_COMMANDS.map((command) => `· ${command.usage} — ${command.summary}`),
+    "可用命令",
+    ...(local.length > 0 ? ["", "本机执行，不会作为聊天消息发给智能体：", ...local.map(line)] : []),
+    ...(posted.length > 0
+      ? ["", "发给智能体的一轮，命令文字照常是这一轮的议题，只是工具集被收窄：", ...posted.map(line)]
+      : []),
     "",
     "/new 只把聊天记录与任务卡归档起来，文件工作区、成员与智能体记忆都不动，适合换一个新任务；/clear 连文件成果一起归档。",
     "/clear 与 /stop 会影响正在运行的成员；两者归档的内容都能在右侧「归档」恢复，智能体记忆不受影响。",
+    "/plan 那一轮里智能体只能读、只能写 plans/ 下的计划文件、只能建任务卡，@ 成员也不会唤醒他们；批准之后再用普通消息让它开工。",
   ].join("\n");
 }

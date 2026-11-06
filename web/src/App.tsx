@@ -18,7 +18,7 @@ import type {
   SessionArchiveSummary,
   TaskCard,
 } from "../../src/core/types";
-import { DEFAULT_LIMITS, LIMIT_FIELDS } from "../../src/core/types";
+import { DEFAULT_LIMITS, LIMIT_FIELDS, RUN_SCOPE_LABELS } from "../../src/core/types";
 import { Icon, type IconName } from "./icons";
 import {
   LAYOUT_KEY,
@@ -51,6 +51,7 @@ import {
   parseSlashCommand,
   suggestSlashCommands,
   type CommandData,
+  type SlashCommandDef,
 } from "./commands";
 import {
   ApiError,
@@ -1227,15 +1228,29 @@ function RoomView({
     }
   }
 
-  async function runSlashCommand(name: string, args: string) {
-    if (args && name !== "help" && name !== "model") {
+  async function runSlashCommand(command: SlashCommandDef, args: string) {
+    if (args && !command.acceptsArgs) {
       setCommandOutput({
-        title: `/${name}`,
-        body: `/${name} 不接受参数。用法：/${name}`,
+        title: `/${command.name}`,
+        body: `/${command.name} 不接受参数。用法：${command.usage}`,
       });
       return;
     }
-    switch (name) {
+    // 带姿态的命令不本机执行：把议题作为这一轮的消息发出去，服务端按姿态表收窄工具集与唤醒规则。
+    if (command.runScope) {
+      setCommandOutput(null);
+      setError(null);
+      try {
+        await sendMessage(
+          args || "请针对群里最近的用户议题出一份执行计划：先查清现状，再给出可验收的步骤与任务卡。",
+          command.runScope,
+        );
+      } catch (err) {
+        setError(messageOf(err));
+      }
+      return;
+    }
+    switch (command.name) {
       case "new":
         setCommandOutput(null);
         await handleNewSession();
@@ -1449,7 +1464,7 @@ function RoomView({
         return;
       }
       setError(null);
-      await runSlashCommand(parsed.command.name, parsed.args);
+      await runSlashCommand(parsed.command, parsed.args);
       return;
     }
     setDraft("");
@@ -4110,6 +4125,14 @@ function MessageBubble({
       <header className="bubble-head">
         <span className="sender">{isUser ? "你" : `@${message.senderName}`}</span>
         {message.kind === "announce" && <span className="chip accent">报告</span>}
+        {message.runScope && (
+          <span
+            className="chip"
+            title="这一轮的工具集被收窄：只能读、只能写计划文件，改动要等你批准后另行派发"
+          >
+            {RUN_SCOPE_LABELS[message.runScope]}
+          </span>
+        )}
         {message.taskId && <span className="chip">{message.taskId.slice(0, 12)}</span>}
         {toggleable && (
           <button

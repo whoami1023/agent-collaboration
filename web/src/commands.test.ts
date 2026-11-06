@@ -154,6 +154,12 @@ describe("斜杠命令解析", () => {
       kind: "command",
       command: { name: "context" },
     });
+    // 议题整段留在 args 里，作为这一轮的消息正文发出去。
+    expect(parseSlashCommand("/plan 调研多智能体协同的调度方式")).toMatchObject({
+      kind: "command",
+      command: { name: "plan", runScope: "plan", acceptsArgs: true },
+      args: "调研多智能体协同的调度方式",
+    });
   });
 
   it("未知命令单独标记，普通文本 / 单独的斜杠不拦截", () => {
@@ -166,6 +172,7 @@ describe("斜杠命令解析", () => {
   it("命令表覆盖全部本地命令", () => {
     expect(SLASH_COMMANDS.map((command) => command.name)).toEqual([
       "help",
+      "plan",
       "new",
       "clear",
       "stop",
@@ -173,6 +180,19 @@ describe("斜杠命令解析", () => {
       "model",
       "context",
     ]);
+  });
+
+  it("/plan 是「命令 → 运行姿态」表里的一项：带议题、收窄这一轮", () => {
+    const command = SLASH_COMMANDS.find((item) => item.name === "plan");
+    expect(command?.usage).toBe("/plan <要规划的事>");
+    expect(command?.acceptsArgs).toBe(true);
+    expect(command?.runScope).toBe("plan");
+    expect(command?.summary).toContain("只读");
+    expect(command?.summary).toContain("等你批准");
+    // 其余命令都是本机执行，不带姿态。
+    for (const item of SLASH_COMMANDS.filter((entry) => entry.name !== "plan")) {
+      expect(item.runScope).toBeUndefined();
+    }
   });
 
   it("/new 的说明要说清「与上一个任务无关」且保留文件工作区", () => {
@@ -371,6 +391,9 @@ describe("命令报告", () => {
     expect(help).toContain("/new 只把聊天记录与任务卡归档起来");
     expect(help).toContain("/clear 连文件成果一起归档");
     expect(help).toContain("都能在右侧「归档」恢复");
+    // 带姿态的命令分一组列出：它确实会发进群里，只是这一轮被收窄。
+    expect(help).toContain("发给智能体的一轮，命令文字照常是这一轮的议题，只是工具集被收窄：");
+    expect(help).toContain("只能写 plans/ 下的计划文件");
   });
 });
 

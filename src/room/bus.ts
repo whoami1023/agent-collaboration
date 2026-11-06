@@ -5,6 +5,7 @@ import type {
   RoomEvent,
   RoomMessage,
   RoomMode,
+  RunScopeKind,
   SenderKind,
 } from "../core/types";
 import { newId } from "../core/ids";
@@ -23,6 +24,8 @@ export interface AppendInput {
   chainRootId?: string;
   depthTurn?: number;
   resume?: ResumeHint;
+  /** 本轮运行姿态；见 RoomMessage.runScope。缺省按 normal 处理。 */
+  runScope?: RunScopeKind;
 }
 
 const MAX_MESSAGES = 2000;
@@ -141,6 +144,7 @@ export class RoomBus {
       ...(input.chainRootId ? { chainRootId: input.chainRootId } : {}),
       ...(input.depthTurn !== undefined ? { depthTurn: input.depthTurn } : {}),
       ...(input.resume ? { resume: input.resume } : {}),
+      ...(input.runScope ? { runScope: input.runScope } : {}),
     };
     this.messages.push(message);
     if (this.messages.length > MAX_MESSAGES) {

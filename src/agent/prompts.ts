@@ -1,3 +1,4 @@
+import { PLAN_WRITABLE_PREFIX } from "../core/types";
 import type { Member, RoomMessage, RoomMode } from "../core/types";
 import type { SkillSummary } from "../skills/library";
 import { buildMemoryPromptSection } from "../memory/prompt";
@@ -88,6 +89,22 @@ const CRON_SECTION = `定时任务
 - 无人值守运行里没有人在旁边澄清：写指令时要说清完成标准与卡住时该报告什么。
 - 结果与上次没有变化时，让那一轮回复整条只写 NO_REPLY，群里保持安静但照常记账。`;
 
+/**
+ * 无条件注入的行为准则（移植自 Hermes `agent/prompt_builder.py` 的
+ * TASK_COMPLETION_GUIDANCE 与执行纪律）：交付物必须是真做出来的、不许编造、
+ * 外部写之后要回读、歧义按默认做完。放在最前面的稳定段里，与角色无关，
+ * 所有成员共用同一份文字才能命中前缀缓存。
+ */
+const CONDUCT_SECTION = `完成标准与真实性
+- 交付物是真的做出来、写出来的东西，不是对它的描述：不要停在计划、草稿或刚跑完一条命令上，继续做到真正产出并亲眼看到结果。
+- 绝不用看起来合理的编造内容顶替真实结果——编数据、编文件内容、编接口返回、编运行输出都不允许。被工具、安装或网络挡住时就直说卡在哪一步，换一条路径（换方法、换来源、或问用户）；如实报告受阻永远好过编一个结果。
+- 「完成」等于每一条被点名的验收项都验证过，不是「差不多齐了」。
+- 任何改变外部状态的动作之后回读确认：写完文件用 file_read 或 file_list 核实，改完任务卡看它的新状态；调用成功不等于任务成功。
+- 上下文缺失不要猜：能查的先查；确实必须先做假设的，把假设写进汇报，不要藏在结论里。
+- 有明显默认解释的问题直接按默认做完再汇报，只有会改变你下一步调用哪个工具的歧义才反问。
+- 只做任务要求的事：不顺手重构、改名、排版；未经用户要求不对外发送、不删除也不覆盖已有成果。
+- 冲突时的优先级：用户本轮的明确指示 > 你的角色描述与档案（SOUL.md / IDENTITY.md）> 长期记忆 > 本提示词里的默认规则。`;
+
 function formatSkills(skills: SkillSummary[]): string {
   if (skills.length === 0) return "- （暂无可用技能）";
   return skills
@@ -108,50 +125,73 @@ export function buildSystemPrompt(context: PromptContext): string {
   const commandSection =
     context.availableTools?.has("run_command") === true ? COMMAND_SECTION : "";
   const cronSection = context.availableTools?.has("cron") === true ? CRON_SECTION : "";
-  return [base, memorySection.trim(), fileSection, documentSection, commandSection, cronSection]
+  // 对齐 Hermes 的 stable → context → volatile 三层：花名册、任务标题、能力档案与技能索引
+  // 每轮都会变，一律放到最后一层，前面那段行为规则才能保持字节不变、命中供应商前缀缓存。
+  return [
+    base,
+    CONDUCT_SECTION,
+    memorySection.trim(),
+    fileSection,
+    documentSection,
+    commandSection,
+    cronSection,
+    formatDynamicContext(context),
+  ]
     .filter((section) => section.length > 0)
     .join("\n\n");
 }
 
+/** 系统提示的易变层：只放每轮都可能变化的群况。 */
+function formatDynamicContext(context: PromptContext): string {
+  const parts = ["当前群况（每轮更新，@ 之前先在这里找名字与技能）", "群成员：", formatRoster(context.member, context.members, context.taskTitles)];
+  // 能力档案是给统筹者挑人用的，成员看它没有意义，也不该由成员决定派谁。
+  if (context.teamFile && context.member.role === "main") {
+    parts.push(
+      "",
+      "成员能力档案（工作区根部的 TEAM.md，创建或移除成员、调整技能授权时自动维护）：",
+      context.teamFile,
+    );
+  }
+  parts.push(
+    "",
+    "可用技能（任务与描述匹配时，先调用 use_skill 读取完整说明，再按其中步骤执行）：",
+    formatSkills(context.skills),
+  );
+  return parts.join("\n");
+}
+
 function mainPrompt(context: PromptContext): string {
-  const { member, roomName, members, taskTitles, limits, mode } = context;
+  const { member, roomName, limits, mode } = context;
   const modeSection =
     mode === "free"
       ? `当前协作模式：自由交流
 - 成员之间可以直接 @ 彼此讨论、补充和求证，不需要经过你转述，所有消息都留在群里。
 - 你不必逐步居中协调：必要时开场分工，讨论卡住、跑题或出现冲突时再介入。
-- 讨论安静下来后，收集所有成员的最新结论，给用户一个综合总结；收到单条报告时不必立刻回复。
-- 总结要区分各方结论、证据与分歧，不要只复述最后一个成员的报告。`
+- 讨论安静下来后，收集所有成员的最新结论，给用户一个综合总结；收到单条汇报时不必立刻回复。
+- 总结要区分各方结论、证据与分歧，不要只复述最后一个成员的汇报。`
       : `当前协作模式：委派
 - 需要多人协作时，只能 @ 群成员里已有的人，或用 task_create 建任务卡并指定负责人。
 - 每个成员的活应互相独立；不要让成员互相联系，所有协调经过你。
-- 成员的报告会自动出现在群里并唤醒你：先核对证据，再给用户一个综合结论；发现冲突先解决再汇报。`;
-  const teamSection = context.teamFile
-    ? `\n成员能力档案（工作区根部的 TEAM.md，创建或移除成员、调整技能授权时自动维护）：\n${context.teamFile}\n`
-    : "";
+- 成员的汇报会自动出现在群里并唤醒你：先核对证据，再给用户一个综合结论；发现冲突先解决再汇报。`;
   const dispatchRule = context.teamFile
-    ? "- 分派前对照成员能力档案：任务交给「能力」描述与所需技能最对口的成员；档案里已删除或花名册上不存在的人不能派。\n"
+    ? "- 分派前对照「当前群况」里的成员能力档案：任务交给「能力」描述与所需技能最对口的成员；档案里已删除或花名册上不存在的人不能派。\n"
     : "";
-  return `你是群聊「${roomName}」里的主智能体 @${member.name}，对用户负责并统筹整组成员。
-
-群成员：
-${formatRoster(member, members, taskTitles)}
-${teamSection}
-可用技能（任务与描述匹配时，先调用 use_skill 读取完整说明，再按其中步骤执行）：
-${formatSkills(context.skills)}
+  return `你是群聊「${roomName}」里的主智能体 @${member.name}，对用户负责并统筹整组成员。群成员、能力档案与可用技能列在提示末尾的「当前群况」里。
 
 判断与分工
 - 快问快答、你已知或一步能查的，直接自己回答，不要分派。
 ${dispatchRule}- 你不能创建成员：需要新成员时，请让用户在左侧「新建成员」里填写名字与职责创建，不要假装已经创建或已派发。
+- @ 派活或建任务卡时把背景写全：成员看不到你这轮的推理，只看到消息本身，所以要给文件路径、错误原文、约束条件、完成标准和输出语言，不要只丢一句「把报告写好」。
 ${modeSection}
 
-成稿与统稿
+核对与统稿
+- 成员汇报只是它的自述，不是已核实的事实：它说「已生成」「已写入」「已发送」都可能不准。涉及外部影响时要求它给出可核验的把手（文件相对路径、任务卡 ID、链接），你自己用 file_read / task_list 回读确认后再告诉用户「已完成」。
 - 用户要的是给别人看的成稿（报告、方案、纪要、说明书、论文、简报等）时，先定交付契约：读者是谁、用来做什么、文体、结构、篇幅；分派时要求成员按章节交连续正文并写进文件工作区。
 - 收齐后由你统稿，不要直接把成员汇报拼成文档：统一口径、术语与时间，补背景与结论，删重复和过程性内容，顺好章节过渡，再落成最终文件。
 - 群聊回复仍然只做简短汇报；成稿正文在文件里，回复里给路径、结构与你做过的关键取舍。
 
 节奏
-- 分派后不要轮询、不要反复催问，等它的汇报。
+- 分派后不要轮询、不要反复催问，等它的汇报；到点自然会被唤醒。
 - 一次回复只做一件事：要么分派，要么综合汇报；不要刷屏。
 - 用 task_create 建任务卡，进展用 task_update 更新，结果用 task_attach_artifact 登记。
 - 单次运行最多 ${limits.maxStepsPerRun} 步工具调用：相互独立的调用放在同一轮发起（例如改任务状态与登记产出），接近上限时先收尾汇报，不要一步只做一个工具调用。
@@ -160,25 +200,20 @@ ${modeSection}
 }
 
 function subPrompt(context: PromptContext): string {
-  const { member, roomName, members, parentName, taskTitles, limits, mode } = context;
+  const { member, roomName, parentName, limits, mode } = context;
   const brief = member.brief?.trim();
   const roleSection = brief ? `\n\n你的角色（创建时用户写下的职责描述）：\n${brief}` : "";
   const peerRule =
     mode === "free"
       ? "- 自由交流模式：需要其他成员的信息、复核或补充时，可以直接 @ 对方；需要决策或资源时 @ 主智能体。最终结论仍以一条完整消息交回群里，主智能体会统一收集和总结。"
       : "- 不要 @ 其他同级成员互相派活；跨线协调必须经过创建你的那一级。";
-  const base = `你是群聊「${roomName}」里的成员 @${member.name}，由 ${parentName ? `@${parentName}` : "主智能体"} 创建，只对分配给你的任务负责。${roleSection}
-
-群成员：
-${formatRoster(member, members, taskTitles)}
-
-可用技能（任务与描述匹配时，先调用 use_skill 读取完整说明，再按其中步骤执行）：
-${formatSkills(context.skills)}
+  const base = `你是群聊「${roomName}」里的成员 @${member.name}，由 ${parentName ? `@${parentName}` : "主智能体"} 创建，只对分配给你的任务负责。群成员与可用技能列在提示末尾的「当前群况」里。${roleSection}
 
 纪律
 - 你只在被 @${member.name} 或收到分配任务时行动；其他人的闲聊不回应。
 - 一次只发一条完整结论，不刷屏，不发「收到」这类空话。
-- 群聊汇报必须包含：结论、证据（路径/链接/关键输出）、未解决项与不确定点，不要只给承诺；任务要求交成文文档时，正文按下方「交付文档」的规则写进文件，群里只报路径与要点，不要把工作简报当成交付物。
+- 群聊汇报必须包含：结论、证据（路径/链接/关键输出）、未解决项与不确定点，不要只给承诺；证据里要有可核验的把手（文件相对路径、任务卡 ID 或链接），上级会回读核对。任务要求交成文文档时，正文按「交付文档」的规则写进文件，群里只报路径与要点，不要把工作简报当成交付物。
+- 派给你的任务缺背景时，先自己查（file_read、task_list、web_search、群聊记录），查不到就在汇报里明确列出缺什么，不要按猜测交付。
 - 你没有创建成员的能力：不要尝试新建或下派子成员，只做分给你的任务。
 ${peerRule}
 - 用 task_update 更新任务卡状态，用 task_attach_artifact 登记产出。
@@ -187,11 +222,28 @@ ${peerRule}
   return `${base}\n${standing}`;
 }
 
+/**
+ * 计划轮规则：随本轮消息下发，系统提示词一个字节都不动（对齐 Hermes 的逐轮 note 通道，
+ * 也就不会破坏刚建立的稳定前缀）。真正的约束在工具注册层已经收窄，这段只解释「为什么少了工具」
+ * 与「那这一轮该交什么」。
+ */
+const PLAN_ROUND_RULES = `本轮是计划轮（只读闸门已生效）
+- 工具清单已被收窄：只能读（file_list / file_read / room_history / task_list / memory_search / web_search / web_fetch），只能写 ${PLAN_WRITABLE_PREFIX} 下的计划文件，只能建任务卡（task_create）。改其它文件、执行命令、登记产出、写记忆都不在本轮能力内；@ 成员也不会唤醒他们。这不是故障，是这一轮的规则。
+- 交付物就两件：一份写进 ${PLAN_WRITABLE_PREFIX}<日期>-<主题>.md 的计划正文，和一组排好依赖的任务卡（每张卡写清负责人、交付什么、怎么算完成）。
+- 计划写给「对这个群毫无上下文的人」看：目标一句话 → 现有材料与已查到的事实（带路径或链接）→ 拟采用的做法 → 逐条可验收的步骤 → 风险与需要用户拍板的问题。步骤要具体到能照着做，不要写「完善细节」「进行测试」这类无法验收的话。
+- 先查后规划：能用只读工具确认的（文件在不在、任务卡什么状态、群里已经说过什么）就确认完再写，不要凭印象规划。
+- 群聊回复只给计划路径、结构与关键取舍，并明确写「等你批准后我再分派执行」。这一轮不要开始执行。`;
+
 export function buildInstruction(
   member: Member,
   trigger: RoomMessage,
   mode: RoomMode = "delegate",
 ): string {
+  const base = instructionFor(member, trigger, mode);
+  return trigger.runScope === "plan" ? `${PLAN_ROUND_RULES}\n\n${base}` : base;
+}
+
+function instructionFor(member: Member, trigger: RoomMessage, mode: RoomMode): string {
   if (trigger.senderKind === "user") {
     return mode === "free"
       ? `用户刚在群里发了一条消息（#${trigger.seq}）。当前是自由交流模式：请阅读上面的群聊记录，直接回答，或 @ 相关成员开启讨论（成员之间也可以直接互相 @）。讨论安静后由你收集并总结。`

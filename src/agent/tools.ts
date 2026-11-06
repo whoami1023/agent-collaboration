@@ -1,4 +1,4 @@
-import type { Member, TaskStatus } from "../core/types";
+import type { Member, RunScopeKind, TaskStatus } from "../core/types";
 import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
 import type { SkillLibrary } from "../skills/library";
@@ -13,6 +13,7 @@ import { buildWebTools, type WebToolOptions } from "../web/tools";
 import { buildFileTools } from "./file-tools";
 import { buildShellTools } from "./shell-tools";
 import { buildCronTools } from "./cron-tools";
+import { applyRunScope } from "./run-scope";
 import type { CronService } from "../cron/service";
 
 export interface ToolDeps {
@@ -26,6 +27,11 @@ export interface ToolDeps {
   web?: WebToolOptions;
   /** 定时任务服务：工作区加载后才有；未接上时智能体看不到 cron 工具。 */
   getCron?: () => CronService | undefined;
+  /**
+   * 本轮运行姿态（由触发消息带上）。设定后只注册白名单里的工具，
+   * 并把文件写入限制在姿态规定的前缀内——见 run-scope.ts。
+   */
+  runScope?: RunScopeKind;
 }
 
 const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done", "failed"];
@@ -241,6 +247,50 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
 
   tools.push({
     schema: {
+      name: "task_list",
+      description:
+        "列出当前房间的任务卡（id、状态、负责人、产出）。「回读确认」就用它：成员说任务已更新、产出已登记时，先看这里的状态和成果，不要凭它的说法向用户宣布完成。",
+      parameters: {
+        type: "object",
+        properties: {
+          status: { type: "string", enum: TASK_STATUSES, description: "可选：只看某个状态" },
+          owner: { type: "string", description: "可选：只看某个成员（成员名，不带 @）" },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+    execute: async (args) => {
+      const status = readString(args, "status");
+      if (status && !TASK_STATUSES.includes(status as TaskStatus)) {
+        return `错误：status 只能是 ${TASK_STATUSES.join(" / ")}`;
+      }
+      const ownerName = readString(args, "owner");
+      const owner = ownerName ? deps.bus.findMemberByName(ownerName) : undefined;
+      if (ownerName && !owner) return `错误：找不到成员 ${ownerName}`;
+      let tasks = deps.board.list();
+      if (status) tasks = tasks.filter((task) => task.status === status);
+      if (owner) tasks = tasks.filter((task) => task.ownerId === owner.id);
+      if (tasks.length === 0) return "（没有符合条件的任务卡）";
+      const shown = tasks.slice(0, 40);
+      const lines = shown.map((task) => {
+        const ownerLabel = task.ownerId ? deps.bus.getMember(task.ownerId)?.name ?? task.ownerId : "未指派";
+        const artifacts =
+          task.artifacts.length > 0
+            ? `，成果 ${task.artifacts.length} 项：${task.artifacts
+                .slice(-3)
+                .map((item) => item.path ?? item.name)
+                .join("、")}`
+            : "，成果 0 项";
+        return `- ${task.id}｜${task.title}｜${task.status}｜@${ownerLabel}${artifacts}`;
+      });
+      const head = `任务卡 ${tasks.length} 张${shown.length < tasks.length ? `（只显示前 ${shown.length} 张）` : ""}：`;
+      return [head, ...lines].join("\n");
+    },
+  });
+
+  tools.push({
+    schema: {
       name: "room_history",
       description: "读取群聊最近的消息记录（当需要更早的上下文时使用）。",
       parameters: {
@@ -289,5 +339,5 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
     tools.push(...buildCronTools({ cron, bus: deps.bus, member, ownerId: deps.userId }));
   }
 
-  return tools;
+  return applyRunScope(tools, deps.runScope);
 }

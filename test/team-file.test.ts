@@ -205,7 +205,7 @@ describe("记忆层接入", () => {
     });
     expect(main).toContain("成员能力档案");
     expect(main).toContain("- 技能：web-search、web-fetch");
-    expect(main).toContain("分派前对照成员能力档案");
+    expect(main).toContain("分派前对照「当前群况」里的成员能力档案");
     // 群成员花名册与档案之间仍然只隔一个空行。
     expect(main).toContain("）\n\n成员能力档案");
     expect(main).toContain("web-fetch\n\n可用技能");

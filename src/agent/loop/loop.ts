@@ -53,6 +53,8 @@ export interface LoopOptions {
   tools: ToolImpl[];
   maxSteps: number;
   signal: AbortSignal;
+  /** 模型调用了本轮没挂载的工具（运行姿态收窄）时的回执；不传则按「没有名为 X 的工具」回复。 */
+  toolUnavailable?: (name: string) => string;
   /** 模型设置里合并出的请求参数（采样、请求头、超时、输出上限）。 */
   request?: LoopRequestOptions;
   /** 上游回流的 token 统计，每个模型调用一次（用于用量与成本记账）。 */
@@ -507,7 +509,7 @@ async function executeOne(
 ): Promise<string> {
   let result: string;
   if (!tool) {
-    result = `错误：没有名为 ${call.name} 的工具`;
+    result = options.toolUnavailable?.(call.name) ?? `错误：没有名为 ${call.name} 的工具`;
   } else {
     try {
       result = await retryAsync(
