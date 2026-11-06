@@ -14,6 +14,7 @@ import {
 import { BOUNDED_CONTEXT_NOTICE, type TranscriptByteCompactionLatch } from "../context/bounded-context";
 import { RepetitionWatch } from "./repetition-guard";
 import { retryAsync, type RetryOptions } from "./retry";
+import { ToolGuardrails } from "./guardrails";
 import {
   detectToolCallShapedText,
   parseJsonToolCallPayload,
@@ -55,6 +56,11 @@ export interface LoopOptions {
   signal: AbortSignal;
   /** 模型调用了本轮没挂载的工具（运行姿态收窄）时的回执；不传则按「没有名为 X 的工具」回复。 */
   toolUnavailable?: (name: string) => string;
+  /**
+   * 工具结果进入上下文前的内容处理（外部来源加不可信信封、密钥脱敏）。
+   * 在护栏记账之前应用，重复结果引用桩省下的就是处理后的真实字节。
+   */
+  transformToolResult?: (name: string, raw: string) => string;
   /** 模型设置里合并出的请求参数（采样、请求头、超时、输出上限）。 */
   request?: LoopRequestOptions;
   /** 上游回流的 token 统计，每个模型调用一次（用于用量与成本记账）。 */
@@ -84,7 +90,9 @@ export type LoopErrorCode =
   | "provider_error"
   | "repeated_tool_error"
   | "max_steps_reached"
-  | "repetition_detected";
+  | "repetition_detected"
+  | "guardrail_halt"
+  | "silent_stop";
 
 export interface LoopResult {
   text: string;
@@ -94,6 +102,8 @@ export interface LoopResult {
   errorCode?: LoopErrorCode;
   /** 工具步数用尽，但已切换到无工具收尾并生成了总结；不算运行失败。 */
   maxStepsReached?: boolean;
+  /** 输出撞到模型长度上限、续写预算已用尽：交付的文本可能不完整，必须如实标注。 */
+  truncated?: boolean;
 }
 
 type StopReason = "stop" | "toolUse" | "error";
@@ -104,6 +114,8 @@ interface StreamedResponse {
   calls: ToolCall[];
   error?: string;
   errorCode?: LoopErrorCode;
+  /** finish_reason === "length"：这次输出被 max_tokens 切断了。 */
+  truncated: boolean;
 }
 
 function isAbort(err: unknown): boolean {
@@ -119,6 +131,27 @@ function throwIfAborted(signal: AbortSignal): void {
 }
 
 const REPEATED_TOOL_ERROR_MESSAGE = "检测到连续重复的工具调用，已中止本次运行";
+
+/**
+ * 输出长度上限截断的续写预算（对应 Hermes `turn_truncation.py`）：
+ * 一次 max_tokens 只够写半份文档，硬切成「已完成」比多跑四步代价大得多；
+ * 但预算必须有限，否则模型每次都写满、每次都续写会变成没有终点的循环。
+ */
+const MAX_OUTPUT_CONTINUATIONS = 4;
+
+const TRUNCATED_CONTINUATION_PROMPT =
+  "你上一条回复因为达到模型单次输出长度上限被截断了。请从中断的地方直接继续写：" +
+  "不要复述或重写已经输出的内容，也不要重新给出结论；继续时把每段控制在长度上限以内。" +
+  "如果是长文档，改成长文本分段写入（file_write 的 append 一次一节），正文只留简短进展。";
+
+const TRUNCATED_TOOL_CALL_NOTICE =
+  "上一条回复在输出长度上限处被截断，其中的工具调用参数可能不完整，因此没有执行任何一个调用。" +
+  "请把动作拆小后重新发起：一次只调用一个工具；写长文档改用 file_write 的 append 分节续写，" +
+  "不要在一回复里塞入大段正文和多个工具调用。";
+
+const SILENT_STOP_NUDGE =
+  "工具结果已经返回，但你这一步没有输出任何正文，群里会看到一次空回复。" +
+  "请基于刚才的结果直接给出答复：已完成什么、关键产出（文件路径 / 任务状态）、结论与未完成项。";
 
 /** 工具调用被中断/释放时补的结果：缺了它，下一次请求会违反 tool_calls 配对约束。 */
 const MISSING_TOOL_RESULT =
@@ -181,6 +214,9 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   let text = "";
   const noticeAtStep = stepBudgetNoticeAt(options.maxSteps);
   let budgetNoticed = false;
+  const guardrails = new ToolGuardrails();
+  let continuations = 0;
+  let silentNudged = false;
 
   for (let step = 0; step < options.maxSteps; step += 1) {
     throwIfAborted(options.signal);
@@ -297,6 +333,24 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     }
 
     if (visibleText) text += visibleText;
+
+    // 长度上限截断的两种形态分开处理：带工具调用的一律不执行（参数可能被切在半截 JSON 上），
+    // 纯正文才续写。截断处补的 assistant 行不带 tool_calls，配对约束因此不受影响。
+    if (streamed.truncated) {
+      if (calls.length > 0) {
+        if (visibleText) messages.push({ role: "assistant", content: visibleText });
+        messages.push({ role: "user", content: TRUNCATED_TOOL_CALL_NOTICE });
+        continue;
+      }
+      if (visibleText) messages.push({ role: "assistant", content: visibleText });
+      if (continuations >= MAX_OUTPUT_CONTINUATIONS) {
+        return { text: text.trim(), steps: step + 1, cancelled: false, truncated: true };
+      }
+      continuations += 1;
+      messages.push({ role: "user", content: TRUNCATED_CONTINUATION_PROMPT });
+      continue;
+    }
+
     messages.push({
       role: "assistant",
       content: visibleText,
@@ -304,6 +358,21 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     });
 
     if (calls.length === 0) {
+      // 静默停止守卫（Hermes turn_finalizer）：停在裸工具行上没有正文，等于群里一次空回复。
+      if (!text.trim()) {
+        if (!silentNudged) {
+          silentNudged = true;
+          messages.push({ role: "user", content: SILENT_STOP_NUDGE });
+          continue;
+        }
+        return {
+          text: "",
+          steps: step + 1,
+          cancelled: false,
+          error: "工具调用完成后没有生成任何正文回复，本轮没有交付物",
+          errorCode: "silent_stop",
+        };
+      }
       return { text: text.trim(), steps: step + 1, cancelled: false };
     }
 
@@ -323,7 +392,10 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       };
     }
 
-    await executeToolBatch(options, messages, calls, retryOptions);
+    const halt = await executeToolBatch(options, messages, calls, retryOptions, guardrails);
+    if (halt) {
+      return { text: text.trim(), steps: step + 1, cancelled: false, error: halt, errorCode: "guardrail_halt" };
+    }
   }
 
   return finalizeMaxSteps(options, messages, text, options.maxSteps);
@@ -422,6 +494,7 @@ async function streamAgentResponse(
           stopReason: "error",
           text: responseText,
           calls,
+          truncated: false,
           error: err instanceof Error ? err.message : String(err),
         };
       }
@@ -432,6 +505,7 @@ async function streamAgentResponse(
         stopReason: "error",
         text: responseText,
         calls,
+        truncated: false,
         error: "检测到重复输出，已中止本次生成",
         errorCode: "repetition_detected",
       };
@@ -441,7 +515,12 @@ async function streamAgentResponse(
 
     const stopReason: StopReason =
       calls.length > 0 || finishReason === "tool_calls" ? "toolUse" : "stop";
-    return { stopReason, text: responseText, calls };
+    return {
+      stopReason,
+      text: responseText,
+      calls,
+      truncated: finishReason === "length" || finishReason === "max_tokens",
+    };
   } finally {
     options.signal.removeEventListener("abort", onAbort);
   }
@@ -452,7 +531,20 @@ async function executeToolBatch(
   messages: LlmMessage[],
   calls: ToolCall[],
   retryOptions: RetryOptions,
-): Promise<void> {
+  guardrails: ToolGuardrails,
+): Promise<string | undefined> {
+  const batchVerdict = guardrails.beforeBatch(
+    calls.map((call) => ({ name: call.name, args: call.args })),
+  );
+  if (batchVerdict.action !== "allow") {
+    // 整批不执行，但每个 tool_call 仍要有结果行；拒绝理由逐条回填，护栏自己的拦截不计入失败。
+    for (const call of calls) {
+      messages.push({ role: "tool", toolCallId: call.id, content: batchVerdict.reason });
+      guardrails.recordRefusal();
+    }
+    return batchVerdict.action === "halt" ? batchVerdict.reason : undefined;
+  }
+
   const resolved = calls.map((call) => {
     const tool = options.tools.find((candidate) => candidate.schema.name === call.name);
     return { call, tool };
@@ -479,25 +571,39 @@ async function executeToolBatch(
       }
       const entry = resolved[index]!;
       options.onToolCall?.(entry.call);
-      const result = await executeOne(options, messages, entry.call, entry.tool, retryOptions);
-      options.onToolResult?.(entry.call, result);
+      const outcome = await executeOne(options, messages, entry.call, entry.tool, retryOptions, guardrails);
+      if (outcome.halt) {
+        for (let remaining = index + 1; remaining < resolved.length; remaining += 1) {
+          const call = resolved[remaining]?.call;
+          if (!call) continue;
+          messages.push({ role: "tool", toolCallId: call.id, content: `未执行：${outcome.halt}` });
+        }
+        return outcome.halt;
+      }
+      options.onToolResult?.(entry.call, outcome.content);
     }
-    return;
+    return undefined;
   }
 
   for (const entry of resolved) {
     options.onToolCall?.(entry.call);
   }
-  const results = await Promise.all(
-    resolved.map((entry) => executeOne(options, messages, entry.call, entry.tool, retryOptions)),
+  const outcomes = await Promise.all(
+    resolved.map((entry) => executeOne(options, messages, entry.call, entry.tool, retryOptions, guardrails)),
   );
   for (let index = 0; index < resolved.length; index += 1) {
     const entry = resolved[index];
-    const result = results[index];
-    if (entry && result !== undefined) {
-      options.onToolResult?.(entry.call, result);
+    const outcome = outcomes[index];
+    if (entry && outcome) {
+      options.onToolResult?.(entry.call, outcome.content);
     }
   }
+  return outcomes.find((outcome) => outcome.halt)?.halt;
+}
+
+interface CallOutcome {
+  content: string;
+  halt?: string;
 }
 
 async function executeOne(
@@ -506,20 +612,36 @@ async function executeOne(
   call: ToolCall,
   tool: ToolImpl | undefined,
   retryOptions: RetryOptions,
-): Promise<string> {
-  let result: string;
+  guardrails: ToolGuardrails,
+): Promise<CallOutcome> {
+  const verdict = guardrails.beforeCall(call.name, call.args);
+  if (verdict.action !== "allow") {
+    if (verdict.action === "halt") {
+      messages.push({ role: "tool", toolCallId: call.id, content: `未执行：${verdict.reason}` });
+      return { content: verdict.reason, halt: verdict.reason };
+    }
+    messages.push({ role: "tool", toolCallId: call.id, content: verdict.reason });
+    guardrails.recordRefusal();
+    return { content: verdict.reason };
+  }
+
+  let raw: string;
+  let refused = false;
   if (!tool) {
-    result = options.toolUnavailable?.(call.name) ?? `错误：没有名为 ${call.name} 的工具`;
+    raw = options.toolUnavailable?.(call.name) ?? `错误：没有名为 ${call.name} 的工具`;
+    // 运行姿态没挂载这个工具：模型已经拿到说明，不再累加失败计数（护栏拒绝不算失败）。
+    refused = true;
+    guardrails.recordRefusal();
   } else {
     try {
-      result = await retryAsync(
-        () => tool.execute(call.args, options.signal),
-        retryOptions,
-      );
+      raw = await retryAsync(() => tool.execute(call.args, options.signal), retryOptions);
     } catch (err) {
-      result = `工具执行失败：${err instanceof Error ? err.message : String(err)}`;
+      raw = `工具执行失败：${err instanceof Error ? err.message : String(err)}`;
     }
   }
-  messages.push({ role: "tool", toolCallId: call.id, content: result });
-  return result;
+  const transformed = options.transformToolResult?.(call.name, raw) ?? raw;
+  const observed = guardrails.observe(call.name, call.args, transformed, { refused });
+  const content = observed.note ? `${observed.content}\n\n${observed.note}` : observed.content;
+  messages.push({ role: "tool", toolCallId: call.id, content });
+  return { content, ...(observed.halt ? { halt: observed.halt } : {}) };
 }

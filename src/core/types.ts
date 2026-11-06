@@ -262,11 +262,41 @@ export interface ArtifactRef {
   addedBy: string;
 }
 
+/**
+ * 完成核验：交付闸门放行 done 时写下的事实凭据。
+ * 与验收条款一样留在卡上，供他人与后续会话看到「这条完成是被什么核对过的」。
+ */
+export interface TaskCompletionProof {
+  verifiedBy: { kind: TaskEvidenceKind; handle: string };
+  at: number;
+  detail?: string;
+}
+
+/** 证据类别：写出的文件、跑成功的命令、登记过的成果。 */
+export type TaskEvidenceKind = "file" | "command" | "artifact";
+
+/**
+ * 一条运行期真实发生过的事实（工具在成功返回的那一刻记下）。
+ * 存在卡上，成员被「继续」唤醒时重新装进本轮台账，闸门才认它。
+ */
+export interface TaskEvidenceRecord {
+  kind: TaskEvidenceKind;
+  handle: string;
+  detail: string;
+  at: number;
+}
+
 export interface TaskCard {
   id: string;
   roomId: string;
   title: string;
   detail: string;
+  /** 验收条款：每条一个可独立核对的客体。写了它，done 就必须带查得通的证据。 */
+  acceptance?: string;
+  /** 本轮台账留在卡上的证据（最多 40 条），供续跑核验。 */
+  evidence?: TaskEvidenceRecord[];
+  /** 通过闸门时的核验凭据（未通过则不写）。 */
+  completion?: TaskCompletionProof;
   ownerId: string | null;
   status: TaskStatus;
   deps: string[];

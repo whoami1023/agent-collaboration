@@ -14,6 +14,7 @@ import { buildFileTools } from "./file-tools";
 import { buildShellTools } from "./shell-tools";
 import { buildCronTools } from "./cron-tools";
 import { applyRunScope } from "./run-scope";
+import { verifyAcceptance, type EvidenceLedger } from "./evidence";
 import type { CronService } from "../cron/service";
 
 export interface ToolDeps {
@@ -32,9 +33,17 @@ export interface ToolDeps {
    * 并把文件写入限制在姿态规定的前缀内——见 run-scope.ts。
    */
   runScope?: RunScopeKind;
+  /**
+   * 本轮证据台账：写文件、跑命令、登记成果时在这里记账，
+   * 交付闸门用它核验 task_update → done（见 evidence.ts）。
+   */
+  evidence?: EvidenceLedger;
 }
 
 const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done", "failed"];
+
+/** 验收条款上限：够写三四条可核对的事实，又不至于让卡片变成第二份需求文档。 */
+const MAX_ACCEPTANCE_CHARS = 300;
 
 function readString(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
@@ -143,7 +152,8 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   tools.push({
     schema: {
       name: "task_create",
-      description: "创建任务卡。依赖未完成时，卡片不能进入进行中或已完成。",
+      description:
+        "创建任务卡。依赖未完成时，卡片不能进入进行中或已完成。交付型任务把「做到什么程度算做完」写进 acceptance（每条一个可独立核对的客体），之后标记完成时闸门会核验真实证据。",
       parameters: {
         type: "object",
         properties: {
@@ -151,6 +161,11 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
           detail: { type: "string", description: "任务细节" },
           owner: { type: "string", description: "可选：负责人成员名（不带 @）" },
           deps: { type: "array", items: { type: "string" }, description: "可选：依赖的任务 id" },
+          acceptance: {
+            type: "string",
+            description:
+              "可选：验收条款。一行一个可独立核对的事实，如「files/reports/x.docx 存在且包含第 3 章」「跑过 python check.py 且退出码 0」。最多 300 字",
+          },
         },
         required: ["title"],
         additionalProperties: false,
@@ -159,23 +174,33 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
     execute: async (args) => {
       const title = readString(args, "title");
       if (!title) return "错误：title 不能为空";
+      const acceptance = readString(args, "acceptance");
+      if (acceptance && acceptance.length > MAX_ACCEPTANCE_CHARS) {
+        return `错误：acceptance 最多 ${MAX_ACCEPTANCE_CHARS} 字；只保留能被逐条核对的验收客体，其余写进 detail`;
+      }
       const ownerName = readString(args, "owner");
       const owner = ownerName ? deps.bus.findMemberByName(ownerName) : undefined;
       const task = deps.board.create({
         title,
         ...(readString(args, "detail") ? { detail: readString(args, "detail") } : {}),
+        ...(acceptance ? { acceptance } : {}),
         createdBy: member.id,
         ownerId: owner?.id ?? null,
         ...(readStringArray(args, "deps") ? { deps: readStringArray(args, "deps") } : {}),
       });
-      return `已创建任务 ${task.id}：${task.title}（状态 ${task.status}${owner ? `，负责人 @${owner.name}` : ""}）`;
+      return `已创建任务 ${task.id}：${task.title}（状态 ${task.status}${owner ? `，负责人 @${owner.name}` : ""}）${
+        task.acceptance
+          ? `\n验收条款已登记，标记完成时闸门会核验证据：\n${task.acceptance}`
+          : ""
+      }`;
     },
   });
 
   tools.push({
     schema: {
       name: "task_update",
-      description: "更新任务卡：状态、负责人或细节。",
+      description:
+        "更新任务卡：状态、负责人或细节。卡片写了验收条款时，标 done 必须同时传 verify_kind 与 verify_handle（本轮真实产出过的文件路径 / 跑过的命令 / 已登记成果名），闸门会回读核验；核验不过就保持 doing。",
       parameters: {
         type: "object",
         properties: {
@@ -183,6 +208,20 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
           status: { type: "string", enum: TASK_STATUSES, description: "新状态" },
           owner: { type: "string", description: "可选：新负责人成员名（不带 @）" },
           detail: { type: "string", description: "可选：补充说明" },
+          acceptance: {
+            type: "string",
+            description: `可选：补写或修订验收条款（最多 ${MAX_ACCEPTANCE_CHARS} 字）`,
+          },
+          verify_kind: {
+            type: "string",
+            enum: ["file", "command", "artifact"],
+            description: "标 done 时的证据类型：写出的文件、跑过的命令，或登记过的成果",
+          },
+          verify_handle: {
+            type: "string",
+            description:
+              "证据标识：文件用相对路径（如 reports/a.md，不带 files/ 前缀），命令用原样那一条，成果用登记时的名称",
+          },
         },
         required: ["task_id"],
         additionalProperties: false,
@@ -195,16 +234,72 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
       if (status && !TASK_STATUSES.includes(status as TaskStatus)) {
         return `错误：status 只能是 ${TASK_STATUSES.join(" / ")}`;
       }
+      const acceptance = readString(args, "acceptance");
+      if (acceptance && acceptance.length > MAX_ACCEPTANCE_CHARS) {
+        return `错误：acceptance 最多 ${MAX_ACCEPTANCE_CHARS} 字`;
+      }
       const ownerName = readString(args, "owner");
       const owner = ownerName ? deps.bus.findMemberByName(ownerName) : undefined;
       if (ownerName && !owner) return `错误：找不到成员 ${ownerName}`;
-      try {
-        const task = deps.board.update(taskId, {
-          ...(status ? { status: status as TaskStatus } : {}),
+      const task = deps.board.get(taskId);
+      if (!task) return `更新失败：任务不存在：${taskId}`;
+      const verifyKind = readString(args, "verify_kind");
+      const verifyHandle = readString(args, "verify_handle");
+      const willBeDone = status === "done";
+      if (willBeDone && (task.acceptance || acceptance) && deps.evidence) {
+        const verdict = await verifyAcceptance({
+          task: { ...task, ...(acceptance ? { acceptance } : {}) },
+          ledger: deps.evidence,
+          ...(verifyKind ? { verifyKind } : {}),
+          ...(verifyHandle ? { verifyHandle } : {}),
+          fileExists: async (relPath) => {
+            if (!deps.files) return false;
+            try {
+              await deps.files.read(relPath, { maxBytes: 1 });
+              return true;
+            } catch {
+              return false;
+            }
+          },
+          artifactExists: async (name) => {
+            const current = deps.board.get(taskId);
+            return (
+              current?.artifacts.some((item) => item.name === name) ??
+              task.artifacts.some((item) => item.name === name)
+            );
+          },
+        });
+        if (!verdict.ok) return verdict.reason;
+        const updated = deps.board.update(taskId, {
+          ...(acceptance ? { acceptance } : {}),
+          status: "done",
           ...(owner ? { ownerId: owner.id } : {}),
           ...(readString(args, "detail") ? { detail: readString(args, "detail") } : {}),
+          evidence: deps.evidence.mergeInto(task.evidence),
+          ...(verdict.verifiedBy
+            ? {
+                completion: {
+                  verifiedBy: verdict.verifiedBy,
+                  at: Date.now(),
+                  ...(verdict.detail ? { detail: verdict.detail } : {}),
+                },
+              }
+            : {}),
         });
-        return `任务 ${task.id} 已更新：状态 ${task.status}${owner ? `，负责人 @${owner.name}` : ""}`;
+        return `任务 ${updated.id} 已核验通过并标记完成：证据 ${verdict.verifiedBy?.kind} ${
+          verdict.verifiedBy?.handle
+        }${owner ? `，负责人 @${owner.name}` : ""}`;
+      }
+      try {
+        const updated = deps.board.update(taskId, {
+          ...(status ? { status: status as TaskStatus } : {}),
+          ...(owner ? { ownerId: owner.id } : {}),
+          ...(acceptance ? { acceptance } : {}),
+          ...(readString(args, "detail") ? { detail: readString(args, "detail") } : {}),
+          // 进展更新顺手把本轮台账留在卡上：成员被「继续」唤醒时装回证据，闸门才认续跑。
+          ...(deps.evidence ? { evidence: deps.evidence.mergeInto(task.evidence) } : {}),
+        });
+        return `任务 ${updated.id} 已更新：状态 ${updated.status}${owner ? `，负责人 @${owner.name}` : ""}`;
       } catch (err) {
         return `更新失败：${err instanceof Error ? err.message : String(err)}`;
       }
@@ -231,13 +326,28 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
       const taskId = readString(args, "task_id");
       const name = readString(args, "name");
       if (!taskId || !name) return "错误：task_id 和 name 都必须提供";
+      const relPath = readString(args, "path");
+      if (relPath && deps.files) {
+        // 指向工作区文件的成果必须真的在：登记一个不存在的路径等于伪造证据。
+        try {
+          await deps.files.read(relPath.replace(/^files\//, ""), { maxBytes: 1 });
+        } catch (err) {
+          return `登记失败：files/${relPath.replace(/^files\//, "")} 读不到（${
+            err instanceof Error ? err.message : String(err)
+          }）。请先产出该文件，或把成果名与摘要写清楚、不带路径。`;
+        }
+      }
       try {
         const task = deps.board.attachArtifact(taskId, {
           name,
-          ...(readString(args, "path") ? { path: readString(args, "path") } : {}),
+          ...(relPath ? { path: relPath } : {}),
           ...(readString(args, "summary") ? { summary: readString(args, "summary") } : {}),
           addedBy: member.id,
         });
+        deps.evidence?.record("artifact", name, relPath ? `files/${relPath.replace(/^files\//, "")}` : "摘要登记");
+        if (relPath && deps.files) {
+          deps.evidence?.record("file", relPath.replace(/^files\//, ""), `成果「${name}」`);
+        }
         return `已登记成果到 ${task.id}，当前共 ${task.artifacts.length} 项`;
       } catch (err) {
         return `登记失败：${err instanceof Error ? err.message : String(err)}`;
@@ -282,7 +392,13 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
                 .map((item) => item.path ?? item.name)
                 .join("、")}`
             : "，成果 0 项";
-        return `- ${task.id}｜${task.title}｜${task.status}｜@${ownerLabel}${artifacts}`;
+        return `- ${task.id}｜${task.title}｜${task.status}｜@${ownerLabel}${artifacts}${
+          task.completion
+            ? `｜已核验：${task.completion.verifiedBy.kind} ${task.completion.verifiedBy.handle}`
+            : task.acceptance
+              ? "｜有验收条款（done 需证据）"
+              : ""
+        }`;
       });
       const head = `任务卡 ${tasks.length} 张${shown.length < tasks.length ? `（只显示前 ${shown.length} 张）` : ""}：`;
       return [head, ...lines].join("\n");
@@ -318,7 +434,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
 
   // 文件工作区：用户上传与智能体产出共用 files/ 目录，对应 OpenClaw 的 read/write/ls 文件工具。
   if (deps.files) {
-    tools.push(...buildFileTools(deps.files));
+    tools.push(...buildFileTools(deps.files, deps.evidence));
     // 命令执行：run_command 在工作区跑命令，run_skill_script 展开并执行技能附带脚本。
     tools.push(
       ...buildShellTools({
@@ -326,6 +442,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
         skills: deps.skills,
         userId: deps.userId,
         member,
+        ...(deps.evidence ? { evidence: deps.evidence } : {}),
       }),
     );
   }

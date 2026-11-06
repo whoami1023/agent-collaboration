@@ -3,6 +3,8 @@ import type { LlmEvent, LlmProvider, LlmRequest } from "./types";
 export interface MockTurn {
   text?: string;
   toolCalls?: Array<{ name: string; args: Record<string, unknown> }>;
+  /** 覆盖 done 事件的 stopReason：测截断续写时给 length / max_tokens。 */
+  finishReason?: string;
 }
 
 export type MockHandler = (request: LlmRequest) => MockTurn | Promise<MockTurn>;
@@ -52,10 +54,10 @@ export class MockProvider implements LlmProvider {
         args: call.args,
       }));
       yield { type: "tool-calls", calls };
-      yield { type: "done", stopReason: "tool_calls" };
+      yield { type: "done", stopReason: turn.finishReason ?? "tool_calls" };
       return;
     }
-    yield { type: "done", stopReason: "stop" };
+    yield { type: "done", stopReason: turn.finishReason ?? "stop" };
   }
 }
 
@@ -79,6 +81,28 @@ function findTaskId(request: LlmRequest): string | undefined {
   return undefined;
 }
 
+const DEMO_DOC = `# 多智能体协同框架调度方式对比
+
+## 一、三类调度方式
+
+| 方式 | 控制流 | 可观测性 | 适用场景 | 主要成本 |
+| --- | --- | --- | --- | --- |
+| 中心编排（orchestrator） | 主智能体分派、成员回报 | 每次唤醒与交付都有记录，消息可回放 | 需要稳定交付物的任务 | 编排逻辑需要维护 |
+| 对等会话 | 成员之间自由 @ | 记录都堆在群聊里，没有明确的收口点 | 开放式讨论、头脑风暴 | 容易发散、难判定完成 |
+| 事件总线 | 事件驱动，谁订阅谁响应 | 事件全量可查，链路追踪较绕 | 高并发、弹性要求高的场景 | 调试与回溯成本最高 |
+
+## 二、选型建议
+
+以「消息可回放 + 每次唤醒有记录」为验收标准衡量，中心编排 + 共享房间事件最稳：
+分派路径唯一，状态收敛清楚，交付物能挂回任务卡。对等会话适合讨论不适合交付；
+纯事件总线弹性最好，但排查一次跨成员的问题需要重建整条事件链。
+
+## 三、局限与存疑
+
+样本只覆盖 3 个框架，缺少长任务（>30 分钟）的压测数据；
+以上结论基于公开实现与文档，未做同等规模的基准测试。
+`;
+
 export function demoHandler(): MockHandler {
   return (request) => {
     const system = request.messages.find((m) => m.role === "system")?.content ?? "";
@@ -99,6 +123,7 @@ export function demoHandler(): MockHandler {
                 title: "调研多智能体协同框架",
                 detail:
                   "调研 2026 年多智能体协同框架的主流调度方式（中心编排 / 对等会话 / 事件总线），输出对比表与选型建议。",
+                acceptance: "files/多智能体调度方式对比.md 存在，且含三类调度方式的对比与选型建议",
               },
             },
           ],
@@ -111,6 +136,19 @@ export function demoHandler(): MockHandler {
         }
       }
       if (steps === 2) {
+        return {
+          toolCalls: [
+            {
+              name: "file_write",
+              args: {
+                path: "多智能体调度方式对比.md",
+                content: DEMO_DOC,
+              },
+            },
+          ],
+        };
+      }
+      if (steps === 3) {
         const taskId = findTaskId(request);
         if (taskId) {
           return {
@@ -120,10 +158,19 @@ export function demoHandler(): MockHandler {
                 args: {
                   task_id: taskId,
                   name: "多智能体调度方式对比.md",
+                  path: "多智能体调度方式对比.md",
                   summary: "中心编排 / 对等会话 / 事件总线 三类调度方式的对比与选型建议",
                 },
               },
-              { name: "task_update", args: { task_id: taskId, status: "done" } },
+              {
+                name: "task_update",
+                args: {
+                  task_id: taskId,
+                  status: "done",
+                  verify_kind: "file",
+                  verify_handle: "多智能体调度方式对比.md",
+                },
+              },
             ],
           };
         }

@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { newId } from "../core/ids";
 import type { PublicUser } from "../core/types";
+import { scanThreats, threatWarning } from "../agent/content/threats";
 import {
   DEFAULT_SKILL_CATEGORY,
   normalizeSkillCategory,
@@ -90,6 +91,17 @@ export interface TemplateImportResult {
   created: AgentTemplateRecord[];
   errors: string[];
   warnings: string[];
+}
+
+/** 模板里最终会变成成员档案的文字：只有这些字段会被模型长期读到。 */
+function templateCorpus(record: AgentTemplateRecord): string {
+  return [
+    record.title,
+    record.description,
+    record.brief,
+    record.vibe ?? "",
+    ...(record.workstyle ?? []),
+  ].join("\n");
 }
 
 export interface TemplateLibraryOptions {
@@ -498,6 +510,10 @@ export class TemplateLibrary {
           );
           created.push(record);
           if (conflict) warnings.push(`标识「${wantedKey}」已被占用，新模板改用「${record.key}」`);
+          // 模板会被原样写成成员档案（等于该成员每一轮都要读的指令）。
+          // 导入是用户自己发起的，所以只提示不拒收 —— 但要把命中摆在导入结果里。
+          const threats = scanThreats(templateCorpus(record), "warn");
+          if (threats.length > 0) warnings.push(`${record.title}：${threatWarning(threats)}`);
         } catch (err) {
           const title =
             typeof doc["title"] === "string" && doc["title"].trim()

@@ -3,6 +3,7 @@ import {
   WorkspaceFileError,
   type WorkspaceFiles,
 } from "../files/workspace-files";
+import type { EvidenceLedger } from "./evidence";
 import type { ToolImpl } from "./loop";
 
 function readString(args: Record<string, unknown>, key: string): string | undefined {
@@ -30,7 +31,7 @@ function normalizePrefix(raw: string | undefined): string {
   return (raw ?? "").trim().replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
 }
 
-export function buildFileTools(files: WorkspaceFiles): ToolImpl[] {
+export function buildFileTools(files: WorkspaceFiles, evidence?: EvidenceLedger): ToolImpl[] {
   return [
     {
       schema: {
@@ -144,6 +145,12 @@ export function buildFileTools(files: WorkspaceFiles): ToolImpl[] {
             overwrite,
             append,
           });
+          // 交付闸门的证据：只有真的落盘成功才记账，路径用规范化后的相对路径。
+          evidence?.record(
+            "file",
+            saved.path,
+            `${append ? "追加" : "写入"} ${formatSize(saved.sizeBytes)}，${content.split("\n").length} 行`,
+          );
           return `${append ? "已追加到" : "已写入"} files/${saved.path}（${formatSize(saved.sizeBytes)}，${content.split("\n").length} 行）。` +
             "用户可在右侧「文件工作区」查看和下载。";
         } catch (err) {

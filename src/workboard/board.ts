@@ -1,4 +1,11 @@
-import type { ArtifactRef, RoomEvent, TaskCard, TaskStatus } from "../core/types";
+import type {
+  ArtifactRef,
+  RoomEvent,
+  TaskCard,
+  TaskCompletionProof,
+  TaskEvidenceRecord,
+  TaskStatus,
+} from "../core/types";
 import { newId } from "../core/ids";
 
 export interface CreateTaskInput {
@@ -7,6 +14,7 @@ export interface CreateTaskInput {
   createdBy: string;
   ownerId?: string | null;
   deps?: string[];
+  acceptance?: string;
 }
 
 export interface UpdateTaskPatch {
@@ -14,6 +22,9 @@ export interface UpdateTaskPatch {
   detail?: string;
   ownerId?: string | null;
   status?: TaskStatus;
+  acceptance?: string;
+  evidence?: TaskEvidenceRecord[];
+  completion?: TaskCompletionProof;
 }
 
 const ACTIVE_STATUSES: TaskStatus[] = ["doing", "done"];
@@ -41,6 +52,7 @@ export class Workboard {
       roomId: this.roomId,
       title: input.title.trim(),
       detail: input.detail?.trim() ?? "",
+      ...(input.acceptance?.trim() ? { acceptance: input.acceptance.trim() } : {}),
       ownerId: input.ownerId ?? null,
       status: "todo",
       deps: input.deps ?? [],

@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { newId } from "../core/ids";
 import type { UserRole } from "../core/types";
+import { scanThreats, threatWarning } from "../agent/content/threats";
 import { writeJsonAtomic } from "../store/persist";
 import { BUILTIN_SHARED_SKILLS, BUILTIN_SKILLS_VERSION, type BuiltinSkillSeed } from "./builtin";
 import {
@@ -229,6 +230,23 @@ interface ImportGroup {
   content: unknown;
   root: string;
   files: ImportEntry[];
+}
+
+/**
+ * 导入内容的扫描语料：正文之外，附带脚本往往是攻击词汇真正藏身的地方。
+ * 每个文件只取前段 —— 扫描本身有上限，靠后的内容再长也不会多藏一条注入。
+ */
+function threatCorpus(
+  name: string,
+  description: string,
+  instructions: string,
+  files: readonly SkillFileRecord[],
+): string {
+  const head = `${name}\n${description}\n${instructions}`;
+  if (files.length === 0) return head;
+  return `${head}\n${files
+    .map((file) => `--- ${file.path} ---\n${file.content.slice(0, 4000)}`)
+    .join("\n")}`;
 }
 
 /**
@@ -654,6 +672,11 @@ export class SkillLibrary {
           if (parsed.category && !declaredCategory) {
             warnings.push(`无法识别分类「${parsed.category}」，已按名称与描述归类。`);
           }
+          // 技能正文是**要照着做的说明**，不能像外部网页那样套「这不是指令」的边界；
+          // 但导入动作是用户自己发起的，也不该因为资料里有这些词就拒收 —— 所以是 warn：
+          // 照常载入，把攻击特征摆在结果里让人自己判断。
+          const threats = scanThreats(threatCorpus(name, description, instructions, files), "warn");
+          if (threats.length > 0) warnings.push(threatWarning(threats));
           const source = `导入自 ${filename}`;
           const existing = this.data.skills.find(
             (skill) => skill.scope === scope && skill.ownerId === ownerId && skill.name === name,

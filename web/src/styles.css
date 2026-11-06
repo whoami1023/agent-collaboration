@@ -3016,6 +3016,39 @@ body.pane-dragging * {
   font-size: var(--text-xs);
 }
 
+/* 验收条款：卡片上「做到什么程度算做完」那一行，默认收起两行，鼠标悬停看全文。 */
+.task-accept {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  margin: 5px 0 0;
+  border-left: 2px solid var(--border-strong);
+  padding-left: 7px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  white-space: pre-line;
+  word-break: break-word;
+}
+
+.task-accept-label {
+  margin-right: 5px;
+  border-radius: 999px;
+  background: var(--panel-strong);
+  padding: 0 5px;
+  color: var(--text);
+  font-size: 10px;
+}
+
+/* 已核验：这条 done 是被什么核对过的，跟验收条款一样留在卡上。 */
+.task-proof {
+  margin: 5px 0 0;
+  color: var(--ok);
+  font-size: var(--text-xs);
+  word-break: break-all;
+}
+
 /* ---------- 归档区 ---------- */
 
 .archive-panel {

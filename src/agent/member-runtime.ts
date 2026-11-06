@@ -25,6 +25,8 @@ import { DEFAULT_COMPACTION_SETTINGS } from "./context/compaction";
 import { resolveMaxActiveTranscriptBytes, type TranscriptByteCompactionLatch } from "./context/bounded-context";
 import type { ContextBudgetConfig } from "./context/budget";
 import { buildTools } from "./tools";
+import { EvidenceLedger } from "./evidence";
+import { applyToolResultPolicy } from "./content/policy";
 import { scopeToolUnavailable } from "./run-scope";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
 
@@ -145,6 +147,9 @@ export class MemberRuntime {
     let flushUsage: () => void = () => {};
     /** 本轮真实调用过的工具名：复盘素材用它区分「动手做过」与「只是说了说」。 */
     const usedTools = new Set<string>();
+    // 交付闸门的证据台账：本轮真实写出/跑成的事实，续跑时从未完成的任务卡上重新装回。
+    const evidence = new EvidenceLedger();
+    evidence.seed(board.list());
 
     try {
       const taskTitles = new Map<string, string>();
@@ -168,6 +173,7 @@ export class MemberRuntime {
         skills: this.deps.skills,
         runScope,
         userId: this.deps.ownerId,
+        evidence,
         getCron: () => this.deps.getCron?.(),
         ...(this.deps.memory ? { memory: this.deps.memory } : {}),
         ...(this.deps.files ? { files: this.deps.files } : {}),
@@ -285,6 +291,8 @@ export class MemberRuntime {
         signal: controller.signal,
         budget,
         budgetOwnerId: this.member.id,
+        // 工具结果进上下文前的统一出口：外部来源套不可信信封、疑似密钥掩码（见 content/policy.ts）。
+        transformToolResult: applyToolResultPolicy,
         byteCompactionState: this.byteCompactionState,
         onContextApplied: (info) => {
           if (info.kind === "compacted") {
@@ -357,6 +365,13 @@ export class MemberRuntime {
       if (result.maxStepsReached) {
         this.notice(
           `@${this.member.name} 单次运行 ${limits.maxStepsPerRun} 步工具调用已用尽，已停止调用工具并基于当前进展收尾。`,
+          this.resumeHint(trigger),
+        );
+      }
+      if (result.truncated) {
+        this.notice(
+          `@${this.member.name} 回复达到模型单次输出长度上限，自动续写若干次仍未写完：上面这份可能是不完整的稿子。` +
+            `发「继续」可以接着写；长文档建议改用 file_write 的 append 分节落盘。`,
           this.resumeHint(trigger),
         );
       }

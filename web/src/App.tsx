@@ -17,6 +17,7 @@ import type {
   SessionArchiveDetail,
   SessionArchiveSummary,
   TaskCard,
+  TaskEvidenceKind,
 } from "../../src/core/types";
 import { DEFAULT_LIMITS, LIMIT_FIELDS, RUN_SCOPE_LABELS } from "../../src/core/types";
 import { Icon, type IconName } from "./icons";
@@ -209,6 +210,11 @@ function statusLabel(status: TaskCard["status"]): string {
     default:
       return "待办";
   }
+}
+
+/** 完成凭据的证据类型：卡上那行「已核验」要能说清它当初是被什么核对过的。 */
+function proofLabel(kind: TaskEvidenceKind): string {
+  return kind === "file" ? "文件" : kind === "command" ? "命令" : "成果";
 }
 
 /** 右侧面板三个视图的显示名与图标，标签栏、顶栏切换和收起按钮共用一份。 */
@@ -2773,6 +2779,18 @@ function RoomView({
                       {task.deps.length > 0 ? ` · 依赖 ${task.deps.length}` : ""}
                       {task.artifacts.length > 0 ? ` · 成果 ${task.artifacts.length}` : ""}
                     </div>
+                    {task.acceptance ? (
+                      <p className="task-accept" title={task.acceptance}>
+                        <span className="task-accept-label">验收</span>
+                        {task.acceptance.replaceAll(/\s+/g, " ")}
+                      </p>
+                    ) : null}
+                    {task.completion ? (
+                      <p className="task-proof">
+                        已核验 · {proofLabel(task.completion.verifiedBy.kind)}{" "}
+                        {task.completion.verifiedBy.handle}
+                      </p>
+                    ) : null}
                   </article>
                 ))}
               </div>

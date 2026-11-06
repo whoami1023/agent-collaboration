@@ -15,6 +15,7 @@
  */
 
 import type { ToolImpl } from "../agent/loop";
+import { scanThreats, threatRefusal } from "../agent/content/threats";
 import type { MemorySearchManager, MemorySearchResult } from "./manager";
 
 class ToolInputError extends Error {}
@@ -255,6 +256,10 @@ export function buildMemoryTools(
       if (importance !== undefined && importance > 10) {
         throw new ToolInputError("importance must be between 1 and 10");
       }
+      // 长期记忆会被自动召回、每轮注入上下文：等于一条会长期生效的指令。
+      // 因此这里用最高档（block）扫描，命中就不写，而不是写进去再指望模型自觉。
+      const refusal = threatRefusal(scanThreats(text ?? "", "block"), "这条记忆");
+      if (refusal) return refusal;
       const written = await manager.appendEntry(
         text ?? "",
         {

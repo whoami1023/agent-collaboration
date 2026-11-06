@@ -83,6 +83,16 @@ const COMMAND_SECTION = `命令执行
 - 命令以服务进程权限运行，不会经过 shell 传递参数的部分只限脚本参数；执行前想清后果，不要运行来源不明的命令。
 - 执行后如实引用真实输出（退出码与关键日志）；失败就贴错误并说明下一步，不要编造运行结果。`;
 
+/**
+ * 交付闸门（移植 Hermes 的 acceptance contract + verification evidence）：
+ * 只在挂了任务工具时注入。「完成」从此不再是模型自己说的状态，而是一条能被回读的事实。
+ */
+const ACCEPTANCE_SECTION = `完成核验
+- 交付型任务用 task_create 的 acceptance 写清验收条款：一行一个「能被单独核对」的客体（某个文件里确有某章、某条命令退出码为 0、某个数字来源可追溯），最多 300 字；过程性任务不用写。
+- 标 done 时必须同时传 verify_kind 与 verify_handle：file 用本轮真实写出或真实改变过的相对路径（如 reports/a.docx，不带 files/ 前缀），command 用原样跑过且退出码 0 的那条命令，artifact 用已经登记过的成果名。闸门会回读核对，查不到就拒绝把任务标成完成。
+- 核验不过就保持 status=doing，如实说明还差哪一条、下一步做什么；绝不为了关掉卡片而挑选一个碰巧存在的文件当证据，也不要把证据写成描述而不是真实标识。
+- 证据只能来自真实动作：file_write 写成功、命令退出码 0、脚本跑完后真实变化的文件。没有做过就没有证据，这与「不许编造结果」是同一条纪律。`;
+
 const CRON_SECTION = `定时任务
 - 用户提到「每天/每周/半小时后/到点再做…」这类延时或周期性要求，用 cron 工具建任务；绝不要在 run_command 里 sleep 或反复轮询来假装定时器。
 - 任务到点会把指令投进群并唤醒对应成员无人值守执行，最终回复就是交付物；一次运行只交一份结果，重复靠调度而不是靠你追问。
@@ -125,6 +135,8 @@ export function buildSystemPrompt(context: PromptContext): string {
   const commandSection =
     context.availableTools?.has("run_command") === true ? COMMAND_SECTION : "";
   const cronSection = context.availableTools?.has("cron") === true ? CRON_SECTION : "";
+  // 闸门只作用在任务卡上：没挂 task_update 的运行（计划轮、纯聊天）不该看到这段规则。
+  const acceptanceSection = context.availableTools?.has("task_update") === true ? ACCEPTANCE_SECTION : "";
   // 对齐 Hermes 的 stable → context → volatile 三层：花名册、任务标题、能力档案与技能索引
   // 每轮都会变，一律放到最后一层，前面那段行为规则才能保持字节不变、命中供应商前缀缓存。
   return [
@@ -134,6 +146,7 @@ export function buildSystemPrompt(context: PromptContext): string {
     fileSection,
     documentSection,
     commandSection,
+    acceptanceSection,
     cronSection,
     formatDynamicContext(context),
   ]

@@ -5,6 +5,12 @@ import type { Member } from "../core/types";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import type { SkillLibrary } from "../skills/library";
 import { isSkillSelected } from "../skills/selection";
+import {
+  commandHandle,
+  recordFileChanges,
+  stampFiles,
+  type EvidenceLedger,
+} from "./evidence";
 import type { ToolImpl } from "./loop";
 import { describeCandidates, resolvePythonLaunch } from "./python-launcher";
 
@@ -20,6 +26,8 @@ export interface ShellToolDeps {
   skills: SkillLibrary;
   userId: string;
   member: Member;
+  /** 本轮证据台账：命令退出码 0 才记账，作为交付闸门的核验来源。 */
+  evidence?: EvidenceLedger;
 }
 
 export interface RunOptions {
@@ -296,6 +304,9 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
           return `错误：${err instanceof Error ? err.message : String(err)}`;
         }
         const timeoutMs = clampTimeout(args["timeout_ms"]);
+        const before = deps.evidence
+          ? stampFiles(await deps.files.list().catch(() => undefined))
+          : undefined;
         const result = await runProcess(command, [], {
           cwd,
           timeoutMs,
@@ -303,6 +314,30 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
           shell: true,
         });
         const relCwd = path.relative(deps.files.rootDir, cwd).split(path.sep).join("/") || ".";
+        if (result.code === 0 && !result.timedOut && !result.aborted && !result.spawnError) {
+          deps.evidence?.record(
+            "command",
+            commandHandle(command),
+            `files/${relCwd === "." ? "" : relCwd} 退出码 0`,
+          );
+          if (before) {
+            const changed = recordFileChanges(
+              deps.evidence!,
+              before,
+              await deps.files.list().catch(() => undefined),
+              `$ ${commandHandle(command)}`,
+            );
+            if (changed.length > 0) {
+              return `${formatResult(
+                `$ ${command}\n工作目录：files/${relCwd === "." ? "" : relCwd}`,
+                result,
+                timeoutMs,
+              )}\n\n本次运行改变了这些文件，可直接作为验收证据（verify_kind=file）：${changed
+                .map((item) => `files/${item}`)
+                .join("、")}`;
+            }
+          }
+        }
         return formatResult(`$ ${command}\n工作目录：files/${relCwd === "." ? "" : relCwd}`, result, timeoutMs);
       },
     },
@@ -405,12 +440,29 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
 
         const timeoutMs = clampTimeout(args["timeout_ms"]);
         const relDir = path.relative(deps.files.rootDir, runDir).split(path.sep).join("/");
+        const before = deps.evidence
+          ? stampFiles(await deps.files.list().catch(() => undefined))
+          : undefined;
         const result = await runProcess(interpreter.command, interpreter.args, {
           cwd: runDir,
           timeoutMs,
           signal,
           shell: false,
         });
+        const scriptHandle = `${skill.name}/${hit.file.path}${
+          scriptArgs.length > 0 ? ` ${scriptArgs.join(" ")}` : ""
+        }`;
+        if (result.code === 0 && !result.timedOut && !result.aborted && !result.spawnError) {
+          deps.evidence?.record("command", commandHandle(scriptHandle), `退出码 0`);
+          if (before) {
+            recordFileChanges(
+              deps.evidence!,
+              before,
+              await deps.files.list().catch(() => undefined),
+              `$ ${commandHandle(scriptHandle)}`,
+            );
+          }
+        }
         return formatResult(
           `脚本：${skill.name}/${hit.file.path}\n解释器：${interpreter.command}\n工作目录：files/${relDir}`,
           result,
