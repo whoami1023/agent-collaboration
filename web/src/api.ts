@@ -22,7 +22,14 @@ import type {
   CronSchedule,
 } from "../../src/cron/types";
 import type { ProviderApi } from "../../src/model/types";
-import type { AdvisorSettings } from "../../src/core/settings";
+import type { AdvisorSettings, CurationSettings } from "../../src/core/settings";
+import type {
+  CurationLog,
+  CurationProposal,
+  SkillLifecycle,
+  SkillLifecycleState,
+  SkillUsageRecord,
+} from "../../src/skills/curation/types";
 import type {
   LearningProposal,
   LearningSettings,
@@ -32,7 +39,8 @@ import type {
 } from "../../src/agent/learning/types";
 
 export type { LearningProposal, LearningSettings, MemoryProposal, ReviewLog, SkillProposal };
-export type { AdvisorSettings };
+export type { AdvisorSettings, CurationSettings };
+export type { CurationLog, CurationProposal, SkillLifecycle, SkillLifecycleState, SkillUsageRecord };
 
 export type { RoomInfo, RoomKind, RoomMode, RoomRoutingMode };
 
@@ -76,6 +84,7 @@ export interface MaskedSettings {
   limits: Limits;
   learning: LearningSettings;
   advisors: AdvisorSettings;
+  curation: CurationSettings;
 }
 
 export interface StateSnapshot {
@@ -290,6 +299,8 @@ export interface SkillView {
   builtin?: boolean;
   imported?: boolean;
   source?: string;
+  /** 策展生命周期：缺省视作 active，归档的技能不会再进入智能体的技能清单。 */
+  lifecycle?: SkillLifecycle;
   createdAt: number;
   updatedAt: number;
 }
@@ -648,6 +659,74 @@ export async function dismissLearningProposal(proposalId: string): Promise<Learn
     `/api/learning/${encodeURIComponent(proposalId)}/dismiss`,
     { method: "POST", body: "{}" },
   );
+  return body.proposal;
+}
+
+export interface CurationSnapshot {
+  settings: CurationSettings;
+  proposals: CurationProposal[];
+  log: CurationLog[];
+  /** skillId → 使用账本；已归档的技能也在这里，卡片徽章靠它。 */
+  usage: Record<string, SkillUsageRecord>;
+  /** 本次读路径顺带跑的扫描；未到间隔时只给 skipped 说明。 */
+  sweep: { proposals: CurationProposal[]; skipped?: string };
+}
+
+/** 策展面板的读路径：GET 会触发一次「到点才跑」的扫描，所以打开就能看到最新状态。 */
+export async function fetchCuration(): Promise<CurationSnapshot> {
+  return request<CurationSnapshot>("/api/skills/curation");
+}
+
+export async function sweepCuration(options: {
+  force?: boolean;
+  consolidate?: boolean;
+} = {}): Promise<{ proposals: CurationProposal[]; skipped?: string }> {
+  return request("/api/skills/curation/sweep", {
+    method: "POST",
+    body: JSON.stringify(options),
+  });
+}
+
+export async function applyCurationProposal(proposalId: string): Promise<CurationProposal> {
+  const body = await request<{ proposal: CurationProposal }>(
+    `/api/skills/curation/proposals/${encodeURIComponent(proposalId)}/apply`,
+    { method: "POST", body: "{}" },
+  );
+  return body.proposal;
+}
+
+export async function dismissCurationProposal(
+  proposalId: string,
+  reason?: string,
+): Promise<CurationProposal> {
+  const body = await request<{ proposal: CurationProposal }>(
+    `/api/skills/curation/proposals/${encodeURIComponent(proposalId)}/dismiss`,
+    {
+      method: "POST",
+      body: JSON.stringify(reason ? { reason } : {}),
+    },
+  );
+  return body.proposal;
+}
+
+/** 技能卡片上的手动操作：固定、归档、恢复。权限口径与编辑技能一致。 */
+export async function putSkillLifecycle(
+  skillId: string,
+  patch: { state?: SkillLifecycleState; pinned?: boolean },
+): Promise<SkillView> {
+  const body = await request<{ skill: SkillView }>(
+    `/api/skills/${encodeURIComponent(skillId)}/lifecycle`,
+    { method: "PUT", body: JSON.stringify(patch) },
+  );
+  return body.skill;
+}
+
+/** 不等扫描，直接为某条技能立一条归档提案（只进待确认清单，不真的归档）。 */
+export async function proposeSkillArchive(skillId: string): Promise<CurationProposal> {
+  const body = await request<{ proposal: CurationProposal }>("/api/skills/curation/archive", {
+    method: "POST",
+    body: JSON.stringify({ skillId }),
+  });
   return body.proposal;
 }
 
@@ -1079,6 +1158,8 @@ export async function saveSettings(patch: {
   learning?: Partial<LearningSettings>;
   /** 顾问扇出开关：是否启用 / 顾问人数 / 询问节奏 / every_n 间隔 / 失败处理 / 顾问模型。 */
   advisors?: Partial<AdvisorSettings>;
+  /** 技能策展开关：是否启用 / 闲置与归档阈值 / 扫描间隔 / 自动归档 / 合并建议 / 策展模型。 */
+  curation?: Partial<CurationSettings>;
 }): Promise<MaskedSettings> {
   const body = await request<{ settings: MaskedSettings }>("/api/settings", {
     method: "PUT",

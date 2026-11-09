@@ -13,6 +13,7 @@ import { addUsage, calculateUsageCost, emptyUsage, type UsageTotals } from "../m
 import type { ModelUsageStore } from "../model/usage-store";
 import type { SkillLibrary } from "../skills/library";
 import { selectSkillsForMember } from "../skills/selection";
+import type { SkillUsageRecorder } from "../skills/curation/types";
 import type { MemorySearchManager } from "../memory/manager";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import { resolveTriggerRecall } from "../memory/recall";
@@ -58,6 +59,8 @@ export interface RuntimeDeps {
   learning?: LearningHost;
   /** 顾问扇出：动手之前先问参谋（默认关闭，见设置里的 advisors）。 */
   advisors?: AdvisorService;
+  /** 技能使用记账（策展的输入）：由工作区注入全局使用账本，缺省不记。 */
+  skillUsage?: SkillUsageRecorder;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -181,6 +184,7 @@ export class MemberRuntime {
         getCron: () => this.deps.getCron?.(),
         ...(this.deps.memory ? { memory: this.deps.memory } : {}),
         ...(this.deps.files ? { files: this.deps.files } : {}),
+        ...(this.deps.skillUsage ? { skillUsage: this.deps.skillUsage } : {}),
       });
       // 主智能体要按成员能力档案决定把活派给谁：每次运行前同步 TEAM.md 再读进来，
       // 保证新建、移除成员或改技能授权后下一轮就看到最新值（读失败则不注入，fail-open）。

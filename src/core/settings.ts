@@ -18,10 +18,11 @@ import {
   type ProviderConfig,
 } from "../model/types";
 import { looksMasked, preserveSecretOnPatch, secretPreview } from "../model/secret";
+import { CURATION_RULES } from "../skills/curation/types";
 
 export type { ModelDefinition, ModelSelection, ProviderApi, ProviderConfig } from "../model/types";
 
-export const SETTINGS_VERSION = 5;
+export const SETTINGS_VERSION = 6;
 
 /**
  * 内置别名（对应 OpenClaw `src/config/defaults.ts` 的 alias 表），
@@ -109,6 +110,38 @@ export const DEFAULT_ADVISORS: AdvisorSettings = {
   degraded: "loud",
 };
 
+/**
+ * 技能策展（学习层第三阶段，对应 Hermes 的 curator pass）：技能库只增不减会越堆越厚，
+ * 这一步按「多久没人用」把闲置技能标出来、该归档的提出来，并（可选）让模型看有没有重复的能合并。
+ * 阈值口径照 Hermes 的 14 / 30 天；与 Hermes 的差别在于归档永远先出提案，
+ * 因为这里的技能库是全局共享的，一次归档会让所有账号的智能体都读不到它。
+ */
+export interface CurationSettings {
+  /** 总开关。使用记账不受它影响（那只是几个计数器，便宜且关掉就再也算不出闲置）。 */
+  enabled: boolean;
+  /** 距最近活动多少天标记闲置（可逆、不影响使用，直接落地）。 */
+  staleAfterDays: number;
+  /** 距最近活动多少天才提议归档；必须大于闲置阈值。 */
+  archiveAfterDays: number;
+  /** 两次策展的最小间隔（小时）；读接口再频繁也不会在这个窗口里重复扫。 */
+  intervalHours: number;
+  /** 自动归档：只对本账号自己的个人技能生效，共享技能与其他账号的技能永远走提案。 */
+  autoArchive: boolean;
+  /** 合并建议：要一次模型调用，默认关闭（Hermes 的 DEFAULT_CONSOLIDATE 同样是 false）。 */
+  consolidate: boolean;
+  /** 合并建议专用模型引用；留空跟随账号默认模型。 */
+  modelRef?: string;
+}
+
+export const DEFAULT_CURATION: CurationSettings = {
+  enabled: true,
+  staleAfterDays: CURATION_RULES.staleAfterDays,
+  archiveAfterDays: CURATION_RULES.archiveAfterDays,
+  intervalHours: CURATION_RULES.intervalHours,
+  autoArchive: false,
+  consolidate: false,
+};
+
 export const DEFAULT_SETTINGS: Settings = {
   settingsVersion: SETTINGS_VERSION,
   providers: [
@@ -130,6 +163,7 @@ export const DEFAULT_SETTINGS: Settings = {
   limits: { ...DEFAULT_LIMITS },
   learning: { ...DEFAULT_LEARNING },
   advisors: { ...DEFAULT_ADVISORS },
+  curation: { ...DEFAULT_CURATION },
 };
 
 export interface Settings {
@@ -142,6 +176,8 @@ export interface Settings {
   learning: LearningSettings;
   /** 顾问扇出（动手前先问参谋）的开关与节流；默认关闭，旧设置缺失时补默认值。 */
   advisors: AdvisorSettings;
+  /** 技能策展（闲置 / 归档 / 合并建议）的开关与阈值；默认只跑确定性扫描，不调模型。 */
+  curation: CurationSettings;
 }
 
 /** 每次返回一份全新的默认设置：DEFAULT_SETTINGS 是共享常量，调用方不要直接改它。 */
@@ -181,6 +217,7 @@ export interface MaskedSettings {
   limits: Limits;
   learning: LearningSettings;
   advisors: AdvisorSettings;
+  curation: CurationSettings;
 }
 
 function maskModel(model: ModelDefinition): MaskedModelDefinition {
@@ -219,6 +256,7 @@ export function maskSettings(settings: Settings): MaskedSettings {
     limits: settings.limits,
     learning: structuredClone(settings.learning),
     advisors: structuredClone(settings.advisors),
+    curation: structuredClone(settings.curation),
   };
 }
 
@@ -259,6 +297,7 @@ interface LegacySettings {
   limits?: Partial<Limits>;
   learning?: Partial<LearningSettings>;
   advisors?: Partial<AdvisorSettings>;
+  curation?: Partial<CurationSettings>;
 }
 
 /**
@@ -353,6 +392,14 @@ function migrateSettings(raw: Partial<Settings>): Partial<Settings> {
         return { ...DEFAULT_ADVISORS };
       }
     })(),
+    // 技能策展同理：v5 及更早的设置没有这个字段，补默认（只跑确定性扫描，不调模型）。
+    curation: (() => {
+      try {
+        return { ...DEFAULT_CURATION, ...sanitizeCuration(legacy.curation ?? {}) };
+      } catch {
+        return { ...DEFAULT_CURATION };
+      }
+    })(),
   };
 }
 
@@ -394,6 +441,7 @@ interface SettingsPatch {
   limits?: Partial<Limits>;
   learning?: Partial<LearningSettings>;
   advisors?: Partial<AdvisorSettings>;
+  curation?: Partial<CurationSettings>;
 }
 
 /**
@@ -490,6 +538,87 @@ export function sanitizeAdvisors(input: unknown): Partial<AdvisorSettings> {
   }
   if (record.modelRef !== undefined) {
     if (typeof record.modelRef !== "string") throw new Error("顾问模型引用必须是字符串");
+    const ref = record.modelRef.trim();
+    result.modelRef = ref || undefined;
+  }
+  return result;
+}
+
+/**
+ * 校验技能策展设置：开关只认真假，天数与间隔按整数与区间收口，
+ * 归档阈值必须晚于闲置阈值（两个都在本次补丁里时才校验，否则由判断函数兜底抬升），
+ * `modelRef` 空串视为「跟随账号默认模型」。
+ */
+export function sanitizeCuration(input: unknown): Partial<CurationSettings> {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("curation 必须是对象");
+  }
+  const record = input as Record<string, unknown>;
+  const known = [
+    "enabled",
+    "staleAfterDays",
+    "archiveAfterDays",
+    "intervalHours",
+    "autoArchive",
+    "consolidate",
+    "modelRef",
+  ];
+  for (const key of Object.keys(record)) {
+    if (!known.includes(key)) throw new Error(`未知的策展字段 ${key}`);
+  }
+  const result: Partial<CurationSettings> = {};
+  if (record.enabled !== undefined) {
+    if (typeof record.enabled !== "boolean") throw new Error("策展开关必须是布尔值");
+    result.enabled = record.enabled;
+  }
+  if (record.staleAfterDays !== undefined) {
+    if (
+      typeof record.staleAfterDays !== "number" ||
+      !Number.isInteger(record.staleAfterDays) ||
+      record.staleAfterDays < 1 ||
+      record.staleAfterDays > 90
+    ) {
+      throw new Error("闲置阈值需在 1–90 天之间（整数）");
+    }
+    result.staleAfterDays = record.staleAfterDays;
+  }
+  if (record.archiveAfterDays !== undefined) {
+    if (
+      typeof record.archiveAfterDays !== "number" ||
+      !Number.isInteger(record.archiveAfterDays) ||
+      record.archiveAfterDays < 7 ||
+      record.archiveAfterDays > 180
+    ) {
+      throw new Error("归档阈值需在 7–180 天之间（整数）");
+    }
+    if (
+      result.staleAfterDays !== undefined &&
+      record.archiveAfterDays <= result.staleAfterDays
+    ) {
+      throw new Error("归档阈值必须晚于闲置阈值");
+    }
+    result.archiveAfterDays = record.archiveAfterDays;
+  }
+  if (record.intervalHours !== undefined) {
+    if (
+      typeof record.intervalHours !== "number" ||
+      !Number.isInteger(record.intervalHours) ||
+      record.intervalHours < CURATION_RULES.minIntervalHours ||
+      record.intervalHours > 720
+    ) {
+      throw new Error(
+        `策展间隔需在 ${CURATION_RULES.minIntervalHours}–720 小时之间（整数）`,
+      );
+    }
+    result.intervalHours = record.intervalHours;
+  }
+  for (const key of ["autoArchive", "consolidate"] as const) {
+    if (record[key] === undefined) continue;
+    if (typeof record[key] !== "boolean") throw new Error("策展开关必须是布尔值");
+    result[key] = record[key];
+  }
+  if (record.modelRef !== undefined) {
+    if (typeof record.modelRef !== "string") throw new Error("策展模型引用必须是字符串");
     const ref = record.modelRef.trim();
     result.modelRef = ref || undefined;
   }
@@ -596,6 +725,11 @@ export function mergeSettings(base: Settings, patch: SettingsPatch): Settings {
       ...DEFAULT_ADVISORS,
       ...base.advisors,
       ...(patch.advisors ?? {}),
+    },
+    curation: {
+      ...DEFAULT_CURATION,
+      ...base.curation,
+      ...(patch.curation ?? {}),
     },
   };
 }

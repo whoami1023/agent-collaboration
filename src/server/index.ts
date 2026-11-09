@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { createApp } from "./app";
 import { AuthService } from "../auth/auth-service";
 import { SkillLibrary } from "../skills/library";
+import { SkillUsageStore } from "../skills/curation/usage-store";
 import { TemplateLibrary } from "../templates/template-library";
 import { WorkspaceRegistry } from "../workspace/workspace";
 
@@ -12,13 +13,18 @@ async function main(): Promise<void> {
   const auth = new AuthService(join(dataDir, "auth.json"));
   await auth.init();
 
-  const skills = new SkillLibrary(join(dataDir, "skills.json"));
+  // 技能账本先于技能库：库的编辑/删除回调要往账本打点，账本又是策展服务与技能库之间的唯一通道。
+  const skillUsage = new SkillUsageStore(join(dataDir, "skill-usage.json"));
+  const skills = new SkillLibrary(join(dataDir, "skills.json"), {
+    onPatch: (skillId) => skillUsage.recordPatch(skillId),
+    onRemove: (skillId) => void skillUsage.forgetSkill(skillId),
+  });
   await skills.init();
 
   const templates = new TemplateLibrary(join(dataDir, "templates.json"));
   await templates.init();
 
-  const workspaces = new WorkspaceRegistry(join(dataDir, "workspaces"), skills);
+  const workspaces = new WorkspaceRegistry(join(dataDir, "workspaces"), skills, skillUsage);
   const app = createApp({
     auth,
     workspaces,
@@ -53,6 +59,7 @@ async function main(): Promise<void> {
     console.log(`收到 ${signal}，正在保存并退出…`);
     server.close();
     await workspaces.closeAll().catch((err) => console.error("关闭工作区失败", err));
+    await skillUsage.flush().catch((err) => console.error("保存技能账本失败", err));
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));

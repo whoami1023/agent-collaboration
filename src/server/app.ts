@@ -8,6 +8,7 @@ import {
   mergeSettings,
   removeProvider,
   sanitizeAdvisors,
+  sanitizeCuration,
   sanitizeLearning,
   sanitizeLimits,
   type Settings,
@@ -28,6 +29,7 @@ import {
 import { AuthError, type AuthService, type PublicUser } from "../auth/auth-service";
 import { buildClearSessionCookie, buildSessionCookie, readSessionToken } from "../auth/cookies";
 import { SkillError, type SkillRecord, type SkillLibrary } from "../skills/library";
+import type { SkillLifecycleState } from "../skills/curation/types";
 import { TemplateError, type AgentTemplateRecord, type TemplateLibrary } from "../templates/template-library";
 import { draftTemplateFromMember } from "../templates/member-template";
 import { CronError, CRON_LIMITS } from "../cron/normalize";
@@ -401,6 +403,113 @@ export function createApp(deps: AppDeps): express.Express {
   app.delete("/api/skills/:id", async (req: Request, res: Response) => {
     await deps.skills.remove(currentUser(res), String(req.params["id"] ?? ""));
     res.json({ ok: true });
+  });
+
+  // ---------------------------------------------------------------- 技能策展（P3）
+
+  /**
+   * 策展面板的读路径：顺手触发一次「到点才跑」的扫描（间隔闸门在服务里），
+   * 所以打开面板就能看到最新的闲置标记与待确认提案，不需要额外的后台定时器。
+   */
+  app.get("/api/skills/curation", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const sweep = await workspace.curation.sweep();
+    const [proposals, log, usage] = await Promise.all([
+      workspace.curation.listProposals(),
+      workspace.curation.listLog(20),
+      workspace.curation.usageSnapshot(),
+    ]);
+    res.json({ settings: workspace.curation.curationSettings, proposals, log, usage, sweep });
+  });
+
+  /** 手动跑一遍扫描：`force` 跳开间隔闸门，`consolidate` 顺带问一次模型有没有重复技能。 */
+  app.post("/api/skills/curation/sweep", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    try {
+      const result = await workspace.curation.sweep({
+        ...(body["force"] === true ? { force: true } : {}),
+        ...(body["consolidate"] === true ? { consolidate: true } : {}),
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: errorMessage(err) });
+    }
+  });
+
+  /** 采纳：闲置/归档直接落生命周期，合并按「一条来源不归本人管就整组拒绝」落地。 */
+  app.post("/api/skills/curation/proposals/:id/apply", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      const proposal = await workspace.curation.applyProposal(
+        currentUser(res),
+        String(req.params["id"] ?? ""),
+      );
+      res.json({ proposal });
+    } catch (err) {
+      const message = errorMessage(err);
+      // 权限类错误沿用技能库自己的状态码（403），只有「提案不存在」才是 404。
+      const status =
+        err instanceof SkillError ? err.status : message === "策展提案不存在" ? 404 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  app.post(
+    "/api/skills/curation/proposals/:id/dismiss",
+    async (req: Request, res: Response) => {
+      const workspace = await workspaceFor(res);
+      const reason = stringField(bodyOf(req), "reason").trim();
+      try {
+        const proposal = await workspace.curation.dismissProposal(
+          String(req.params["id"] ?? ""),
+          reason || "用户忽略",
+        );
+        res.json({ proposal });
+      } catch (err) {
+        const message = errorMessage(err);
+        res.status(message === "策展提案不存在" ? 404 : 400).json({ error: message });
+      }
+    },
+  );
+
+  /** 不等扫描，直接为某条技能立一条归档提案（技能卡片上的「提议归档」）。 */
+  app.post("/api/skills/curation/archive", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      const proposal = await workspace.curation.proposeArchiveNow(
+        currentUser(res),
+        stringField(bodyOf(req), "skillId"),
+      );
+      res.status(201).json({ proposal });
+    } catch (err) {
+      res.status(400).json({ error: errorMessage(err) });
+    }
+  });
+
+  /** 技能卡片上的手动操作：固定、归档、恢复。权限与提案通道共用一套口径。 */
+  app.put("/api/skills/:id/lifecycle", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    const state = body["state"];
+    const pinned = body["pinned"];
+    if (state !== undefined && state !== "active" && state !== "stale" && state !== "archived") {
+      res.status(400).json({ error: "生命周期只能是 active、stale 或 archived" });
+      return;
+    }
+    if (pinned !== undefined && typeof pinned !== "boolean") {
+      res.status(400).json({ error: "固定标记必须是布尔值" });
+      return;
+    }
+    try {
+      const skill = await workspace.curation.setSkillLifecycle(currentUser(res), String(req.params["id"] ?? ""), {
+        ...(state !== undefined ? { state: state as SkillLifecycleState } : {}),
+        ...(pinned !== undefined ? { pinned } : {}),
+      });
+      res.json({ skill: skillView(skill) });
+    } catch (err) {
+      res.status(err instanceof SkillError ? err.status : 400).json({ error: errorMessage(err) });
+    }
   });
 
   app.get("/api/templates", (_req: Request, res: Response) => {
@@ -1152,12 +1261,14 @@ export function createApp(deps: AppDeps): express.Express {
       const limits = body.limits !== undefined ? sanitizeLimits(body.limits) : undefined;
       const learning = body.learning !== undefined ? sanitizeLearning(body.learning) : undefined;
       const advisors = body.advisors !== undefined ? sanitizeAdvisors(body.advisors) : undefined;
+      const curation = body.curation !== undefined ? sanitizeCuration(body.curation) : undefined;
       const next = mergeSettings(current, {
         ...(providers ? { providers } : {}),
         ...(selection ? { selection } : {}),
         ...(limits ? { limits } : {}),
         ...(learning ? { learning } : {}),
         ...(advisors ? { advisors } : {}),
+        ...(curation ? { curation } : {}),
       });
       // 默认模型失效（指向已删/已停用的模型）时先回落到仍然可用的引用，再校验。
       const ready = repairDefaultModel(next);

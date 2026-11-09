@@ -22,6 +22,8 @@ import {
   type SkillFileRecord,
 } from "./skill-files";
 import { parseSkillMarkdown, skillNameFromFile, SkillMarkdownError } from "./skill-md";
+import { normalizeLifecycle } from "./curation/lifecycle";
+import type { SkillLifecycle, SkillLifecycleState } from "./curation/types";
 
 export type SkillScope = "shared" | "personal";
 export type { SkillFileRecord } from "./skill-files";
@@ -46,6 +48,11 @@ export interface SkillRecord {
   builtin?: boolean;
   imported?: boolean;
   source?: string;
+  /**
+   * 策展生命周期位（缺省 = active）。归档只在这一层生效：
+   * listForAgent 会跳过 archived，智能体既看不到也调不到，但正文完整保留，随时能恢复。
+   */
+  lifecycle?: SkillLifecycle;
   createdAt: number;
   updatedAt: number;
 }
@@ -89,6 +96,13 @@ export interface SkillImportResult {
 export interface SkillLibraryOptions {
   seedShared?: boolean;
   now?: () => number;
+  /**
+   * 正文被人工编辑后回调（策展的使用账本据此记一次 patch，
+   * 用来判断「改过之后有没有人再用」——Hermes 唯一认的效能信号）。
+   */
+  onPatch?: (skillId: string) => void;
+  /** 技能被真删时回调，让使用账本清掉旧条目；归档不走这里（账本要留着解释为什么归档）。 */
+  onRemove?: (skillId: string) => void;
 }
 
 interface SkillData {
@@ -323,6 +337,8 @@ export class SkillLibrary {
   private chain: Promise<unknown> = Promise.resolve();
   private readonly now: () => number;
   private readonly seedShared: boolean;
+  private readonly onPatch?: (skillId: string) => void;
+  private readonly onRemove?: (skillId: string) => void;
 
   constructor(
     private readonly file: string,
@@ -330,13 +346,21 @@ export class SkillLibrary {
   ) {
     this.now = options.now ?? Date.now;
     this.seedShared = options.seedShared ?? true;
+    this.onPatch = options.onPatch;
+    this.onRemove = options.onRemove;
   }
 
   async init(): Promise<void> {
     try {
       const raw = JSON.parse(await readFile(this.file, "utf8")) as Partial<SkillData>;
+      const skills = Array.isArray(raw.skills) ? raw.skills : [];
+      for (const skill of skills) {
+        const lifecycle = normalizeLifecycle(skill.lifecycle);
+        if (lifecycle) skill.lifecycle = lifecycle;
+        else delete skill.lifecycle;
+      }
       this.data = {
-        skills: Array.isArray(raw.skills) ? raw.skills : [],
+        skills,
         removedBuiltins: Array.isArray(raw.removedBuiltins)
           ? raw.removedBuiltins.filter((name): name is string => typeof name === "string")
           : [],
@@ -420,8 +444,14 @@ export class SkillLibrary {
       .sort(byName);
   }
 
+  /**
+   * 智能体可见清单：已归档的技能不再出现，因此既进不了系统提示词，
+   * 也读不到（readForAgent 走的就是这份清单）；恢复后立刻回来。
+   */
   listForAgent(userId: string): SkillRecord[] {
-    return [...this.listShared(), ...this.listPersonal(userId)];
+    return [...this.listShared(), ...this.listPersonal(userId)].filter(
+      (skill) => skill.lifecycle?.state !== "archived",
+    );
   }
 
   readForAgent(userId: string, rawName: unknown): SkillRecord | undefined {
@@ -532,6 +562,7 @@ export class SkillLibrary {
         this.assertNameFree(name, record.scope, record.ownerId, record.id);
       }
       const files = input.files === undefined ? record.files : normalizeFilesInput(input.files);
+      const bodyChanged = instructions !== record.instructions;
       record.name = name;
       record.description = description;
       record.instructions = instructions;
@@ -541,6 +572,8 @@ export class SkillLibrary {
       else delete record.files;
       record.updatedAt = this.now();
       await this.persist();
+      // 只算正文改动：改个标题不该被记成「编辑过一次技能」，那是策展效能判断的分母。
+      if (bodyChanged) this.onPatch?.(record.id);
       return record;
     });
   }
@@ -556,19 +589,77 @@ export class SkillLibrary {
         this.data.removedBuiltins = [...removed];
       }
       await this.persist();
+      this.onRemove?.(record.id);
     });
   }
 
   /** 删号时清掉该用户的个人技能；共享技能保留（归属显示为「已注销账号」）。 */
   async removeOwnedBy(ownerId: string): Promise<number> {
     return this.mutate(async () => {
-      const before = this.data.skills.length;
-      this.data.skills = this.data.skills.filter(
-        (skill) => !(skill.scope === "personal" && skill.ownerId === ownerId),
+      const gone = this.data.skills.filter(
+        (skill) => skill.scope === "personal" && skill.ownerId === ownerId,
       );
-      const removed = before - this.data.skills.length;
-      if (removed > 0) await this.persist();
-      return removed;
+      if (gone.length === 0) return 0;
+      const goneIds = new Set(gone.map((skill) => skill.id));
+      this.data.skills = this.data.skills.filter((skill) => !goneIds.has(skill.id));
+      await this.persist();
+      for (const skill of gone) this.onRemove?.(skill.id);
+      return gone.length;
+    });
+  }
+
+  /** 策展采纳用：读一条技能而不抛错，返回 undefined 说明来源已被删除、提案随之失效。 */
+  findById(id: string): SkillRecord | undefined {
+    return this.data.skills.find((skill) => skill.id === id);
+  }
+
+  /** 策展扫描用：这条技能当前账号能不能管（不抛错，只判断），管不了的只出提案不落状态。 */
+  mayManage(user: SkillActor, id: string): boolean {
+    const record = this.data.skills.find((skill) => skill.id === id);
+    if (!record) return false;
+    return record.scope === "shared" ? user.role === "admin" : record.ownerId === user.id;
+  }
+
+  /**
+   * 生命周期唯一的写入口：状态迁移、固定、合并去向都从这里过，权限口径与编辑技能一致。
+   * 刻意不动 updatedAt —— 闲置判断的兜底时钟就是它，一迁移就刷新等于永远闲置不了。
+   */
+  async setLifecycle(
+    user: SkillActor,
+    id: string,
+    patch: {
+      state?: SkillLifecycleState;
+      pinned?: boolean;
+      absorbedInto?: string;
+      absorbedIntoId?: string;
+    },
+  ): Promise<SkillRecord> {
+    return this.mutate(async () => {
+      const record = this.find(id);
+      this.assertCanManage(user, record);
+      const next: SkillLifecycle = { ...(record.lifecycle ?? { state: "active" as const }) };
+      if (patch.pinned !== undefined) {
+        if (patch.pinned) next.pinned = true;
+        else delete next.pinned;
+      }
+      if (patch.state !== undefined && patch.state !== next.state) {
+        next.state = patch.state;
+        if (patch.state === "archived") next.archivedAt = this.now();
+        else {
+          delete next.archivedAt;
+          delete next.absorbedInto;
+          delete next.absorbedIntoId;
+        }
+      }
+      if (next.state === "archived") {
+        if (patch.absorbedInto) next.absorbedInto = patch.absorbedInto;
+        else delete next.absorbedInto;
+        if (patch.absorbedIntoId) next.absorbedIntoId = patch.absorbedIntoId;
+        else delete next.absorbedIntoId;
+      }
+      record.lifecycle = next;
+      await this.persist();
+      return record;
     });
   }
 

@@ -16,6 +16,7 @@ import { buildCronTools } from "./cron-tools";
 import { applyRunScope } from "./run-scope";
 import { verifyAcceptance, type EvidenceLedger } from "./evidence";
 import type { CronService } from "../cron/service";
+import type { SkillUsageRecorder } from "../skills/curation/types";
 
 export interface ToolDeps {
   bus: RoomBus;
@@ -38,6 +39,11 @@ export interface ToolDeps {
    * 交付闸门用它核验 task_update → done（见 evidence.ts）。
    */
   evidence?: EvidenceLedger;
+  /**
+   * 技能使用记账（策展的输入）：命中一次技能就加一次数，同步返回、异步落盘。
+   * 没接上时什么都不做——群聊永远不该因为账本写不进去而停下来。
+   */
+  skillUsage?: SkillUsageRecorder;
 }
 
 const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done", "failed"];
@@ -97,6 +103,8 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
         }`;
       }
       if (!isSkillSelected(member.skillNames, skill.name)) return denialFor(skill.name);
+      // 展开正文算一次真实使用：策展的闲置与归档判断只看这个计数，光在提示词里列出来不算被用过。
+      deps.skillUsage?.(skill.id, "use");
       const files = skill.files ?? [];
       const filesSection =
         files.length > 0
@@ -140,6 +148,8 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
           ? `错误：技能 ${skillName} 里没有文件 ${path}。可选路径：${list.join("、")}`
           : `错误：技能 ${skillName} 没有附带文件`;
       }
+      // 读附带文件只算「动过手」（viewCount），不计入 useCount：闲置判断看的是整份技能有没有被展开。
+      deps.skillUsage?.(skill.id, "view");
       if (hit.file.encoding === "base64") {
         return `文件 ${hit.file.path} 是二进制内容（${formatSkillFileSize(
           hit.file.size,
@@ -443,6 +453,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
         userId: deps.userId,
         member,
         ...(deps.evidence ? { evidence: deps.evidence } : {}),
+        ...(deps.skillUsage ? { skillUsage: deps.skillUsage } : {}),
       }),
     );
   }

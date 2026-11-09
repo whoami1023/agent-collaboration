@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { LearningProposal, LearningSettings, ReviewLog, SkillProposal } from "./api";
 import { applyLearningProposal, dismissLearningProposal, fetchLearning } from "./api";
+import CurationSection from "./CurationSection";
 import { Icon } from "./icons";
 
-type LearningTab = "pending" | "applied" | "log";
+type LearningTab = "pending" | "applied" | "log" | "curation";
 
 interface LearningPanelProps {
   onClose(): void;
@@ -87,6 +88,7 @@ export default function LearningPanel({
   const [tab, setTab] = useState<LearningTab>("pending");
   const [proposals, setProposals] = useState<LearningProposal[]>([]);
   const [log, setLog] = useState<ReviewLog[]>([]);
+  const [curationPending, setCurationPending] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
 
@@ -206,10 +208,24 @@ export default function LearningPanel({
             >
               复盘流水
             </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "curation"}
+              className={`skills-tab${tab === "curation" ? " active" : ""}`}
+              onClick={() => setTab("curation")}
+            >
+              技能策展
+              <span className="chip">{curationPending}</span>
+            </button>
           </div>
         </div>
 
-        {tab !== "log" && (
+        {tab === "curation" && (
+          <CurationSection refreshToken={refreshToken} onPendingChange={setCurationPending} />
+        )}
+
+        {tab !== "log" && tab !== "curation" && (
           <p className="hint">
             成员每轮交付后，另起一次模型调用判断「这轮有没有值得长期记住的事实、有没有值得沉淀的做法」。
             {learning

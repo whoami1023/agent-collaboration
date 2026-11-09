@@ -23,6 +23,7 @@ import type { WorkspaceFiles } from "../files/workspace-files";
 import { MemberRuntime } from "./member-runtime";
 import { AdvisorService } from "./advisors/service";
 import type { LearningHost } from "./learning/types";
+import type { SkillUsageRecorder } from "../skills/curation/types";
 import { CRON_SENDER_ID } from "../cron/types";
 import type { CronTurnOutcome } from "../cron/types";
 import type { CronService } from "../cron/service";
@@ -46,6 +47,8 @@ export interface OrchestratorDeps {
   onUsageRecord?(record: MemberUsageRecord): void;
   /** 学习层：成员一轮交付后触发后台复盘（工作区在建模时注入）。 */
   learning?: LearningHost;
+  /** 策展层：技能使用记账回调，工具被真正调用时打点（工作区在建模时注入）。 */
+  skillUsage?: SkillUsageRecorder;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -648,6 +651,7 @@ export class Orchestrator {
         ...(deps.usage ? { usage: deps.usage } : {}),
         ...(deps.onUsageRecord ? { onUsageRecord: deps.onUsageRecord } : {}),
         ...(deps.learning ? { learning: deps.learning } : {}),
+        ...(deps.skillUsage ? { skillUsage: deps.skillUsage } : {}),
         advisors: this.advisors,
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });

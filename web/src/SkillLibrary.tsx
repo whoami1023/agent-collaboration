@@ -3,23 +3,30 @@ import type { ChangeEvent, FormEvent } from "react";
 import {
   createSkill,
   deleteSkill,
+  fetchCuration,
   fetchSkillFile,
   fetchSkills,
   importSkills,
+  proposeSkillArchive,
+  putSkillLifecycle,
   updateSkill,
   type SkillCategory,
   type SkillCategoryView,
   type SkillFileInput,
   type SkillFileView,
   type SkillImportResult,
+  type SkillLifecycleState,
   type SkillScope,
   type SkillSnapshot,
+  type SkillUsageRecord,
   type SkillView,
 } from "./api";
 import { Icon } from "./icons";
 
 type SkillTab = "shared" | "personal";
 type CategoryFilter = SkillCategory | "all";
+/** 默认不打扰：归档过的技能收在「含已归档」开关后面，需要恢复时再打开。 */
+type LifecycleFilter = "active" | "all";
 
 type SkillMode =
   | { kind: "list" }
@@ -34,6 +41,20 @@ function messageOf(err: unknown): string {
 
 function scopeLabel(scope: SkillScope): string {
   return scope === "shared" ? "共享" : "个人";
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * 闲置天数的口径与服务端一致：看最近一次真实活动（用过 / 读过 / 改过），
+ * 一次都没有就退回创建或更新时间 —— 从没被用过的技能只会被标记，不会被归档。
+ */
+function idleDaysOf(skill: SkillView, usage: SkillUsageRecord | undefined, now: number): number {
+  const stamps = [usage?.lastUsedAt, usage?.lastViewedAt, usage?.lastPatchedAt].filter(
+    (value): value is number => typeof value === "number",
+  );
+  const last = stamps.length > 0 ? Math.max(...stamps) : Math.max(skill.updatedAt, skill.createdAt);
+  return Math.max(0, Math.floor((now - last) / DAY_MS));
 }
 
 const MAX_SKILL_MD_BYTES = 256 * 1024;
@@ -123,6 +144,9 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [usageById, setUsageById] = useState<Record<string, SkillUsageRecord>>({});
+  const [lifecycleFilter, setLifecycleFilter] = useState<LifecycleFilter>("active");
+  const [curationBusy, setCurationBusy] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -130,6 +154,13 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
       setError(null);
     } catch (err) {
       setError(messageOf(err));
+    }
+    // 使用账本与策展状态读不到也不该影响技能库本身：徽章只是附加信息。
+    try {
+      const curation = await fetchCuration();
+      setUsageById(curation.usage);
+    } catch {
+      setUsageById({});
     }
   }, []);
 
@@ -166,12 +197,60 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
   const canManageShared = snapshot?.canManageShared ?? false;
   const skills = tab === "shared" ? shared : personal;
   const canManage = (skill: SkillView) => skill.scope === "personal" || canManageShared;
+  const isArchived = (skill: SkillView) => skill.lifecycle?.state === "archived";
+  const archivedCount = skills.filter(isArchived).length;
+  const now = Date.now();
+
+  /** 生命周期改动直接写回当前快照，省一次全量刷新（技能多时列表不该闪）。 */
+  function applyLifecycleUpdate(updated: SkillView) {
+    setSnapshot((current) => {
+      if (!current) return current;
+      const swap = (list: SkillView[]) =>
+        list.map((item) => (item.id === updated.id ? updated : item));
+      return { ...current, shared: swap(current.shared), personal: swap(current.personal) };
+    });
+  }
+
+  async function handleLifecycle(
+    skill: SkillView,
+    patch: { state?: SkillLifecycleState; pinned?: boolean },
+    done: string,
+  ) {
+    if (curationBusy) return;
+    setCurationBusy(skill.id);
+    setError(null);
+    setNotice(null);
+    try {
+      applyLifecycleUpdate(await putSkillLifecycle(skill.id, patch));
+      setNotice(done);
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setCurationBusy(null);
+    }
+  }
+
+  async function handleProposeArchive(skill: SkillView) {
+    if (curationBusy) return;
+    setCurationBusy(skill.id);
+    setError(null);
+    setNotice(null);
+    try {
+      await proposeSkillArchive(skill.id);
+      setNotice(`已把 ${skill.name} 放进策展的待确认清单，在「学习 → 技能策展」里确认才会真的归档。`);
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setCurationBusy(null);
+    }
+  }
 
   const categories = snapshot?.categories ?? [];
   const categoryById = new Map(categories.map((item) => [item.id, item]));
   const categoryLabel = (id: SkillCategory): string => categoryById.get(id)?.label ?? "其他";
   const normalizedQuery = query.trim().toLowerCase();
   const matching = skills.filter((skill) => {
+    if (lifecycleFilter === "active" && isArchived(skill)) return false;
     if (!normalizedQuery) return true;
     return (
       skill.name.toLowerCase().includes(normalizedQuery) ||
@@ -230,6 +309,31 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
         {skill.builtin && <span className="chip">内置</span>}
         {skill.imported && <span className="chip">导入</span>}
         {fileCountLabel(skill) && <span className="chip">{fileCountLabel(skill)}</span>}
+        {!skill.builtin && (
+          <span
+            className={`chip${
+              skill.lifecycle?.state === "archived"
+                ? " skill-archived"
+                : skill.lifecycle?.state === "stale"
+                  ? " skill-stale"
+                  : ""
+            }`}
+            title={
+              skill.lifecycle?.state === "archived"
+                ? "已归档：不会再进入智能体的技能清单，正文与附带文件都还留着"
+                : skill.lifecycle?.state === "stale"
+                  ? "闲置中：超过归档阈值才会提议归档，且要你确认"
+                  : "正常使用中"
+            }
+          >
+            {skill.lifecycle?.state === "archived"
+              ? "已归档"
+              : skill.lifecycle?.state === "stale"
+                ? "闲置"
+                : `用过 ${usageById[skill.id]?.useCount ?? 0} 次 · 闲置 ${idleDaysOf(skill, usageById[skill.id], now)} 天`}
+          </span>
+        )}
+        {skill.lifecycle?.pinned && <span className="chip">已固定</span>}
       </div>
       <p className="skill-desc">{skill.description}</p>
       <div className="skill-foot">
@@ -256,6 +360,66 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
             >
               编辑
             </button>
+          )}
+          {canManage(skill) && !skill.builtin && (
+            <>
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={curationBusy === skill.id}
+                title={
+                  skill.lifecycle?.pinned
+                    ? "取消固定后，这条技能重新参与闲置与归档的判断"
+                    : "固定：策展扫描不会再动这条技能的状态"
+                }
+                onClick={() =>
+                  void handleLifecycle(
+                    skill,
+                    { pinned: !skill.lifecycle?.pinned },
+                    skill.lifecycle?.pinned
+                      ? `已取消固定 ${skill.name}`
+                      : `已固定 ${skill.name}，策展不再动它`,
+                  )
+                }
+              >
+                {skill.lifecycle?.pinned ? "取消固定" : "固定"}
+              </button>
+              {isArchived(skill) ? (
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  disabled={curationBusy === skill.id}
+                  onClick={() =>
+                    void handleLifecycle(skill, { state: "active" }, `已恢复 ${skill.name}，智能体重新能用它`)
+                  }
+                >
+                  恢复
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={curationBusy === skill.id}
+                    title="只进待确认清单，不会直接改动技能状态"
+                    onClick={() => void handleProposeArchive(skill)}
+                  >
+                    提议归档
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm danger"
+                    disabled={curationBusy === skill.id}
+                    title="归档不等于删除：正文与附带文件都保留，随时可以恢复"
+                    onClick={() =>
+                      void handleLifecycle(skill, { state: "archived" }, `已归档 ${skill.name}，随时可恢复`)
+                    }
+                  >
+                    归档
+                  </button>
+                </>
+              )}
+            </>
           )}
           {canManage(skill) &&
             (confirmingId === skill.id ? (
@@ -381,6 +545,23 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
                   <Icon name="import" />
                   导入
                 </button>
+                <button
+                  type="button"
+                  className={`btn ghost sm${lifecycleFilter === "all" ? " active" : ""}`}
+                  aria-pressed={lifecycleFilter === "all"}
+                  title={
+                    archivedCount === 0
+                      ? "这个标签下还没有归档过的技能。归档的技能不会进入智能体的技能清单，正文都保留。"
+                      : lifecycleFilter === "all"
+                        ? "收起已归档的技能，列表只留能用的"
+                        : `展开这 ${archivedCount} 条已归档的技能，可以逐条恢复`
+                  }
+                  onClick={() => setLifecycleFilter((current) => (current === "all" ? "active" : "all"))}
+                >
+                  <Icon name="archive" />
+                  <span>含已归档</span>
+                  <span className="chip">{archivedCount}</span>
+                </button>
               </div>
             </div>
             <p className="hint">{hint}</p>
@@ -440,6 +621,16 @@ export default function SkillLibraryPanel({ onClose }: { onClose: () => void }) 
                   ? "共享库还是空的。"
                   : "你还没有个人技能，可以新建一个，或导入现成的 SKILL.md。"}
               </p>
+            ) : matching.length === 0 && archivedCount > 0 && !normalizedQuery ? (
+              <div className="skills-empty">
+                <p className="empty small">
+                  这个标签下的 {archivedCount} 条技能都已归档，默认先收起来不打扰。
+                </p>
+                <button type="button" className="btn ghost sm" onClick={() => setLifecycleFilter("all")}>
+                  <Icon name="archive" />
+                  查看已归档
+                </button>
+              </div>
             ) : matching.length === 0 ? (
               <div className="skills-empty">
                 <p className="empty small">没有匹配「{query.trim()}」的技能。</p>

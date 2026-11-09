@@ -125,7 +125,7 @@ import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdo
 import { CsvPreview, RichPreviewBody } from "./FilePreviews";
 
 type ThemeMode = "light" | "dark";
-type SettingsTab = "profile" | "model" | "limits" | "learning" | "advisors" | "appearance";
+type SettingsTab = "profile" | "model" | "limits" | "learning" | "curation" | "advisors" | "appearance";
 /** 右侧面板的三个视图：任务看板、文件工作区、归档区。 */
 type RightTab = "tasks" | "files" | "archives";
 
@@ -2036,7 +2036,7 @@ function RoomView({
             >
               <Icon name="sparkles" />
               <span className="nav-label">学习</span>
-              <span className="nav-hint">复盘产出 · 记忆与技能</span>
+              <span className="nav-hint">复盘产出 · 记忆 · 技能策展</span>
               {learningPending > 0 && <span className="nav-count">{learningPending}</span>}
             </button>
 
@@ -4570,6 +4570,14 @@ function SettingsDialog({
             </button>
             <button
               type="button"
+              className={`settings-tab${tab === "curation" ? " active" : ""}`}
+              onClick={() => setTab("curation")}
+            >
+              <Icon name="archive" />
+              技能策展
+            </button>
+            <button
+              type="button"
               className={`settings-tab${tab === "advisors" ? " active" : ""}`}
               onClick={() => setTab("advisors")}
             >
@@ -4593,6 +4601,13 @@ function SettingsDialog({
             {tab === "limits" && <LimitsSection settings={settings} onSaved={onSettingsSaved} />}
             {tab === "learning" && (
               <LearningSection
+                settings={settings}
+                modelChoices={modelChoices}
+                onSaved={onSettingsSaved}
+              />
+            )}
+            {tab === "curation" && (
+              <CurationSettingsSection
                 settings={settings}
                 modelChoices={modelChoices}
                 onSaved={onSettingsSaved}
@@ -5215,6 +5230,209 @@ function AdvisorSection({
       <div className="modal-actions">
         <button className="btn primary" disabled={busy} onClick={() => void handleSave()}>
           {busy ? "保存中…" : "保存顾问设置"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CurationSettingsSection({
+  settings,
+  modelChoices,
+  onSaved,
+}: {
+  settings: MaskedSettings;
+  modelChoices: { ref: string; label: string }[];
+  onSaved: (next: MaskedSettings) => void;
+}) {
+  const curation = settings.curation;
+  const [enabled, setEnabled] = useState(curation?.enabled ?? true);
+  const [staleAfterDays, setStaleAfterDays] = useState(String(curation?.staleAfterDays ?? 14));
+  const [archiveAfterDays, setArchiveAfterDays] = useState(String(curation?.archiveAfterDays ?? 30));
+  const [intervalHours, setIntervalHours] = useState(String(curation?.intervalHours ?? 168));
+  const [autoArchive, setAutoArchive] = useState(curation?.autoArchive ?? false);
+  const [consolidate, setConsolidate] = useState(curation?.consolidate ?? false);
+  const [modelRef, setModelRef] = useState(curation?.modelRef ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  async function handleSave() {
+    if (busy) return;
+    setError(null);
+    setNote(null);
+    const stale = Number(staleAfterDays.trim());
+    if (!Number.isInteger(stale) || stale < 1 || stale > 90) {
+      setError("闲置阈值需在 1–90 天之间（整数）");
+      return;
+    }
+    const archive = Number(archiveAfterDays.trim());
+    if (!Number.isInteger(archive) || archive < 7 || archive > 180) {
+      setError("归档阈值需在 7–180 天之间（整数）");
+      return;
+    }
+    if (archive <= stale) {
+      setError("归档要比标记闲置更晚：归档天数必须大于闲置天数");
+      return;
+    }
+    const interval = Number(intervalHours.trim());
+    if (!Number.isInteger(interval) || interval < 24 || interval > 720) {
+      setError("扫描间隔需在 24–720 小时之间（整数）");
+      return;
+    }
+    setBusy(true);
+    try {
+      const next = await saveSettings({
+        curation: {
+          enabled,
+          staleAfterDays: stale,
+          archiveAfterDays: archive,
+          intervalHours: interval,
+          autoArchive,
+          consolidate,
+          modelRef: modelRef.trim(),
+        },
+      });
+      onSaved(next);
+      const saved = next.curation;
+      setEnabled(saved.enabled);
+      setStaleAfterDays(String(saved.staleAfterDays));
+      setArchiveAfterDays(String(saved.archiveAfterDays));
+      setIntervalHours(String(saved.intervalHours));
+      setAutoArchive(saved.autoArchive);
+      setConsolidate(saved.consolidate);
+      setModelRef(saved.modelRef ?? "");
+      setNote("已保存，下次扫描起生效");
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="settings-form">
+      <div className="section-label">技能策展</div>
+      <p className="hint">
+        技能库会越攒越多，用过的和早就不用的混在一起。策展按「有没有被真正使用」来整理：
+        智能体每调用一次 use_skill 或跑一次技能脚本就记一笔账，闲置过阈值先标记，再久才提议归档。
+        归档不删东西 —— 正文与附带文件都留在技能库里，随时能恢复；所有状态改动都要你点确认，
+        只有自己的个人技能才允许自动归档。
+      </p>
+      <label className="field">
+        <span>
+          技能策展
+          <em>（关闭后扫描什么都不做，已有状态保持不变）</em>
+        </span>
+        <select
+          value={enabled ? "on" : "off"}
+          onChange={(event) => setEnabled(event.target.value === "on")}
+        >
+          <option value="on">开启（整理闲置与归档）</option>
+          <option value="off">关闭（不动任何技能）</option>
+        </select>
+      </label>
+      <label className="field">
+        <span>
+          标记闲置（天）
+          <em>（1–90 · 从未用过的技能只标记，绝不归档）</em>
+        </span>
+        <input
+          type="number"
+          value={staleAfterDays}
+          min={1}
+          max={90}
+          step={1}
+          disabled={!enabled}
+          onChange={(event) => setStaleAfterDays(event.target.value)}
+        />
+      </label>
+      <label className="field">
+        <span>
+          提议归档（天）
+          <em>（7–180 · 必须大于上面的闲置天数）</em>
+        </span>
+        <input
+          type="number"
+          value={archiveAfterDays}
+          min={7}
+          max={180}
+          step={1}
+          disabled={!enabled}
+          onChange={(event) => setArchiveAfterDays(event.target.value)}
+        />
+      </label>
+      <label className="field">
+        <span>
+          扫描间隔（小时）
+          <em>（24–720 · 打开「学习 → 技能策展」时到点才跑，不会额外常驻一个定时器）</em>
+        </span>
+        <input
+          type="number"
+          value={intervalHours}
+          min={24}
+          max={720}
+          step={1}
+          disabled={!enabled}
+          onChange={(event) => setIntervalHours(event.target.value)}
+        />
+      </label>
+      <label className="field">
+        <span>
+          自动归档
+          <em>（默认关闭：归档一律先进待确认清单）</em>
+        </span>
+        <select
+          value={autoArchive ? "on" : "off"}
+          disabled={!enabled}
+          onChange={(event) => setAutoArchive(event.target.value === "on")}
+        >
+          <option value="off">不自动归档（等我确认）</option>
+          <option value="on">自动归档本账号自己的个人技能</option>
+        </select>
+      </label>
+      <label className="field">
+        <span>
+          找重复技能
+          <em>（默认关闭：只有手动扫描「扫描并找重复」才会把候选清单交给模型比对一轮）</em>
+        </span>
+        <select
+          value={consolidate ? "on" : "off"}
+          disabled={!enabled}
+          onChange={(event) => setConsolidate(event.target.value === "on")}
+        >
+          <option value="off">不比对（只做按时间的机械整理）</option>
+          <option value="on">扫描时顺带提议合并</option>
+        </select>
+        <span className="hint">
+          合并建议全靠模型判断哪些技能其实是同一件事，来源清单由程序生成、清单外的名字一律作废；
+          采纳时只要有一条来源不归当前账号管，整组就拒绝，不会归档了一半。
+        </span>
+      </label>
+      <label className="field">
+        <span>
+          策展模型
+          <em>（留空则跟随默认模型）</em>
+        </span>
+        <select value={modelRef} disabled={!enabled} onChange={(event) => setModelRef(event.target.value)}>
+          <option value="">跟随默认模型</option>
+          {modelChoices
+            .filter((choice) => choice.ref !== "default")
+            .map((choice) => (
+              <option key={choice.ref} value={choice.ref}>
+                {choice.label}
+              </option>
+            ))}
+        </select>
+        <span className="hint">
+          只有「找重复」这一步真的会调用模型；标记闲置与提议归档都是纯粹的时间与次数比较，不花钱。
+        </span>
+      </label>
+      {error && <p className="form-error">{error}</p>}
+      {note && <p className="form-note">{note}</p>}
+      <div className="modal-actions">
+        <button className="btn primary" disabled={busy} onClick={() => void handleSave()}>
+          {busy ? "保存中…" : "保存策展设置"}
         </button>
       </div>
     </div>

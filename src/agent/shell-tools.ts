@@ -4,6 +4,7 @@ import path from "node:path";
 import type { Member } from "../core/types";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import type { SkillLibrary } from "../skills/library";
+import type { SkillUsageRecorder } from "../skills/curation/types";
 import { isSkillSelected } from "../skills/selection";
 import {
   commandHandle,
@@ -28,6 +29,8 @@ export interface ShellToolDeps {
   member: Member;
   /** 本轮证据台账：命令退出码 0 才记账，作为交付闸门的核验来源。 */
   evidence?: EvidenceLedger;
+  /** 技能使用记账：跑技能自带脚本算一次真实使用（比展开正文更强的信号）。 */
+  skillUsage?: SkillUsageRecorder;
 }
 
 export interface RunOptions {
@@ -386,6 +389,9 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
             ? `错误：技能 ${skill.name} 里没有文件 ${scriptPath}。可选路径：${list.join("、")}`
             : `错误：技能 ${skill.name} 没有附带文件`;
         }
+        // 按「发起了这次执行」记账，不看退出码：脚本因为本机没装运行时而失败，
+        // 不该让这份技能被算成没人用进而归档。
+        deps.skillUsage?.(skill.id, "use");
 
         const rawArgs = args["args"];
         if (rawArgs !== undefined && !Array.isArray(rawArgs)) return "错误：args 必须是字符串数组";

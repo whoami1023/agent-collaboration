@@ -5016,6 +5016,39 @@ body.pane-dragging * {
   overflow-wrap: anywhere;
 }
 
+/* ---------- skill curation (技能策展) ---------- */
+
+.curation-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 16px 0 8px;
+  color: var(--text-strong);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.curation-title:first-of-type {
+  margin-top: 4px;
+}
+
+/* 闲置用暖色、归档用虚线灰：归档不删正文也不删文件，不该看起来像报错。 */
+.chip.skill-stale {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: var(--warn-subtle);
+  color: var(--warn);
+}
+
+.chip.skill-archived {
+  border-style: dashed;
+  background: var(--panel);
+  color: var(--muted);
+}
+
+.learning-log.transitioned {
+  border-left-color: var(--ok);
+}
+
 /* ---------- auth ---------- */
 
 .auth-screen {

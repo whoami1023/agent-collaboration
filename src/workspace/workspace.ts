@@ -2,6 +2,8 @@ import { join } from "node:path";
 import { rm } from "node:fs/promises";
 import { LearningService } from "../agent/learning/service";
 import { LearningStore } from "../agent/learning/store";
+import { CurationService } from "../skills/curation/service";
+import { SkillUsageStore } from "../skills/curation/usage-store";
 import { ensureMainMember, Orchestrator } from "../agent/orchestrator";
 import { SessionArchives, summaryOf } from "../archive/session-archive";
 import { CronService } from "../cron/service";
@@ -134,9 +136,16 @@ export class Workspace {
     private readonly manifest: RoomManifest,
     /** 学习层：复盘服务 + 账本，路由与关房都要用。 */
     readonly learning: LearningService,
+    /** 策展层：技能生命周期与合并建议，扫描走惰性读路径，关房时要冲刷账本。 */
+    readonly curation: CurationService,
   ) {}
 
-  static async load(rootDir: string, owner: WorkspaceOwner, skills: SkillLibrary): Promise<Workspace> {
+  static async load(
+    rootDir: string,
+    owner: WorkspaceOwner,
+    skills: SkillLibrary,
+    skillUsage: SkillUsageStore,
+  ): Promise<Workspace> {
     const dir = join(rootDir, owner.id);
     const manifest = new RoomManifest(dir);
     const descriptors = await manifest.load();
@@ -214,6 +223,17 @@ export class Workspace {
       },
     });
 
+    // 策展层（P3）：技能生命周期与合并建议。账本是全局的（技能本身全局共享），
+    // 服务按账号建，扫描只覆盖这个账号看得见的技能，读路径惰性触发。
+    const curation = new CurationService({
+      store: skillUsage,
+      skills,
+      getSettings: () => settingsRef.current,
+      getModelDeps: () => ({ settings: settingsRef.current, dataDir: dir }),
+      owner: { id: owner.id, name: owner.displayName, ...(owner.role ? { role: owner.role } : {}) },
+      usage,
+    });
+
     const workspace = new Workspace(
       owner.id,
       dir,
@@ -226,6 +246,7 @@ export class Workspace {
       settingsRef,
       manifest,
       learning,
+      curation,
     );
     workspaceRef = workspace;
     workspace.groupBuses = groupBuses;
@@ -324,6 +345,7 @@ export class Workspace {
       usage: this.usage,
       onUsageRecord: (record) => bus.emit({ type: "model-usage", usage: record }),
       learning: this.learning,
+      skillUsage: this.curation.recordUsage,
     });
     const instance: RoomInstance = { descriptor, bus, board, orchestrator, stateFile: this.stateFileFor(descriptor.id), saveTimer: null };
     bus.subscribe((event) => {
@@ -792,22 +814,32 @@ export class Workspace {
     );
     await this.usage.flush().catch(() => undefined);
     await this.learning.flush().catch(() => undefined);
+    await this.curation.flush().catch(() => undefined);
     await this.cronService?.flush().catch(() => undefined);
   }
 }
 
 export class WorkspaceRegistry {
   private workspaces = new Map<string, Promise<Workspace>>();
+  /**
+   * 技能使用账本：技能本身是全局的，账本也必须全局——同一条技能的用量不能按账号各算一份。
+   * 服务端在启动时传入（与 `data/skills.json` 并列）；没传时退化成 `workspaces/skill-usage.json`，
+   * 测试与内嵌启动仍能独立跑起来。
+   */
+  private readonly skillUsage: SkillUsageStore;
 
   constructor(
     private readonly rootDir: string,
     private readonly skills: SkillLibrary,
-  ) {}
+    skillUsage?: SkillUsageStore,
+  ) {
+    this.skillUsage = skillUsage ?? new SkillUsageStore(join(rootDir, "skill-usage.json"));
+  }
 
   get(owner: WorkspaceOwner): Promise<Workspace> {
     const existing = this.workspaces.get(owner.id);
     if (existing) return existing;
-    const created = Workspace.load(this.rootDir, owner, this.skills).catch((err) => {
+    const created = Workspace.load(this.rootDir, owner, this.skills, this.skillUsage).catch((err) => {
       this.workspaces.delete(owner.id);
       throw err;
     });

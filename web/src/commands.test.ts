@@ -115,6 +115,14 @@ const settings: MaskedSettings = {
   },
   learning: { mode: "propose", everyNRuns: 2, dailyCap: 20 },
   advisors: { enabled: false, maxAdvisors: 2, cadence: "user_turn", everyN: 3, degraded: "loud" },
+  curation: {
+    enabled: true,
+    staleAfterDays: 14,
+    archiveAfterDays: 30,
+    intervalHours: 168,
+    autoArchive: false,
+    consolidate: false,
+  },
 };
 
 function data(overrides: Partial<CommandData> = {}): CommandData {
