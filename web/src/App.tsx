@@ -21,6 +21,7 @@ import type {
   TaskEvidenceKind,
 } from "../../src/core/types";
 import { DEFAULT_LIMITS, LIMIT_FIELDS, ROOM_ROUTING_LABELS, RUN_SCOPE_LABELS } from "../../src/core/types";
+import type { QuestionField, QuestionItem } from "../../src/room/questions";
 import { Icon, type IconName } from "./icons";
 import {
   LAYOUT_KEY,
@@ -103,6 +104,7 @@ import {
   setRoomRouting,
   setupAdmin,
   startNewSession,
+  answerQuestion,
   subscribeEvents,
   updateProfile,
   uploadWorkspaceFile,
@@ -970,6 +972,12 @@ function RoomView({
   const messages = state?.messages ?? [];
   const members = state?.members ?? [];
   const tasks = state?.tasks ?? [];
+  const questions = state?.questions ?? [];
+  const openQuestions = questions.filter((question) => question.status === "open");
+  const questionByMessageId = useMemo(
+    () => new Map(questions.map((question) => [question.messageId, question])),
+    [questions],
+  );
   const roomMode = state?.room.mode ?? "delegate";
   const roomRouting = state?.room.routing ?? "lead";
 
@@ -1518,6 +1526,25 @@ function RoomView({
       await sendMessage(
         `@${memberName} 接着刚才没做完的继续：先回顾上一轮的进展与未完成项，` +
           "把剩下的做完后汇报结论、关键产出路径和仍未解决的地方。",
+      );
+    } catch (err) {
+      setError(messageOf(err));
+    }
+  }
+
+  /** 回答结构化提问的一题：服务端返回最新问题状态，全部答完会额外回灌一条用户消息。 */
+  async function handleAnswerQuestion(
+    questionId: string,
+    fieldId: string,
+    payload: { optionId?: string; text?: string },
+  ): Promise<void> {
+    setError(null);
+    try {
+      const result = await answerQuestion(questionId, { fieldId, ...payload });
+      setState((current) =>
+        current
+          ? { ...current, questions: upsert(current.questions, result.question) }
+          : current,
       );
     } catch (err) {
       setError(messageOf(err));
@@ -2461,6 +2488,20 @@ function RoomView({
               <pre>{commandOutput.body}</pre>
             </section>
           )}
+          {openQuestions.length > 0 && (
+            <button
+              type="button"
+              className="question-banner"
+              onClick={() =>
+                document
+                  .getElementById(`question-${openQuestions[0]!.messageId}`)
+                  ?.scrollIntoView({ behavior: "smooth", block: "center" })
+              }
+            >
+              <span>{openQuestions.length} 个问题等你回答</span>
+              <span className="question-banner-action">查看</span>
+            </button>
+          )}
           <div className="messages">
             <div className="messages-inner">
               {messages.length === 0 && (
@@ -2480,8 +2521,10 @@ function RoomView({
                 <MessageBubble
                   key={message.id}
                   message={message}
+                  question={questionByMessageId.get(message.id)}
                   nameById={nameById}
                   onResume={handleResume}
+                  onAnswer={handleAnswerQuestion}
                 />
               ))}
               {Object.values(runs).map((run) => {
@@ -4136,7 +4179,9 @@ function PaneResizer({
 function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnapshot | null {
   if (!current) return current;
   if (event.type === "messages-cleared") {
-    return current.messages.length === 0 ? current : { ...current, messages: [] };
+    return current.messages.length === 0
+      ? current
+      : { ...current, messages: [], questions: [] };
   }
   if (event.type === "tasks-cleared") {
     return current.tasks.length === 0 ? current : { ...current, tasks: [] };
@@ -4166,17 +4211,28 @@ function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnaps
   if (event.type === "task") {
     return { ...current, tasks: upsert(current.tasks, event.task) };
   }
+  if (event.type === "question") {
+    return { ...current, questions: upsert(current.questions, event.question) };
+  }
   return current;
 }
 
 function MessageBubble({
   message,
+  question,
   nameById,
   onResume,
+  onAnswer,
 }: {
   message: RoomMessage;
+  question?: QuestionItem;
   nameById: Map<string, string>;
   onResume: (memberName: string) => void;
+  onAnswer: (
+    questionId: string,
+    fieldId: string,
+    payload: { optionId?: string; text?: string },
+  ) => Promise<void>;
 }) {
   const [source, setSource] = useState(false);
   if (message.senderKind === "system") {
@@ -4206,10 +4262,14 @@ function MessageBubble({
   const renderPreview = !isUser && visible.length > 0;
   const toggleable = renderPreview && (hasMarkdownStructure(visible) || visible !== message.text);
   return (
-    <article className={`bubble ${isUser ? "user" : "member"} ${message.kind}`}>
+    <article
+      id={question ? `question-${message.id}` : undefined}
+      className={`bubble ${isUser ? "user" : "member"} ${message.kind}`}
+    >
       <header className="bubble-head">
         <span className="sender">{isUser ? "你" : `@${message.senderName}`}</span>
         {message.kind === "announce" && <span className="chip accent">报告</span>}
+        {message.kind === "question" && <span className="chip accent">提问</span>}
         {message.runScope && (
           <span
             className="chip"
@@ -4245,7 +4305,103 @@ function MessageBubble({
       ) : (
         <div className="bubble-text">{message.text}</div>
       )}
+      {question && <QuestionCard question={question} onAnswer={onAnswer} />}
     </article>
+  );
+}
+
+function answerTextOf(question: QuestionItem, field: QuestionField): string | undefined {
+  const answer = question.answers[field.id];
+  if (!answer) return undefined;
+  if (answer.optionId) {
+    return field.options.find((option) => option.id === answer.optionId)?.label ?? answer.optionId;
+  }
+  return answer.text;
+}
+
+function QuestionCard({
+  question,
+  onAnswer,
+}: {
+  question: QuestionItem;
+  onAnswer: (
+    questionId: string,
+    fieldId: string,
+    payload: { optionId?: string; text?: string },
+  ) => Promise<void>;
+}) {
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const open = question.status === "open";
+  return (
+    <section className={`question-card ${question.status}`}>
+      <header className="question-head">
+        <strong>{question.title}</strong>
+        <span className="chip accent">
+          {question.status === "open" ? "需要你回答" : question.status === "answered" ? "已回答" : "已取消"}
+        </span>
+        {question.urgency !== "routine" && (
+          <span className="chip">{question.urgency === "critical" ? "紧急" : "较急"}</span>
+        )}
+      </header>
+      {question.unblocks && <p className="question-unblocks">回答后可以继续：{question.unblocks}</p>}
+      {question.questions.map((field, index) => {
+        const chosen = question.answers[field.id]?.optionId;
+        const recorded = answerTextOf(question, field);
+        return (
+          <div className="question-field" key={field.id}>
+            <div className="question-text">
+              {index + 1}. {field.question}
+            </div>
+            <div className="question-options">
+              {field.options.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  className={`question-option${chosen === option.id ? " selected" : ""}`}
+                  disabled={!open || busy === field.id}
+                  onClick={async () => {
+                    setBusy(field.id);
+                    await onAnswer(question.id, field.id, { optionId: option.id });
+                    setBusy(null);
+                  }}
+                >
+                  {option.label}
+                  {option.recommended ? <span className="question-recommend">推荐</span> : null}
+                </button>
+              ))}
+            </div>
+            {open ? (
+              <form
+                className="question-reply"
+                onSubmit={async (event) => {
+                  event.preventDefault();
+                  const text = (drafts[field.id] ?? "").trim();
+                  if (!text) return;
+                  setBusy(field.id);
+                  await onAnswer(question.id, field.id, { text });
+                  setDrafts((current) => ({ ...current, [field.id]: "" }));
+                  setBusy(null);
+                }}
+              >
+                <input
+                  value={drafts[field.id] ?? ""}
+                  placeholder="或写下你的回答…"
+                  onChange={(event) =>
+                    setDrafts((current) => ({ ...current, [field.id]: event.target.value }))
+                  }
+                />
+                <button type="submit" disabled={!(drafts[field.id] ?? "").trim() || busy === field.id}>
+                  提交
+                </button>
+              </form>
+            ) : recorded ? (
+              <div className="question-recorded">你的回答：{recorded}</div>
+            ) : null}
+          </div>
+        );
+      })}
+    </section>
   );
 }
 

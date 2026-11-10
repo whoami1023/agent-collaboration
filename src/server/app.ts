@@ -594,7 +594,59 @@ export function createApp(deps: AppDeps): express.Express {
       members: scope.room.bus.listMembers(),
       messages: scope.room.bus.listMessages(300),
       tasks: scope.room.board.list(),
+      questions: scope.workspace.listQuestions(scope.room.descriptor.id),
       settings: maskSettings(scope.workspace.getSettings()),
+    });
+  });
+
+  // 结构化提问：只读列表（state 里也带一份；单独接口便于面板轮询）。
+  app.get("/api/questions", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    res.json({
+      roomId: scope.room.descriptor.id,
+      questions: scope.workspace.listQuestions(scope.room.descriptor.id),
+    });
+  });
+
+  // 回答一题：选项或文本二选一；全部答完后后端把答案作为用户消息回灌并唤醒提问者。
+  app.post("/api/questions/:id/answer", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    const body = bodyOf(req);
+    const fieldId = typeof body["fieldId"] === "string" ? body["fieldId"].trim() : "";
+    const optionId = typeof body["optionId"] === "string" ? body["optionId"].trim() : "";
+    const text = typeof body["text"] === "string" ? body["text"].trim() : "";
+    if (!fieldId) {
+      res.status(400).json({ error: "fieldId 不能为空" });
+      return;
+    }
+    if (!optionId && !text) {
+      res.status(400).json({ error: "必须选择选项或填写回答" });
+      return;
+    }
+    const user = currentUser(res);
+    try {
+      const result = await scope.workspace.answerQuestion(
+        scope.room.descriptor.id,
+        String(req.params["id"] ?? ""),
+        fieldId,
+        { ...(optionId ? { optionId } : {}), ...(text ? { text } : {}) },
+        user?.id ?? "user",
+      );
+      res.json(result);
+    } catch (err) {
+      res.status(err instanceof RoomError ? err.status : 400).json({ error: errorMessage(err) });
+    }
+  });
+
+  // 持久工作队列：只读投影，附派生健康度（排队过久 / 运行过久）。
+  app.get("/api/queue", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    res.json({
+      roomId: scope.room.descriptor.id,
+      items: scope.workspace.listWorkItems(scope.room.descriptor.id),
     });
   });
 

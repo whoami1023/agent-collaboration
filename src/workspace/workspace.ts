@@ -24,8 +24,13 @@ import type {
   TaskCard,
   UserRole,
 } from "../core/types";
-import { DEFAULT_MODEL_REF, SYSTEM_ID } from "../core/types";
+import { DEFAULT_MODEL_REF, SYSTEM_ID, USER_ID } from "../core/types";
 import { newId } from "../core/ids";
+import {
+  QuestionStore,
+  formatAnswerMessage,
+  type QuestionItem,
+} from "../room/questions";
 import { ModelUsageStore } from "../model/usage-store";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
@@ -46,6 +51,11 @@ import {
 import type { SkillLibrary } from "../skills/library";
 import { readJson, writeJsonAtomic } from "../store/persist";
 import { Workboard } from "../workboard/board";
+import {
+  WorkQueue,
+  type WorkItem,
+  type WorkItemHealth,
+} from "../room/work-queue";
 
 interface PersistedState {
   members: PersistedMember[];
@@ -54,6 +64,10 @@ interface PersistedState {
   tasks: TaskCard[];
   mode?: RoomMode;
   routing?: RoomRoutingMode;
+  /** 持久工作队列：重启后未完成的唤醒义务在这里接回。 */
+  workQueue?: WorkItem[];
+  /** 结构化提问：问题与逐题答案随房间保存，重启后仍能继续回答。 */
+  questions?: QuestionItem[];
 }
 
 /** v3 及更早的成员档案用 `providerId`，v4 统一为 `modelRef`（`provider/model` 或别名）。 */
@@ -95,6 +109,10 @@ export interface RoomInstance {
   bus: RoomBus;
   board: Workboard;
   orchestrator: Orchestrator;
+  /** 持久工作队列：唤醒义务与运行终局都落在这条线上。 */
+  workQueue: WorkQueue;
+  /** 结构化提问：待答问题与答案，界面按 messageId 把卡片挂在提问消息下。 */
+  questions: QuestionStore;
   /** 作战室落在 `state.json`，群聊落在 `rooms/<roomId>.json`。 */
   stateFile: string;
   saveTimer: NodeJS.Timeout | null;
@@ -303,6 +321,8 @@ export class Workspace {
 
     await workspace.persist();
     await cron.start();
+    // 落盘的待办在服务重新打开时接着跑；超出恢复窗口或多次中断的会被明确结算。
+    for (const room of workspace.rooms.values()) room.orchestrator.resumeQueue();
     return workspace;
   }
 
@@ -345,6 +365,19 @@ export class Workspace {
       const main = this.bus.listMembers().find((member) => member.role === "main");
       if (main) bus.addMember(roomCopy(main, descriptor.id));
     }
+    const workQueue = new WorkQueue(descriptor.id, {
+      onChange: () => this.scheduleSave(descriptor.id),
+    });
+    workQueue.hydrate(persisted?.workQueue);
+    // 上次进程结束前还在跑的义务回到 pending；待编排器建好后再决定续跑还是放弃。
+    workQueue.recoverInterrupted();
+    const questions = new QuestionStore(descriptor.id, {
+      onChange: (question) => {
+        this.scheduleSave(descriptor.id);
+        for (const listener of [...this.roomListeners]) listener(descriptor.id, { type: "question", question });
+      },
+    });
+    questions.hydrate(persisted?.questions);
     const orchestrator = new Orchestrator({
       bus,
       board,
@@ -360,8 +393,19 @@ export class Workspace {
       skillUsage: this.curation.recordUsage,
       recallLedger: this.recallLedger,
       toolOutputs: this.toolOutputs,
+      workQueue,
+      questions,
     });
-    const instance: RoomInstance = { descriptor, bus, board, orchestrator, stateFile: this.stateFileFor(descriptor.id), saveTimer: null };
+    const instance: RoomInstance = {
+      descriptor,
+      bus,
+      board,
+      orchestrator,
+      workQueue,
+      questions,
+      stateFile: this.stateFileFor(descriptor.id),
+      saveTimer: null,
+    };
     bus.subscribe((event) => {
       if (SAVE_TRIGGERS.includes(event.type)) this.scheduleSave(descriptor.id);
       if (DIRTY_TRIGGERS.includes(event.type)) this.memory.markDirty();
@@ -406,6 +450,56 @@ export class Workspace {
     const room = this.rooms.get(roomId);
     if (!room) throw new RoomError(404, "房间不存在");
     return room;
+  }
+
+  /** 工作队列只读视图：状态是事实，derived / ageMs 是对「是否卡住」的派生判断。 */
+  listWorkItems(roomId?: string): WorkItemHealth[] {
+    return this.room(roomId).workQueue.health();
+  }
+
+  listQuestions(roomId?: string): QuestionItem[] {
+    return this.room(roomId).questions.list();
+  }
+
+  /**
+   * 用户回答一题；全部问题答完后，把结构化答案作为用户消息发回群里并 @ 提问者，
+   * 由现有唤醒链路让提问者继续——答复不依赖提问者还在不在跑。
+   */
+  async answerQuestion(
+    roomId: string,
+    questionId: string,
+    fieldId: string,
+    payload: { optionId?: string; text?: string },
+    by: string,
+  ): Promise<{ question: QuestionItem; message: RoomMessage | null }> {
+    const room = this.room(roomId);
+    const result = room.questions.answer(questionId, fieldId, payload, by);
+    if (result.status !== "recorded") throw new RoomError(409, result.reason);
+    let message: RoomMessage | null = null;
+    if (result.complete) {
+      const asker = room.bus.getMember(result.item.askerId);
+      message = room.bus.append({
+        senderId: USER_ID,
+        senderName: "用户",
+        senderKind: "user",
+        kind: "chat",
+        text: formatAnswerMessage(result.item),
+        mentions: asker ? [asker.id] : [],
+        replyTo: result.item.messageId,
+        depthTurn: 0,
+      });
+      if (!asker) {
+        room.bus.append({
+          senderId: SYSTEM_ID,
+          senderName: "系统",
+          senderKind: "system",
+          kind: "system",
+          text: `提问者 @${result.item.askerName} 已不在册；回答已记录，可请主智能体接着处理。`,
+        });
+      }
+    }
+    await this.persistRoom(roomId);
+    return { question: result.item, message };
   }
 
   listRooms(): RoomInfo[] {
@@ -645,6 +739,7 @@ export class Workspace {
   }> {
     const room = this.room(roomId);
     const cancelled = room.orchestrator.cancelAllRuns();
+    room.questions.cancelOpen(SYSTEM_ID, "会话已清除");
     const archived = await this.captureRoomSession(room);
     const cleared = room.bus.clearMessages();
     const tasksCleared = room.board.clearAll();
@@ -666,6 +761,7 @@ export class Workspace {
   }> {
     const room = this.room(roomId);
     const cancelled = room.orchestrator.cancelAllRuns();
+    room.questions.cancelOpen(SYSTEM_ID, "已开启新会话");
     const snapshot = room.bus.snapshot();
     const archived = await this.archives.capture({
       roomName: room.bus.roomName,
@@ -707,6 +803,7 @@ export class Workspace {
   }> {
     const room = this.room(roomId);
     const cancelled = room.orchestrator.cancelAllRuns();
+    room.questions.cancelOpen(SYSTEM_ID, "会话已恢复");
     const autoArchived = await this.captureRoomSession(room);
     const { archive, restoredFiles, conflicts } = await this.archives.restore(id);
     const currentSeq = room.bus.snapshot().seq;
@@ -809,6 +906,8 @@ export class Workspace {
       tasks: room.board.snapshot(),
       mode: snapshot.mode,
       routing: snapshot.routing,
+      workQueue: room.workQueue.snapshot(),
+      questions: room.questions.snapshot(),
     } satisfies PersistedState);
   }
 

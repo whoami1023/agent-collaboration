@@ -149,6 +149,16 @@ const ACCEPTANCE_SECTION = `完成核验
 - 核验不过就保持 status=doing，如实说明还差哪一条、下一步做什么；绝不为了关掉卡片而挑选一个碰巧存在的文件当证据，也不要把证据写成描述而不是真实标识。
 - 证据只能来自真实动作：file_write 写成功、命令退出码 0、脚本跑完后真实变化的文件。没有做过就没有证据，这与「不许编造结果」是同一条纪律。`;
 
+/**
+ * 结构化提问：只在挂了 ask_user 时说明。把「需要用户拍板」做成可回答的卡片，
+ * 而不是在聊天里反复追问；提出后先收尾，答案回来再继续。
+ */
+const ASK_SECTION = `结构化提问
+- 真正需要用户决定、猜错会改变方向的事（口径、范围、取舍、是否继续），用 ask_user 提结构化问题：1–4 个问题、每问 2–4 个选项，能推荐就标一个推荐项。
+- 能从文件、记忆、网络或工具里查到的答案不要问；有明显默认解释的也不要问。
+- 提出后本轮先收尾：不要重复提问，也不要在收到回答前按猜测继续；用户答完后你会被重新唤醒，答案会以消息形式回到群里。
+- 只问真正阻塞下一步的点，别把整份需求拆成一串问题。`;
+
 const CRON_SECTION = `定时任务
 - 用户提到「每天/每周/半小时后/到点再做…」这类延时或周期性要求，用 cron 工具建任务；绝不要在 run_command 里 sleep 或反复轮询来假装定时器。
 - 任务到点会把指令投进群并唤醒对应成员无人值守执行，最终回复就是交付物；一次运行只交一份结果，重复靠调度而不是靠你追问。
@@ -194,6 +204,7 @@ export function buildSystemPrompt(context: PromptContext): string {
     context.availableTools?.has("run_batch") === true ? BATCH_SECTION : "";
   const outputSection =
     context.availableTools?.has("output_search") === true ? OUTPUT_SECTION : "";
+  const askSection = context.availableTools?.has("ask_user") === true ? ASK_SECTION : "";
   const cronSection = context.availableTools?.has("cron") === true ? CRON_SECTION : "";
   // 闸门只作用在任务卡上：没挂 task_update 的运行（计划轮、纯聊天）不该看到这段规则。
   const acceptanceSection = context.availableTools?.has("task_update") === true ? ACCEPTANCE_SECTION : "";
@@ -209,6 +220,7 @@ export function buildSystemPrompt(context: PromptContext): string {
     batchSection,
     outputSection,
     acceptanceSection,
+    askSection,
     cronSection,
     formatDynamicContext(context),
   ]

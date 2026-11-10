@@ -1,5 +1,6 @@
 import type { CronJob, CronJobState, CronRunRecord } from "../cron/types";
 import type { LearningProposal, ReviewLog } from "../agent/learning/types";
+import type { QuestionItem } from "../room/questions";
 
 export const USER_ID = "user";
 export const SYSTEM_ID = "system";
@@ -11,7 +12,7 @@ export type MemberStatus = "idle" | "running" | "cancelled" | "error";
 export type ContextMode = "fork" | "isolated";
 export type ControlScope = "children" | "none";
 export type SenderKind = "user" | "member" | "system";
-export type MessageKind = "chat" | "announce" | "system";
+export type MessageKind = "chat" | "announce" | "system" | "question";
 export type TaskStatus = "todo" | "doing" | "blocked" | "done" | "failed";
 export type UserRole = "admin" | "user";
 /**
@@ -365,7 +366,13 @@ export type AgentEvent =
   | { type: "tool-result"; runId: string; memberId: string; name: string; content: string; ok: boolean; code?: string }
   | { type: "run-final"; runId: string; memberId: string; text: string }
   | { type: "run-error"; runId: string; memberId: string; error: string }
-  | { type: "run-aborted"; runId: string; memberId: string };
+  | {
+      type: "run-aborted";
+      runId: string;
+      memberId: string;
+      /** 中止原因：超时、用户取消、清会话静默取消、成员被移除。缺省按普通取消处理。 */
+      reason?: "timeout" | "cancelled" | "silent" | "removed";
+    };
 
 export type RoomEvent =
   | { type: "message"; message: RoomMessage }
@@ -378,6 +385,7 @@ export type RoomEvent =
   | { type: "member"; member: Member }
   | { type: "member-removed"; memberId: string }
   | { type: "task"; task: TaskCard }
+  | { type: "question"; question: QuestionItem }
   | { type: "run"; event: AgentEvent }
   | { type: "model-usage"; usage: ModelUsageEvent }
   /** 一次后台复盘的产出：提案（可能为空）+ 流水，前端据此刷新「学习」面板。 */

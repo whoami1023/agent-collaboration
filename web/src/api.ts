@@ -22,6 +22,7 @@ import type {
   CronSchedule,
 } from "../../src/cron/types";
 import type { ProviderApi } from "../../src/model/types";
+import type { QuestionItem } from "../../src/room/questions";
 import type { AdvisorSettings, CurationSettings } from "../../src/core/settings";
 import type {
   CurationLog,
@@ -99,6 +100,7 @@ export interface StateSnapshot {
   members: Member[];
   messages: RoomMessage[];
   tasks: TaskCard[];
+  questions: QuestionItem[];
   settings: MaskedSettings;
 }
 
@@ -837,6 +839,17 @@ export async function sendMessage(
     body: JSON.stringify(runScope ? { text, runScope } : { text }),
   });
   return body.message;
+}
+
+/** 回答结构化提问的一题；全部答完后服务端会回灌一条用户消息并唤醒提问者。 */
+export async function answerQuestion(
+  questionId: string,
+  payload: { fieldId: string; optionId?: string; text?: string },
+): Promise<{ question: QuestionItem; message: RoomMessage | null }> {
+  return request(withRoom(`/api/questions/${encodeURIComponent(questionId)}/answer`), {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }
 
 /** /clear 与 /new 的返回：被清掉的消息数、任务卡数、中止的运行，以及生成的归档摘要（原本为空则是 null）。 */

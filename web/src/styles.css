@@ -5678,3 +5678,129 @@ body.pane-dragging * {
   border-radius: 8px;
   font-size: var(--text-xs);
 }
+
+/* 结构化提问：问题卡片挂在提问气泡下，顶部一条待答提示可跳转。 */
+.question-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 8px 16px 0;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: 10px;
+  background: var(--accent-subtle);
+  color: var(--accent);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.question-banner-action {
+  font-weight: 600;
+}
+
+.question-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.question-card.canceled {
+  opacity: 0.7;
+}
+
+.question-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-strong);
+}
+
+.question-unblocks {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.question-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.question-text {
+  color: var(--text);
+}
+
+.question-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.question-option {
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--text);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.question-option.selected {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.question-option:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.question-recommend {
+  margin-left: 6px;
+  color: var(--accent);
+  font-size: var(--text-xs);
+}
+
+.question-reply {
+  display: flex;
+  gap: 6px;
+}
+
+.question-reply input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+}
+
+.question-reply button {
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--panel-strong);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.question-reply button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.question-recorded {
+  color: var(--accent);
+  font-size: var(--text-sm);
+}

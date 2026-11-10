@@ -5,6 +5,13 @@ import type { ModelUsageStore } from "../model/usage-store";
 import type { MemberUsageRecord } from "./member-runtime";
 import { newId } from "../core/ids";
 import type { RoomBus } from "../room/bus";
+import {
+  MAX_WORK_RECOVERIES,
+  WORK_RECOVERY_WINDOW_MS,
+  WorkQueue,
+  type WorkItem,
+} from "../room/work-queue";
+import type { QuestionStore } from "../room/questions";
 import type { Workboard } from "../workboard/board";
 import { decideWakes } from "../room/wake";
 import {
@@ -55,6 +62,10 @@ export interface OrchestratorDeps {
   recallLedger?: RecallLedger;
   /** 工具输出存档：大结果落盘后由 output_search / output_read 取回。 */
   toolOutputs?: ToolOutputStore;
+  /** 持久工作队列：唤醒先落一条义务行，运行收尾再结算；不传时用房间内内存队列。 */
+  workQueue?: WorkQueue;
+  /** 结构化提问：成员把需要用户决定的点做成卡片，答案回来再唤醒它。 */
+  questions?: QuestionStore;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -101,8 +112,13 @@ export class Orchestrator {
   private cronService?: CronService;
   /** 顾问扇出：动手之前先问参谋；每房间一个实例，回合缓存因此不会跨房间串。 */
   private readonly advisors: AdvisorService;
+  /** 持久工作队列：一条义务一行，进程重启后仍能续跑。 */
+  private readonly workQueue: WorkQueue;
+  /** 已经排进运行槽的队列行：同一行不会被并发调度两次。 */
+  private readonly scheduledWork = new Set<string>();
 
   constructor(private readonly deps: OrchestratorDeps) {
+    this.workQueue = deps.workQueue ?? new WorkQueue(deps.bus.roomId);
     this.advisors = new AdvisorService({
       getSettings: deps.getSettings,
       ...(deps.usage ? { usage: deps.usage } : {}),
@@ -141,6 +157,7 @@ export class Orchestrator {
   }
 
   cancelMember(memberId: string): boolean {
+    this.workQueue.cancelForMember(memberId, "成员运行已取消");
     return this.runtimes.get(memberId)?.cancel() ?? false;
   }
 
@@ -271,15 +288,15 @@ export class Orchestrator {
 
   /** 清空聊天记录前中止所有在跑的成员：静默取消，且丢弃它们排队中的 steer。 */
   cancelAllRuns(): number {
-    return this.stopRuns(true);
+    return this.stopRuns(true, "会话已清除");
   }
 
   /** /stop：中止所有在跑的成员，保留「本次运行已取消」提示。 */
   stopAllRuns(): number {
-    return this.stopRuns(false);
+    return this.stopRuns(false, "用户停止");
   }
 
-  private stopRuns(silent: boolean): number {
+  private stopRuns(silent: boolean, queueNote: string): number {
     // 停止前已入队的消息（含刚发出、尚未派发的）不再唤醒成员；之后的新消息序号更高，不受影响。
     this.stoppedThroughSeq = this.deps.bus.snapshot().seq;
     this.clearCollector();
@@ -287,6 +304,8 @@ export class Orchestrator {
     for (const runtime of this.runtimes.values()) {
       if (runtime.cancel(silent ? { silent: true } : {})) cancelled += 1;
     }
+    // 停下来的义务不能留在队列里假装还会执行：明确取消，终局理由随行保留。
+    this.workQueue.cancelOpen(queueNote);
     return cancelled;
   }
 
@@ -416,6 +435,7 @@ export class Orchestrator {
     this.runtimes.delete(memberId);
     this.pendingReleases.get(memberId)?.();
     this.pendingReleases.delete(memberId);
+    this.workQueue.cancelForMember(memberId, "成员已移除");
 
     for (const task of board.list()) {
       if (task.ownerId === memberId) board.update(task.id, { ownerId: null });
@@ -600,7 +620,135 @@ export class Orchestrator {
       runtime.steer(trigger, steerNote);
       return;
     }
-    this.schedule(() => runtime.run(trigger));
+    const item = this.workQueue.enqueue({
+      memberId,
+      memberName: member.name,
+      trigger,
+    });
+    // 同一条触发消息已经在队列里：这条唤醒是重复的，不再开一轮。
+    if (!item) return;
+    this.scheduleWorkItem(runtime, member.id, trigger, item.id);
+  }
+
+  private scheduleWorkItem(
+    runtime: MemberRuntime,
+    memberId: string,
+    trigger: RoomMessage,
+    itemId: string,
+  ): void {
+    if (this.stopped || this.scheduledWork.has(itemId)) return;
+    this.scheduledWork.add(itemId);
+    this.schedule(() => this.runWorkItem(runtime, memberId, trigger, itemId));
+  }
+
+  /**
+   * 一次唤醒的执行包装：先领取队列行，再按运行终局写回队列。
+   * 关停导致的中止不结算——行留在 in_progress，由下次启动的 recoverInterrupted 接回。
+   */
+  private async runWorkItem(
+    runtime: MemberRuntime,
+    memberId: string,
+    trigger: RoomMessage,
+    itemId: string,
+  ): Promise<void> {
+    if (this.stopped || !this.workQueue.claim(itemId)) {
+      this.scheduledWork.delete(itemId);
+      return;
+    }
+    const observed: {
+      terminal?:
+        | { status: "ok"; text: string }
+        | { status: "error"; error: string }
+        | { status: "aborted"; reason?: "timeout" | "cancelled" | "silent" | "removed" };
+    } = {};
+    const unsubscribe = this.deps.bus.subscribe((event) => {
+      if (event.type !== "run" || event.event.memberId !== memberId) return;
+      const run = event.event;
+      if (run.type === "run-final") observed.terminal = { status: "ok", text: run.text };
+      else if (run.type === "run-error") observed.terminal = { status: "error", error: run.error };
+      else if (run.type === "run-aborted") {
+        observed.terminal = { status: "aborted", ...(run.reason ? { reason: run.reason } : {}) };
+      }
+    });
+    try {
+      await runtime.run(trigger);
+    } catch (err) {
+      observed.terminal = { status: "error", error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      unsubscribe();
+      this.scheduledWork.delete(itemId);
+    }
+    if (this.stopped) return;
+    const terminal = observed.terminal;
+    if (!terminal) {
+      const member = this.deps.bus.getMember(memberId);
+      if (!member || member.status === "cancelled") {
+        this.workQueue.cancel(itemId, "成员已不可用，未产生终局");
+      } else {
+        this.workQueue.fail(itemId, "运行结束但没有终局事件");
+      }
+    } else if (terminal.status === "ok") {
+      this.workQueue.complete(itemId, terminal.text);
+    } else if (terminal.status === "error") {
+      this.workQueue.fail(itemId, terminal.error);
+    } else if (terminal.reason === "timeout") {
+      this.workQueue.fail(itemId, "整轮运行超时被中止");
+    } else if (terminal.reason === "removed") {
+      this.workQueue.cancel(itemId, "成员已移除");
+    } else if (terminal.reason === "silent") {
+      this.workQueue.cancel(itemId, "会话已清除");
+    } else {
+      this.workQueue.cancel(itemId, "运行已取消");
+    }
+    this.drainMemberWork(memberId);
+  }
+
+  /**
+   * 启动恢复：把落盘的 pending 行重新排进运行槽位。
+   * 超过恢复窗口、多次中断、成员不在册的一律明确结算，不静默丢。
+   * 同一成员一次只恢复一条，后续由 drainMemberWork 接着排。
+   */
+  resumeQueue(): number {
+    if (this.stopped) return 0;
+    const now = Date.now();
+    let started = 0;
+    const resumedMembers = new Set<string>();
+    for (const item of this.workQueue.pending()) {
+      if (resumedMembers.has(item.memberId)) continue;
+      const member = this.deps.bus.getMember(item.memberId);
+      if (!member || member.status === "cancelled") {
+        this.workQueue.cancel(item.id, member ? "成员已取消" : "成员已不在册");
+        continue;
+      }
+      if (item.recoveries >= MAX_WORK_RECOVERIES) {
+        this.workQueue.fail(item.id, `已中断恢复 ${item.recoveries} 次，停止自动续跑`);
+        continue;
+      }
+      if (now - item.createdAt > WORK_RECOVERY_WINDOW_MS) {
+        this.workQueue.fail(item.id, "超过 24 小时恢复窗口，未再自动续跑");
+        continue;
+      }
+      const runtime = this.runtimeFor(member);
+      if (runtime.isRunning) continue;
+      resumedMembers.add(item.memberId);
+      this.scheduleWorkItem(runtime, member.id, item.trigger, item.id);
+      started += 1;
+    }
+    return started;
+  }
+
+  /** 运行收尾后接着排同一成员的下一条待办；一次只开一条，避免 steer 吞掉后排的终局。 */
+  private drainMemberWork(memberId: string): void {
+    if (this.stopped) return;
+    const runtime = this.runtimes.get(memberId);
+    if (!runtime || runtime.isRunning) return;
+    const next = this.workQueue
+      .pending()
+      .find((item: WorkItem) => item.memberId === memberId && !this.scheduledWork.has(item.id));
+    if (!next) return;
+    const member = this.deps.bus.getMember(memberId);
+    if (!member || member.status === "cancelled") return;
+    this.scheduleWorkItem(runtime, memberId, next.trigger, next.id);
   }
 
   private schedule(run: () => Promise<void>): void {
@@ -660,6 +808,7 @@ export class Orchestrator {
         ...(deps.skillUsage ? { skillUsage: deps.skillUsage } : {}),
         ...(deps.recallLedger ? { recallLedger: deps.recallLedger } : {}),
         ...(deps.toolOutputs ? { toolOutputs: deps.toolOutputs } : {}),
+        ...(deps.questions ? { questions: deps.questions } : {}),
         advisors: this.advisors,
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });

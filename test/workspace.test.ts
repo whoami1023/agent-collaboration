@@ -182,6 +182,97 @@ describe("WorkspaceRegistry", () => {
     await reloaded.closeAll();
   });
 
+  it("工作队列随房间落盘，重启后把未完成的唤醒义务接着跑完", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    const room = alice.room();
+    const trigger = room.bus.append({
+      senderId: "user",
+      senderName: "用户",
+      senderKind: "user",
+      kind: "chat",
+      text: "重启后继续这件事",
+      depthTurn: 0,
+    });
+    const queued = room.workQueue.enqueue({
+      memberId: "m_main",
+      memberName: "主智能体",
+      trigger,
+    });
+    expect(queued?.state).toBe("pending");
+    await alice.close();
+
+    const skills2 = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await skills2.init();
+    const reloaded = new WorkspaceRegistry(dir, skills2);
+    registry = reloaded;
+    const restored = await reloaded.get({ id: "u_alice", displayName: "Alice" });
+    const queue = restored.room().workQueue;
+    const started = Date.now();
+    while (
+      !queue.list().some((item) => item.state === "done") &&
+      Date.now() - started < 10_000
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const item = queue.list()[0];
+    expect(item?.state).toBe("done");
+    expect(item?.attempts).toBeGreaterThanOrEqual(1);
+    expect(item?.outcome?.status).toBe("ok");
+    expect(item?.outcome?.text).toBeTruthy();
+  });
+
+  it("结构化提问随房间落盘，重启后待答状态与已答字段都还在", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    const room = alice.room();
+    const questionMessage = room.bus.append({
+      senderId: "m_main",
+      senderName: "主智能体",
+      senderKind: "member",
+      kind: "question",
+      text: "【需要你回答】确认口径",
+      mentions: [],
+      depthTurn: 0,
+    });
+    const item = room.questions.ask({
+      messageId: questionMessage.id,
+      askerId: "m_main",
+      askerName: "主智能体",
+      title: "确认口径",
+      questions: [
+        {
+          id: "scope",
+          question: "范围？",
+          options: [
+            { id: "brief", label: "摘要" },
+            { id: "full", label: "完整", recommended: true },
+          ],
+        },
+        {
+          id: "audience",
+          question: "读者？",
+          options: [
+            { id: "exec", label: "管理层" },
+            { id: "team", label: "执行团队" },
+          ],
+        },
+      ],
+    });
+    room.questions.answer(item.id, "scope", { optionId: "brief" }, "u_alice");
+    await alice.close();
+
+    const skills2 = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await skills2.init();
+    const reloaded = new WorkspaceRegistry(dir, skills2);
+    registry = reloaded;
+    const restored = await reloaded.get({ id: "u_alice", displayName: "Alice" });
+    const questions = restored.room().questions.list();
+    expect(questions).toHaveLength(1);
+    expect(questions[0]?.status).toBe("open");
+    expect(questions[0]?.messageId).toBe(questionMessage.id);
+    expect(questions[0]?.answers["scope"]?.optionId).toBe("brief");
+    expect(questions[0]?.questions).toHaveLength(2);
+  });
+
   it("首次加载即生成智能体档案文件，且不覆盖已有内容", async () => {
     const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
     const files = await alice.memory.listAgentFiles();

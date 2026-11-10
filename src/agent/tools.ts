@@ -22,6 +22,8 @@ import type { SkillUsageRecorder } from "../skills/curation/types";
 import { toolFailureText } from "./tool-errors";
 import type { ToolOutputStore } from "./content/offload";
 import { buildOutputTools } from "./content/output-tools";
+import type { QuestionStore } from "../room/questions";
+import { buildQuestionTools } from "./question-tools";
 
 export interface ToolDeps {
   bus: RoomBus;
@@ -55,6 +57,8 @@ export interface ToolDeps {
   toolOutputs?: ToolOutputStore;
   /** 本轮运行 id：run_batch 存档时带上，便于把一次调用与这一轮对应起来。 */
   runId?: string;
+  /** 结构化提问：提出需要用户决定的问题，答案回来后由消息链路唤醒提问者。 */
+  questions?: QuestionStore;
 }
 
 const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done", "failed"];
@@ -517,8 +521,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   }
 
   // 文件工作区：用户上传与智能体产出共用 files/ 目录，对应 OpenClaw 的 read/write/ls 文件工具。
-  if (deps.files) {
-    tools.push(...buildFileTools(deps.files, deps.evidence));
+  if (deps.files) {    tools.push(...buildFileTools(deps.files, deps.evidence));
     // 命令执行：run_command 在工作区跑命令，run_skill_script 展开并执行技能附带脚本。
     tools.push(
       ...buildShellTools({
@@ -535,6 +538,11 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   }
 
   // 联网检索与正文抓取：内置共享技能 web-search / web-fetch / web-browse 的执行底座。
+  // 结构化提问：真正需要用户决定的点做成卡片；答案回来会以用户消息唤醒提问者。
+  if (deps.questions) {
+    tools.push(...buildQuestionTools({ bus: deps.bus, member, questions: deps.questions }));
+  }
+
   tools.push(...buildWebTools(deps.web));
 
   // 工具输出存档：只在工作区接上了存档时注册；按成员隔离，成员看不到别人的输出。

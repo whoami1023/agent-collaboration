@@ -78,6 +78,7 @@ describe("多用户 API", () => {
   it("未登录拒绝访问，首次初始化管理员并进入自己的房间", async () => {
     expect((await call("/api/auth/bootstrap")).body["needsSetup"]).toBe(true);
     expect((await call("/api/state")).status).toBe(401);
+    expect((await call("/api/queue")).status).toBe(401);
 
     const setup = await call("/api/auth/setup", {
       method: "POST",
@@ -94,6 +95,24 @@ describe("多用户 API", () => {
     const state = await call("/api/state", { cookie });
     expect(state.status).toBe(200);
     expect((state.body["room"] as Record<string, unknown>)["name"]).toContain("老板");
+    const queue = await call("/api/queue", { cookie });
+    expect(queue.status).toBe(200);
+    expect(queue.body["roomId"]).toBe("room_main");
+    expect(Array.isArray(queue.body["items"])).toBe(true);
+    expect(Array.isArray(state.body["questions"])).toBe(true);
+    const badAnswer = await call("/api/questions/ask_missing/answer", {
+      method: "POST",
+      cookie,
+      body: { fieldId: "scope", optionId: "full" },
+    });
+    expect(badAnswer.status).toBe(409);
+    expect(
+      (await call("/api/questions/ask_missing/answer", {
+        method: "POST",
+        cookie,
+        body: { fieldId: "", optionId: "full" },
+      })).status,
+    ).toBe(400);
     expect(await call("/api/auth/setup", {
       method: "POST",
       body: { username: "other", password: "secret123" },

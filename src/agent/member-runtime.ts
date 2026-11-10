@@ -31,6 +31,7 @@ import { buildTools } from "./tools";
 import { EvidenceLedger } from "./evidence";
 import { createToolResultTransform } from "./content/policy";
 import type { ToolOutputStore } from "./content/offload";
+import type { QuestionStore } from "../room/questions";
 import { scopeToolUnavailable } from "./run-scope";
 import { isPassText } from "../room/routing";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
@@ -67,6 +68,8 @@ export interface RuntimeDeps {
   recallLedger?: RecallLedger;
   /** 工具输出存档：大结果落盘后按成员隔离地检索与分页读取。 */
   toolOutputs?: ToolOutputStore;
+  /** 结构化提问：真正需要用户决定的点做成卡片，答案回来再唤醒本成员。 */
+  questions?: QuestionStore;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -193,6 +196,7 @@ export class MemberRuntime {
         ...(this.deps.files ? { files: this.deps.files } : {}),
         ...(this.deps.skillUsage ? { skillUsage: this.deps.skillUsage } : {}),
         ...(this.deps.toolOutputs ? { toolOutputs: this.deps.toolOutputs } : {}),
+        ...(this.deps.questions ? { questions: this.deps.questions } : {}),
         runId,
       });
       // 主智能体要按成员能力档案决定把活派给谁：每次运行前同步 TEAM.md 再读进来，
@@ -387,7 +391,7 @@ export class MemberRuntime {
 
       // 运行期间成员被移除：不再以已移除成员的身份往群里发言。
       if (!bus.getMember(this.member.id)) {
-        this.emit({ type: "run-aborted", runId, memberId: this.member.id });
+        this.emit({ type: "run-aborted", runId, memberId: this.member.id, reason: "removed" });
         return;
       }
 
@@ -491,7 +495,12 @@ export class MemberRuntime {
       }
     } catch (err) {
       if (isAbort(err)) {
-        this.emit({ type: "run-aborted", runId, memberId: this.member.id });
+        this.emit({
+          type: "run-aborted",
+          runId,
+          memberId: this.member.id,
+          reason: timedOut ? "timeout" : this.silentAbort ? "silent" : "cancelled",
+        });
         if (this.silentAbort) {
           // 刚清空会话就中止：不再往群里补一条系统消息。
         } else if (timedOut && bus.getMember(this.member.id)) {
