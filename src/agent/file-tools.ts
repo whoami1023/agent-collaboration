@@ -1,4 +1,5 @@
 import {
+  MAX_LINE_PAGE_LINES,
   MAX_TEXT_BYTES,
   WorkspaceFileError,
   type WorkspaceFiles,
@@ -6,6 +7,18 @@ import {
 import type { EvidenceLedger } from "./evidence";
 import type { ToolImpl } from "./loop";
 import { toolFailureText } from "./tool-errors";
+import { guardExternalContent } from "./content/envelope";
+import { rankTextChunks } from "./content/offload";
+
+/** 超过这个大小就不再整份读：先检索或分页，避免把大文件灌进上下文。 */
+export const MAX_DIRECT_READ_BYTES = 64 * 1024;
+/** 文件检索的扫描上限：单文件 256 KB、总量 8 MB、最多 200 个文件。 */
+const MAX_SEARCH_FILES = 200;
+const MAX_SEARCH_FILE_BYTES = 256 * 1024;
+const MAX_SEARCH_TOTAL_BYTES = 8 * 1024 * 1024;
+/** 检索默认返回 6 段，同一文件最多 2 段，避免一份大文档挤掉其他来源。 */
+const MAX_SEARCH_HITS = 6;
+const MAX_SEARCH_HITS_PER_FILE = 2;
 
 function readString(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
@@ -15,6 +28,14 @@ function readString(args: Record<string, unknown>, key: string): string | undefi
 function readText(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
   return typeof value === "string" ? value : undefined;
+}
+
+/** 行号参数：缺省返回 undefined，非正整数返回 "invalid"。 */
+function readLineNumber(args: Record<string, unknown>, key: string): number | "invalid" | undefined {
+  const value = args[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return "invalid";
+  return Math.round(value);
 }
 
 function formatSize(bytes: number): string {
@@ -111,11 +132,13 @@ export function buildFileTools(files: WorkspaceFiles, evidence?: EvidenceLedger)
       schema: {
         name: "file_read",
         description:
-          "读取文件工作区里的文本文件。用户上传的资料、其他成员写出的成果都可以读；二进制文件只能提示大小。",
+          "读取文件工作区里的文本文件。大于 64 KB 的文件不再整份读取：先用 file_search 定位，或传 start_line/end_line 分页读。二进制与图片只能提示大小。",
         parameters: {
           type: "object",
           properties: {
             path: { type: "string", description: "文件相对路径，如 reports/a.md" },
+            start_line: { type: "number", description: "可选：起始行号（1 起始），与 end_line 一起分页读取" },
+            end_line: { type: "number", description: "可选：结束行号（含）；不传则按单页上限尽量多读" },
           },
           required: ["path"],
           additionalProperties: false,
@@ -128,20 +151,155 @@ export function buildFileTools(files: WorkspaceFiles, evidence?: EvidenceLedger)
             next: "传入文件工作区里的相对路径，如 reports/a.md。",
           });
         }
+        const startLine = readLineNumber(args, "start_line");
+        const endLine = readLineNumber(args, "end_line");
+        if (startLine === "invalid" || endLine === "invalid") {
+          return toolFailureText("invalid_argument", "start_line / end_line 必须是大于 0 的整数", {
+            next: "行号从 1 开始；例如 start_line=101, end_line=200。",
+          });
+        }
+        if (startLine !== undefined && endLine !== undefined && endLine < startLine) {
+          return toolFailureText("invalid_argument", "end_line 不能小于 start_line", {
+            next: "交换两个行号，或只传 start_line 让工具按页读取。",
+          });
+        }
         try {
-          const file = await files.read(relPath, { maxBytes: MAX_TEXT_BYTES });
-          if (file.preview === "image") {
-            return `文件 ${file.path} 是图片（${formatSize(file.sizeBytes)}），无法作为文本读取；请让用户在右侧「文件工作区」预览或下载。`;
+          // 先用 1 字节探出大小与图片类型，避免为了判断「要不要整份读」先读一遍全文。
+          const head = await files.read(relPath, { maxBytes: 1 });
+          if (head.preview === "image") {
+            return `文件 ${head.path} 是图片（${formatSize(head.sizeBytes)}），无法作为文本读取；请让用户在右侧「文件工作区」预览或下载。`;
           }
+          const wantsRange = startLine !== undefined || endLine !== undefined;
+          if (!wantsRange && head.sizeBytes > MAX_DIRECT_READ_BYTES) {
+            return toolFailureText(
+              "invalid_argument",
+              `文件 ${head.path} 有 ${formatSize(head.sizeBytes)}，超过单次整份读取上限 ${formatSize(MAX_DIRECT_READ_BYTES)}`,
+              {
+                why: "整份读会占满上下文，后面的工作就没有空间了。",
+                next: `先用 file_search(query="关键词", path="${head.path}") 定位相关段落，或 file_read(path="${head.path}", start_line=1, end_line=200) 分页读取。`,
+                verify: "分页读取会给出本页行号与下一页的起点。",
+              },
+            );
+          }
+          if (wantsRange) {
+            const page = await files.readLines(relPath, {
+              ...(startLine !== undefined ? { startLine } : {}),
+              ...(endLine !== undefined ? { endLine } : {}),
+            });
+            if (page.binary) {
+              return `文件 ${page.path} 是二进制内容（${formatSize(page.sizeBytes)}），无法作为文本读取；请让用户下载查看。`;
+            }
+            const lastLine = Math.max(page.startLine, page.endLine);
+            const body = page.text || "（该范围内没有内容）";
+            const hint = page.more
+              ? `（还有更多内容：file_read(path="${page.path}", start_line=${page.endLine + 1}, end_line=${
+                  page.endLine + MAX_LINE_PAGE_LINES
+                })）`
+              : "（已读到末尾。）";
+            return `文件 ${page.path}（${formatSize(page.sizeBytes)}）第 ${page.startLine}–${lastLine} 行：\n\n${body}\n\n${hint}`;
+          }
+          const file = await files.read(relPath, { maxBytes: MAX_TEXT_BYTES });
           if (file.binary) {
             return `文件 ${file.path} 是二进制内容（${formatSize(file.sizeBytes)}），无法作为文本读取；请让用户下载查看。`;
           }
           return `文件 ${file.path}（${formatSize(file.sizeBytes)}）：\n\n${file.content}${
-            file.truncated ? "\n\n（内容超过 1 MB，已截断）" : ""
+            file.truncated ? "\n\n（内容超过 1 MB，已截断；请用 start_line/end_line 分页读取完整内容）" : ""
           }`;
         } catch (err) {
           return fileFailure(err, "read");
         }
+      },
+    },
+    {
+      schema: {
+        name: "file_search",
+        description:
+          "在文件工作区的文本文件里检索内容，返回命中的文件、行区间与片段。适合先定位再分页读取，不必把大文件整份读进上下文。",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "检索词：错误原文、字段名、章节标题或关键短语，越具体越好",
+            },
+            path: { type: "string", description: "可选：只搜某个子目录或文件，如 reports 或 reports/a.md" },
+            limit: { type: "number", description: "可选：返回段数，默认 6，最多 10" },
+          },
+          required: ["query"],
+          additionalProperties: false,
+        },
+      },
+      execute: async (args) => {
+        const query = readString(args, "query");
+        if (!query) {
+          return toolFailureText("invalid_argument", "query 不能为空", {
+            next: "传一个具体关键词、错误原文或字段名。",
+          });
+        }
+        const prefix = normalizePrefix(readString(args, "path"));
+        const rawLimit = args["limit"];
+        const limit =
+          typeof rawLimit === "number" && Number.isFinite(rawLimit)
+            ? Math.min(10, Math.max(1, Math.round(rawLimit)))
+            : MAX_SEARCH_HITS;
+        const listing = await files.list();
+        const candidates = listing.files
+          .filter(
+            (file) =>
+              file.kind === "file" &&
+              (!prefix || file.path === prefix || file.path.startsWith(`${prefix}/`)),
+          )
+          .slice(0, MAX_SEARCH_FILES);
+        const hits: Array<{
+          path: string;
+          span: { startLine: number; endLine: number };
+          score: number;
+          text: string;
+          partial: boolean;
+        }> = [];
+        let totalBytes = 0;
+        for (const candidate of candidates) {
+          if (totalBytes >= MAX_SEARCH_TOTAL_BYTES) break;
+          const file = await files
+            .read(candidate.path, { maxBytes: MAX_SEARCH_FILE_BYTES })
+            .catch(() => undefined);
+          if (!file || file.binary || file.preview !== "text") continue;
+          totalBytes += Buffer.byteLength(file.content, "utf8");
+          for (const chunk of rankTextChunks(file.content, query).slice(0, MAX_SEARCH_HITS_PER_FILE)) {
+            hits.push({
+              path: file.path,
+              span: chunk.span,
+              score: chunk.score,
+              text: chunk.text,
+              partial: file.truncated,
+            });
+          }
+        }
+        hits.sort(
+          (a, b) =>
+            b.score - a.score ||
+            a.path.localeCompare(b.path) ||
+            a.span.startLine - b.span.startLine,
+        );
+        const top = hits.slice(0, limit);
+        if (top.length === 0) {
+          return (
+            `没有找到匹配的文件内容（关键词：${query}${prefix ? `，范围 ${prefix}` : ""}）。` +
+            "可以换更短的关键词，或用 file_list 按文件名查找。"
+          );
+        }
+        const filesHit = new Set(top.map((hit) => hit.path)).size;
+        const blocks = top.map((hit) => {
+          const label =
+            `--- ${hit.path} 第 ${hit.span.startLine}–${hit.span.endLine} 行` +
+            `${hit.partial ? "（大文件仅检索前 256 KB）" : ""} ---`;
+          return `${label}\n${guardExternalContent("file_search", hit.text)}`;
+        });
+        return [
+          `在工作区 ${filesHit} 个文件里找到 ${top.length} 段（关键词：${query}）：`,
+          ...blocks,
+          '（要看相邻上下文用 file_read(path="…", start_line=…, end_line=…)。）',
+        ].join("\n\n");
       },
     },
     {

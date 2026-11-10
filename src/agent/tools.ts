@@ -20,6 +20,8 @@ import { verifyAcceptance, type EvidenceLedger } from "./evidence";
 import type { CronService } from "../cron/service";
 import type { SkillUsageRecorder } from "../skills/curation/types";
 import { toolFailureText } from "./tool-errors";
+import type { ToolOutputStore } from "./content/offload";
+import { buildOutputTools } from "./content/output-tools";
 
 export interface ToolDeps {
   bus: RoomBus;
@@ -49,6 +51,10 @@ export interface ToolDeps {
    * 没接上时什么都不做——群聊永远不该因为账本写不进去而停下来。
    */
   skillUsage?: SkillUsageRecorder;
+  /** 工具输出存档：大结果落盘后，成员用 output_search / output_read 取回其余部分。 */
+  toolOutputs?: ToolOutputStore;
+  /** 本轮运行 id：run_batch 存档时带上，便于把一次调用与这一轮对应起来。 */
+  runId?: string;
 }
 
 const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done", "failed"];
@@ -520,6 +526,8 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
         skills: deps.skills,
         userId: deps.userId,
         member,
+        ...(deps.toolOutputs ? { toolOutputs: deps.toolOutputs } : {}),
+        ...(deps.runId ? { runId: deps.runId } : {}),
         ...(deps.evidence ? { evidence: deps.evidence } : {}),
         ...(deps.skillUsage ? { skillUsage: deps.skillUsage } : {}),
       }),
@@ -528,6 +536,11 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
 
   // 联网检索与正文抓取：内置共享技能 web-search / web-fetch / web-browse 的执行底座。
   tools.push(...buildWebTools(deps.web));
+
+  // 工具输出存档：只在工作区接上了存档时注册；按成员隔离，成员看不到别人的输出。
+  if (deps.toolOutputs) {
+    tools.push(...buildOutputTools({ store: deps.toolOutputs, memberId: member.id }));
+  }
 
   // 定时任务：调度器由工作区注入，未接上时这个工具压根不出现在清单里。
   const cron = deps.getCron?.();

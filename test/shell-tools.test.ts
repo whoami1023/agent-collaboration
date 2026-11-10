@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildShellTools } from "../src/agent/shell-tools";
+import { buildShellTools, MAX_OUTPUT_BYTES } from "../src/agent/shell-tools";
 import { resetPythonLaunchCache, resolvePythonLaunch } from "../src/agent/python-launcher";
 import type { Member, PublicUser } from "../src/core/types";
 import { WorkspaceFiles } from "../src/files/workspace-files";
@@ -97,7 +97,10 @@ describe("run_command", () => {
   it("输出超过上限时截断", async () => {
     const tool = tools.get("run_command")!;
     const out = await tool.execute(
-      { command: `node -e "process.stdout.write('x'.repeat(40000))"` },
+      {
+        command: `node -e "process.stdout.write('x'.repeat(${MAX_OUTPUT_BYTES + 1024}))"`,
+        timeout_ms: 60_000,
+      },
       signal,
     );
     expect(out).toContain("已截断");

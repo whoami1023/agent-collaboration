@@ -14,19 +14,33 @@ import {
 } from "./evidence";
 import type { ToolImpl } from "./loop";
 import { describeCandidates, resolvePythonLaunch } from "./python-launcher";
+import type { ToolOutputStore } from "./content/offload";
+import { clipForContext, CONTEXT_BUDGET_BYTES, formatByteSize } from "./content/offload";
+import { guardExternalContent } from "./content/envelope";
+import { redactSecrets } from "./content/redact";
+import { redactionNote } from "./content/policy";
+import { toolFailureText } from "./tool-errors";
 
 export const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 export const MAX_COMMAND_TIMEOUT_MS = 120_000;
 export const MAX_COMMAND_CHARS = 4_000;
-export const MAX_OUTPUT_BYTES = 32 * 1024;
+export const MAX_OUTPUT_BYTES = 1024 * 1024;
 export const MAX_SCRIPT_ARGS = 20;
 export const MAX_SCRIPT_ARG_CHARS = 500;
+/** run_batch：一次最多几条命令、几个查询，以及单次回复里查询片段的总预算。 */
+export const MAX_BATCH_COMMANDS = 8;
+export const MAX_BATCH_QUERIES = 6;
+export const BATCH_QUERY_BUDGET_BYTES = 2 * 1024;
+export const BATCH_REPLY_BUDGET_BYTES = 8 * 1024;
 
 export interface ShellToolDeps {
   files: WorkspaceFiles;
   skills: SkillLibrary;
   userId: string;
   member: Member;
+  /** 工具输出存档：run_batch 在本次调用内直接检索刚产生的输出。 */
+  toolOutputs?: ToolOutputStore;
+  runId?: string;
   /** 本轮证据台账：命令退出码 0 才记账，作为交付闸门的核验来源。 */
   evidence?: EvidenceLedger;
   /** 技能使用记账：跑技能自带脚本算一次真实使用（比展开正文更强的信号）。 */
@@ -189,7 +203,9 @@ function formatResult(header: string, result: RunResult, timeoutMs: number): str
   }
   if (!result.stdout.trim() && !result.stderr.trim()) lines.push("（没有输出）");
   if (result.truncated) {
-    lines.push(`（输出超过 ${MAX_OUTPUT_BYTES / 1024} KB，已截断；请缩小输出范围后重跑）`);
+    lines.push(
+      `（输出超过 ${MAX_OUTPUT_BYTES / 1024 / 1024} MB，已截断；请缩小输出范围后重跑）`,
+    );
   }
   // Windows 的 python/python3 常常是商店占位程序：给出可执行的下一步，而不是让用户读那句英文提示。
   if (/Python was not found|python\.exe.*WindowsApps/i.test(`${result.stdout}\n${result.stderr}`)) {
@@ -204,6 +220,25 @@ function formatResult(header: string, result: RunResult, timeoutMs: number): str
 function readString(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function readBatchList(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const items = raw
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  return items.length > 0 ? items : undefined;
+}
+
+function oneLine(text: string, max = 100): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+function countTextLines(text: string): number {
+  if (text.length === 0) return 0;
+  return text.split(/\r?\n/).length;
 }
 
 function clampTimeout(raw: unknown): number {
@@ -275,7 +310,7 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
       schema: {
         name: "run_command",
         description:
-          "在文件工作区（files/）里执行一条命令，例如 python 脚本、node 脚本、pip/npm 安装依赖、数据校验。默认 30 秒超时、输出截断到 32 KB；子进程有服务进程的文件系统权限。",
+          "在文件工作区（files/）里执行一条命令，例如 python 脚本、node 脚本、pip/npm 安装依赖、数据校验。默认 30 秒超时，输出最多保留 1 MB（大输出会存档，上下文只显示相关片段）；子进程有服务进程的文件系统权限。",
         parameters: {
           type: "object",
           properties: {
@@ -342,6 +377,177 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
           }
         }
         return formatResult(`$ ${command}\n工作目录：files/${relCwd === "." ? "" : relCwd}`, result, timeoutMs);
+      },
+    },
+    {
+      schema: {
+        name: "run_batch",
+        description:
+          "一次顺序执行多条命令（最多 8 条）并汇总退出码，适合同时查测试、类型错误、构建、日志等多件事。完整输出会存入工具输出存档；queries 里的问题会在同一次调用里从完整输出中挑相关片段回答，不需要再单独检索。",
+        parameters: {
+          type: "object",
+          properties: {
+            commands: {
+              type: "array",
+              items: { type: "string" },
+              description: "要顺序执行的命令列表（1–8 条），每条与 run_command 的 command 写法相同",
+            },
+            queries: {
+              type: "array",
+              items: { type: "string" },
+              description: "可选：要从合并输出里回答的问题或关键词（最多 6 个），如「失败的测试名」「端口冲突」",
+            },
+            cwd: { type: "string", description: "可选：相对文件工作区的运行目录，默认 files/ 根目录" },
+            timeout_ms: {
+              type: "number",
+              description: "可选：每条命令的超时毫秒数，默认 30000，最大 120000",
+            },
+          },
+          required: ["commands"],
+          additionalProperties: false,
+        },
+      },
+      executionMode: "sequential",
+      execute: async (args, signal) => {
+        const commands = readBatchList(args["commands"]);
+        if (!commands) {
+          return toolFailureText("invalid_argument", "commands 不能为空", {
+            next: "传 1–8 条要顺序执行的命令，例如 [\"npm test\", \"npx tsc --noEmit\"]。",
+          });
+        }
+        if (commands.length > MAX_BATCH_COMMANDS) {
+          return toolFailureText("invalid_argument", `一次最多 ${MAX_BATCH_COMMANDS} 条命令`, {
+            next: "把互不依赖的检查拆成两次 run_batch，或只保留与当前问题最相关的命令。",
+          });
+        }
+        const tooLong = commands.find((command) => command.length > MAX_COMMAND_CHARS);
+        if (tooLong) {
+          return toolFailureText("invalid_argument", `单条命令不能超过 ${MAX_COMMAND_CHARS} 字符`, {
+            next: "把长命令写成脚本文件，再用 run_batch 调用脚本。",
+          });
+        }
+        const queries = readBatchList(args["queries"]) ?? [];
+        if (queries.length > MAX_BATCH_QUERIES) {
+          return toolFailureText("invalid_argument", `一次最多 ${MAX_BATCH_QUERIES} 个查询`, {
+            next: "合并相近的问题，或分两次 run_batch。",
+          });
+        }
+        await fs.mkdir(deps.files.rootDir, { recursive: true });
+        let cwd: string;
+        try {
+          cwd = resolveCwd(deps.files.rootDir, readString(args, "cwd"));
+          const stat = await fs.stat(cwd);
+          if (!stat.isDirectory()) return "错误：cwd 不是目录";
+        } catch (err) {
+          return `错误：${err instanceof Error ? err.message : String(err)}`;
+        }
+        const timeoutMs = clampTimeout(args["timeout_ms"]);
+        const relCwd = path.relative(deps.files.rootDir, cwd).split(path.sep).join("/") || ".";
+        const before = deps.evidence
+          ? stampFiles(await deps.files.list().catch(() => undefined))
+          : undefined;
+
+        const blocks: string[] = [];
+        const summaries: string[] = [];
+        for (let index = 0; index < commands.length; index += 1) {
+          const command = commands[index]!;
+          if (signal.aborted) {
+            summaries.push(`- ${index + 1}. \`${oneLine(command)}\` 未执行（运行已中止）`);
+            continue;
+          }
+          const result = await runProcess(command, [], { cwd, timeoutMs, signal, shell: true });
+          if (result.code === 0 && !result.timedOut && !result.aborted && !result.spawnError) {
+            deps.evidence?.record(
+              "command",
+              commandHandle(command),
+              `files/${relCwd === "." ? "" : relCwd} 退出码 0（run_batch）`,
+            );
+          }
+          const block = formatResult(`$ ${command}`, result, timeoutMs);
+          blocks.push(block);
+          summaries.push(
+            `- ${index + 1}. \`${oneLine(command)}\` 退出码 ${result.code ?? "无"}` +
+              `（${formatByteSize(Buffer.byteLength(block, "utf8"))} / ${countTextLines(block)} 行）`,
+          );
+        }
+        if (before) {
+          recordFileChanges(
+            deps.evidence!,
+            before,
+            await deps.files.list().catch(() => undefined),
+            "run_batch",
+          );
+        }
+
+        const combined = blocks.join("\n\n");
+        const redacted = redactSecrets(combined);
+        const note =
+          redacted.replaced > 0 ? redactionNote(redacted.replaced, redacted.families) : "";
+        const executed = blocks.length;
+        const summaryText = summaries.join("\n");
+
+        const store = deps.toolOutputs;
+        if (!store || (queries.length === 0 && !store.shouldOffload(redacted.text))) {
+          return [
+            `批量执行：${executed} 条命令（工作目录：files/${relCwd === "." ? "" : relCwd}）`,
+            summaryText,
+            guardExternalContent("run_batch", redacted.text),
+            note,
+          ]
+            .filter((part) => part.length > 0)
+            .join("\n\n");
+        }
+
+        const record = await store.capture({
+          tool: "run_batch",
+          roomId: deps.member.roomId,
+          memberId: deps.member.id,
+          ...(deps.runId ? { runId: deps.runId } : {}),
+          argsPreview: `run_batch: ${oneLine(commands.join(" ; "), 200)}`,
+          text: redacted.text,
+        });
+        if (!record) {
+          return [
+            `批量执行：${executed} 条命令（本次存档失败）`,
+            summaryText,
+            guardExternalContent("run_batch", clipForContext(redacted.text, CONTEXT_BUDGET_BYTES)),
+            "（批量输出较大，本次存档失败；上面只保留开头与结尾，请缩小输出范围后重跑。）",
+            note,
+          ]
+            .filter((part) => part.length > 0)
+            .join("\n\n");
+        }
+
+        const header =
+          `批量执行：${executed} 条命令，共 ${formatByteSize(record.bytes)} / ${record.lines} 行；` +
+          `完整输出已存档 ${record.id}`;
+        const sections: string[] = [];
+        const seen = new Set<string>();
+        let replyBytes = 0;
+        for (const query of queries.length > 0 ? queries : [""]) {
+          const selection = store.selectForContext(record, redacted.text, query, BATCH_QUERY_BUDGET_BYTES);
+          if (selection.spans.length === 0) continue;
+          const key = selection.spans.map((span) => `${span.startLine}-${span.endLine}`).join(",");
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const section = `${query ? `## 查询：${query}` : "## 开头片段"}\n\n${guardExternalContent(
+            "run_batch",
+            selection.excerpts,
+          )}`;
+          const size = Buffer.byteLength(section, "utf8");
+          if (sections.length > 0 && replyBytes + size > BATCH_REPLY_BUDGET_BYTES) {
+            sections.push("（其余查询结果未展示；用 output_search 继续检索这份存档。）");
+            break;
+          }
+          sections.push(section);
+          replyBytes += size;
+        }
+        const footer =
+          `（其余内容用 output_search(query="…", id="${record.id}") 检索，` +
+          `或 output_read(id="${record.id}", start_line=…, end_line=…) 按行读取；不要重跑命令。）`;
+        return [header, summaryText, ...sections, footer, note]
+          .filter((part) => part.length > 0)
+          .join("\n\n");
       },
     },
     {

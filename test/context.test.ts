@@ -49,7 +49,7 @@ import {
 } from "../src/agent/context/utils";
 import { applyContextBudget } from "../src/agent/context/budget";
 import { SUMMARIZATION_SYSTEM_PROMPT } from "../src/agent/context/summarization";
-import { runAgentLoop, type ToolImpl } from "../src/agent/loop";
+import { RECALL_MESSAGE_MARKER, runAgentLoop, type ToolImpl } from "../src/agent/loop";
 import { MockProvider } from "../src/provider/mock";
 import type { LlmMessage, LlmRequest } from "../src/provider/types";
 
@@ -398,6 +398,91 @@ describe("applyContextBudget 编排", () => {
     expect(outcome.messages[0]!.role).toBe("system");
   });
 
+  it("压缩摘要末尾追加确定性状态块；回调为空或抛错时不污染摘要", async () => {
+    const fat = "x".repeat(60_000);
+    const provider = new MockProvider((request) =>
+      request.messages[0]?.content === SUMMARIZATION_SYSTEM_PROMPT
+        ? { text: "## 目标\n压缩产物" }
+        : { text: "final" },
+    );
+    const base = {
+      messages: [
+        { role: "system" as const, content: "sys" },
+        user(`huge ask ${fat}`),
+        assistant(`huge answer ${fat}`),
+        user("tail ask"),
+        assistant("tail answer"),
+      ],
+      config: {
+        contextWindowTokens: 20_000,
+        compaction: { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 10, reserveTokens: 1_024 },
+      },
+      memberId: "m1",
+      transport: { provider, model: "mock" },
+    };
+    const withBlock = await applyContextBudget({
+      ...base,
+      compactionState: async () => '<tool_output_state room="r1">\n- out_x｜run_command（1 KB / 2 行）\n</tool_output_state>',
+    });
+    const summary = readCompactionSummary(withBlock.messages[1]!);
+    expect(summary).toContain("压缩产物");
+    expect(summary).toContain('<tool_output_state room="r1">');
+
+    const emptyBlock = await applyContextBudget({
+      ...base,
+      compactionState: () => "",
+    });
+    expect(readCompactionSummary(emptyBlock.messages[1]!)).toContain("## 目标\n压缩产物");
+    expect(readCompactionSummary(emptyBlock.messages[1]!)).not.toContain("<tool_output_state");
+
+    const failing = await applyContextBudget({
+      ...base,
+      compactionState: () => {
+        throw new Error("状态块读取失败");
+      },
+    });
+    expect(failing.compacted).toBeDefined();
+    expect(readCompactionSummary(failing.messages[1]!)).toContain("## 目标\n压缩产物");
+    expect(readCompactionSummary(failing.messages[1]!)).not.toContain("<tool_output_state");
+  });
+
+  it("runAgentLoop 把 compactionState 透传进压缩摘要", async () => {
+    const fat = "x".repeat(60_000);
+    const seen: LlmRequest[] = [];
+    let stateCalls = 0;
+    const provider = new MockProvider((request) => {
+      if (request.messages[0]?.content === SUMMARIZATION_SYSTEM_PROMPT) {
+        return { text: "## 目标\n压缩产物" };
+      }
+      seen.push(request);
+      return { text: "收尾" };
+    });
+    const result = await runAgentLoop({
+      provider,
+      model: "mock",
+      system: "sys",
+      messages: [user(`huge ${fat}`), assistant(`huge answer ${fat}`), user("tail ask")],
+      tools: [],
+      maxSteps: 3,
+      signal: new AbortController().signal,
+      budget: {
+        contextWindowTokens: 20_000,
+        compaction: { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 10, reserveTokens: 1_024 },
+      },
+      compactionState: async () => {
+        stateCalls += 1;
+        return '<tool_output_state room="r1">\n- out_x\n</tool_output_state>';
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(stateCalls).toBeGreaterThan(0);
+    const summary = seen
+      .flatMap((request) => request.messages)
+      .find((message) => message.role === "user" && message.content.startsWith(COMPACTION_SUMMARY_MARKER));
+    expect(summary?.content).toContain("压缩产物");
+    expect(summary?.content).toContain('<tool_output_state room="r1">');
+  });
+
   it("字节压力做有界截断并附带纪元，无需压缩", async () => {
     const provider = new MockProvider(() => ({ text: "unused" }));
     const outcome = await applyContextBudget({
@@ -473,5 +558,124 @@ describe("agent 循环接入", () => {
     expect(result.text).toBe("收尾结论");
     expect(applied).toContain("bounded");
     expect(sawNotice).toBe(true);
+  });
+});
+
+describe("压缩后逐轮召回", () => {
+  it("有压缩摘要时才召回，并把块放在最新用户消息后面", async () => {
+    const requests: LlmRequest[] = [];
+    const queries: string[] = [];
+    const provider = new MockProvider((request) => {
+      requests.push(request);
+      return { text: "完成" };
+    });
+    const result = await runAgentLoop({
+      provider,
+      model: "mock",
+      system: "sys",
+      messages: [buildCompactionSummaryMessage("旧摘要"), user("新问题：cache 为什么失效")],
+      tools: [],
+      maxSteps: 2,
+      signal: new AbortController().signal,
+      recall: {
+        produce: (query) => {
+          queries.push(query);
+          return "召回：cache miss 片段";
+        },
+      },
+    });
+    expect(result.text).toBe("完成");
+    expect(queries).toEqual(["新问题：cache 为什么失效"]);
+    const history = requests[0]!.messages.filter((message) => message.role !== "system");
+    const marker = history.findIndex((message) => message.content.startsWith(RECALL_MESSAGE_MARKER));
+    expect(marker).toBeGreaterThan(0);
+    expect(history[marker - 1]!.content).toContain("新问题");
+    expect(history[marker]!.content).toContain("召回：cache miss 片段");
+
+    const freshRequests: LlmRequest[] = [];
+    let freshCalls = 0;
+    await runAgentLoop({
+      provider: new MockProvider((request) => {
+        freshRequests.push(request);
+        return { text: "好" };
+      }),
+      model: "mock",
+      system: "sys",
+      messages: [user("没有压缩过的问题")],
+      tools: [],
+      maxSteps: 2,
+      signal: new AbortController().signal,
+      recall: {
+        produce: () => {
+          freshCalls += 1;
+          return "不该出现的召回";
+        },
+      },
+    });
+    expect(freshCalls).toBe(0);
+    expect(
+      freshRequests[0]!.messages.some((message) => message.content.startsWith(RECALL_MESSAGE_MARKER)),
+    ).toBe(false);
+  });
+
+  it("新回合换题时重算并替换旧块，不累积", async () => {
+    const noop: ToolImpl = {
+      schema: { name: "noop", description: "noop", parameters: { type: "object", properties: {} } },
+      execute: async () => "ok",
+    };
+    const requests: LlmRequest[] = [];
+    const queries: string[] = [];
+    let step = 0;
+    let pulls = 0;
+    const provider = new MockProvider((request) => {
+      requests.push(request);
+      step += 1;
+      return step === 1 ? { toolCalls: [{ name: "noop", args: {} }] } : { text: "收尾" };
+    });
+    await runAgentLoop({
+      provider,
+      model: "mock",
+      system: "sys",
+      messages: [buildCompactionSummaryMessage("旧摘要"), user("第一个问题 about cache")],
+      tools: [noop],
+      maxSteps: 3,
+      signal: new AbortController().signal,
+      pullPending: () => {
+        pulls += 1;
+        return pulls === 2 ? [user("第二个问题 about build")] : [];
+      },
+      recall: {
+        produce: (query) => {
+          queries.push(query);
+          return `召回给 ${query}`;
+        },
+      },
+    });
+    expect(queries).toEqual(["第一个问题 about cache", "第二个问题 about build"]);
+    const history = requests[1]!.messages.filter((message) => message.role !== "system");
+    const recalls = history.filter((message) => message.content.startsWith(RECALL_MESSAGE_MARKER));
+    expect(recalls).toHaveLength(1);
+    expect(recalls[0]!.content).toContain("召回给 第二个问题 about build");
+    expect(recalls[0]!.content).not.toContain("第一个问题");
+  });
+
+  it("召回回调失败时不影响本轮运行", async () => {
+    const provider = new MockProvider(() => ({ text: "照常完成" }));
+    const result = await runAgentLoop({
+      provider,
+      model: "mock",
+      system: "sys",
+      messages: [buildCompactionSummaryMessage("旧摘要"), user("问题")],
+      tools: [],
+      maxSteps: 2,
+      signal: new AbortController().signal,
+      recall: {
+        produce: () => {
+          throw new Error("召回读取失败");
+        },
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.text).toBe("照常完成");
   });
 });

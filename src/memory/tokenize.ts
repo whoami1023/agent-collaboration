@@ -35,6 +35,28 @@ export function tokenize(text: string): Set<string> {
   return tokens;
 }
 
+/**
+ * 与 tokenize 同一套切分（词 + CJK 二元组 + 单字），但保留重复项。
+ * Set 版本够做去重与相似度；算 BM25 的词频时需要每个词实际出现几次。
+ */
+export function tokenizeList(text: string): string[] {
+  const lower = normalizeLowercase(text).normalize("NFC");
+  const words = lower.replace(CJK_RUN_RE, " ").match(/[\p{L}\p{N}_][\p{L}\p{M}\p{N}_]*/gu) ?? [];
+  const cjkRuns = lower.match(CJK_RUN_RE) ?? [];
+  const tokens = [...words];
+  for (const run of cjkRuns) {
+    for (let index = 1; index < run.length; index += 1) {
+      tokens.push(run.slice(index - 1, index + 1));
+    }
+  }
+  for (const run of cjkRuns) {
+    for (const char of run) {
+      tokens.push(char);
+    }
+  }
+  return tokens;
+}
+
 function jaccardSimilarity(setA: Set<string>, setB: Set<string>): number {
   if (setA.size === 0 && setB.size === 0) {
     return 1;

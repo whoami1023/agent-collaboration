@@ -196,7 +196,11 @@ describe("护栏接进循环", () => {
         : { text: "好了" };
     const onToolResult = vi.fn();
     const result = await run(handler, [echoTool], {
-      transformToolResult: (name: string, raw: string) => `<untrusted source="${name}">${raw}</untrusted>`,
+      // 异步转换也要被等待：大输出落盘选片走的就是这条路径。
+      transformToolResult: async (name: string, raw: string) => {
+        await Promise.resolve();
+        return `<untrusted source="${name}">${raw}</untrusted>`;
+      },
       onToolResult,
     });
     expect(result.text).toBe("好了");

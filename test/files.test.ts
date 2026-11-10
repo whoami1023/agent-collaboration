@@ -216,4 +216,72 @@ describe("文件工具", () => {
     expect(await read.execute({ path: "blob.bin" }, signal)).toContain("二进制");
     expect(await read.execute({ path: "pic.png" }, signal)).toContain("图片");
   });
+
+  it("file_read 分页只返回请求行，并在末尾给出下一页起点", async () => {
+    await files.write(
+      "big.txt",
+      Buffer.from(Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n")),
+    );
+    const read = buildFileTools(files).find((tool) => tool.schema.name === "file_read")!;
+
+    const page = await read.execute({ path: "big.txt", start_line: 5, end_line: 7 }, signal);
+    expect(page).toContain("第 5–7 行");
+    expect(page).toContain("line 5");
+    expect(page).toContain("line 7");
+    expect(page).not.toContain("line 4");
+    expect(page).not.toContain("line 8");
+    expect(page).toContain("start_line=8");
+
+    const tail = await read.execute({ path: "big.txt", start_line: 29, end_line: 40 }, signal);
+    expect(tail).toContain("第 29–30 行");
+    expect(tail).toContain("已读到末尾");
+  });
+
+  it("超过 64 KB 且未指定范围时拒绝整份读，指向 file_search 与分页", async () => {
+    const rows = Array.from({ length: 5000 }, (_, index) => `row ${index} ${"x".repeat(20)}`);
+    await files.write("huge.log", Buffer.from(rows.join("\n")));
+    const read = buildFileTools(files).find((tool) => tool.schema.name === "file_read")!;
+
+    const refused = await read.execute({ path: "huge.log" }, signal);
+    expect(refused).toContain("超过单次整份读取上限");
+    expect(refused).toContain("file_search");
+    expect(refused).toContain("start_line=1");
+
+    const page = await read.execute({ path: "huge.log", start_line: 4995, end_line: 5000 }, signal);
+    expect(page).toContain("row 4999");
+    expect(page).toContain("已读到末尾");
+  });
+
+  it("行号非法或范围倒置时拒绝", async () => {
+    await files.write("small.txt", Buffer.from("a\nb\nc"));
+    const read = buildFileTools(files).find((tool) => tool.schema.name === "file_read")!;
+    expect(await read.execute({ path: "small.txt", start_line: 0 }, signal)).toContain(
+      "大于 0 的整数",
+    );
+    expect(
+      await read.execute({ path: "small.txt", start_line: 5, end_line: 3 }, signal),
+    ).toContain("不能小于");
+  });
+
+  it("行分页支持超过 1 MB 的文件，并能从中间直接取页", async () => {
+    const rows = Array.from({ length: 30_000 }, (_, index) => `row ${index + 1} ${"y".repeat(40)}`);
+    await files.write("huge.log", Buffer.from(rows.join("\n"), "utf8"));
+    const page = await files.readLines("huge.log", { startLine: 20_000, endLine: 20_002 });
+    expect(page.startLine).toBe(20_000);
+    expect(page.endLine).toBe(20_002);
+    expect(page.text).toContain("row 20000");
+    expect(page.more).toBe(true);
+
+    const end = await files.readLines("huge.log", { startLine: 29_999 });
+    expect(end.text).toContain("row 30000");
+    expect(end.more).toBe(false);
+  });
+
+  it("超长单行按页预算截断并明确标注，不会整行带进上下文", async () => {
+    await files.write("one-line.txt", Buffer.from("z".repeat(100_000)));
+    const page = await files.readLines("one-line.txt");
+    expect(page.text).toContain("本行超过单页上限");
+    expect(Buffer.byteLength(page.text, "utf8")).toBeLessThan(70 * 1024);
+    expect(page.more).toBe(true);
+  });
 });

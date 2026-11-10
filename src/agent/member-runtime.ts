@@ -29,7 +29,8 @@ import { resolveMaxActiveTranscriptBytes, type TranscriptByteCompactionLatch } f
 import type { ContextBudgetConfig } from "./context/budget";
 import { buildTools } from "./tools";
 import { EvidenceLedger } from "./evidence";
-import { applyToolResultPolicy } from "./content/policy";
+import { createToolResultTransform } from "./content/policy";
+import type { ToolOutputStore } from "./content/offload";
 import { scopeToolUnavailable } from "./run-scope";
 import { isPassText } from "../room/routing";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
@@ -64,6 +65,8 @@ export interface RuntimeDeps {
   skillUsage?: SkillUsageRecorder;
   /** 记忆召回留痕：主动注入过什么、交付时引用了没有；缺省不记。 */
   recallLedger?: RecallLedger;
+  /** 工具输出存档：大结果落盘后按成员隔离地检索与分页读取。 */
+  toolOutputs?: ToolOutputStore;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -189,6 +192,8 @@ export class MemberRuntime {
         ...(this.deps.recallLedger ? { recallLedger: this.deps.recallLedger } : {}),
         ...(this.deps.files ? { files: this.deps.files } : {}),
         ...(this.deps.skillUsage ? { skillUsage: this.deps.skillUsage } : {}),
+        ...(this.deps.toolOutputs ? { toolOutputs: this.deps.toolOutputs } : {}),
+        runId,
       });
       // 主智能体要按成员能力档案决定把活派给谁：每次运行前同步 TEAM.md 再读进来，
       // 保证新建、移除成员或改技能授权后下一轮就看到最新值（读失败则不注入，fail-open）。
@@ -308,6 +313,16 @@ export class MemberRuntime {
         compaction: { ...DEFAULT_COMPACTION_SETTINGS },
       };
 
+      // 工具结果进上下文前的统一出口：脱敏 → 大输出落盘选片 → 外部来源套不可信信封。
+      // 查询词用本轮触发消息 + 工具参数，选片因此贴着「这一轮到底在找什么」。
+      const transformToolResult = createToolResultTransform({
+        ...(this.deps.toolOutputs ? { store: this.deps.toolOutputs } : {}),
+        memberId: this.member.id,
+        roomId: bus.roomId,
+        runId,
+        query: trigger.text,
+      });
+
       const result = await runAgentLoop({
         provider: transport.provider,
         model: transport.model.id,
@@ -322,7 +337,20 @@ export class MemberRuntime {
         budget,
         budgetOwnerId: this.member.id,
         // 工具结果进上下文前的统一出口：外部来源套不可信信封、疑似密钥掩码（见 content/policy.ts）。
-        transformToolResult: applyToolResultPolicy,
+        transformToolResult,
+        // 压缩摘要后追加确定性状态块：列出最近的工具输出存档与取回方式，避免压缩后丢线索。
+        ...(this.deps.toolOutputs
+          ? { compactionState: () => this.deps.toolOutputs!.stateBlock(this.member.id, bus.roomId) }
+          : {}),
+        // 压缩后的每个新回合按当前问题召回旧工具输出；只在已有压缩摘要后生效。
+        ...(this.deps.toolOutputs
+          ? {
+              recall: {
+                produce: (query: string) =>
+                  this.deps.toolOutputs!.recallBlock(this.member.id, bus.roomId, query),
+              },
+            }
+          : {}),
         byteCompactionState: this.byteCompactionState,
         onContextApplied: (info) => {
           if (info.kind === "compacted") {

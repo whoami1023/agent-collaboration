@@ -9,11 +9,15 @@
 import type { Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 export const MAX_TEXT_BYTES = 1024 * 1024;
 export const MAX_PREVIEW_BYTES = 256 * 1024;
 export const MAX_LIST_ENTRIES = 500;
+/** 文本分页的默认上限：一次最多 400 行、64 KB，超出时由调用方继续翻页。 */
+export const MAX_LINE_PAGE_LINES = 400;
+export const MAX_LINE_PAGE_BYTES = 64 * 1024;
 const MAX_LIST_DEPTH = 12;
 const BINARY_SNIFF_BYTES = 8192;
 
@@ -91,6 +95,25 @@ export interface WorkspaceFileContent {
   truncated: boolean;
 }
 
+export interface WorkspaceFileLineRange {
+  path: string;
+  sizeBytes: number;
+  updatedAt: number;
+  binary: boolean;
+  startLine: number;
+  endLine: number;
+  text: string;
+  /** 后面还有没读到的行。 */
+  more: boolean;
+}
+
+export interface WorkspaceFileLineOptions {
+  startLine?: number;
+  endLine?: number;
+  maxLines?: number;
+  maxBytes?: number;
+}
+
 export interface WorkspaceFileDownload {
   path: string;
   name: string;
@@ -125,6 +148,12 @@ function looksBinary(buffer: Buffer): boolean {
     if (buffer[index] === 0) return true;
   }
   return false;
+}
+
+/** 按字节上限截断字符串，避免把 UTF-8 多字节序列留在半个字符上。 */
+function truncateUtf8(text: string, maxBytes: number): string {
+  const buffer = Buffer.from(text, "utf8");
+  return buffer.length <= maxBytes ? text : buffer.subarray(0, maxBytes).toString("utf8");
 }
 
 export function inlineMimeFor(name: string): string | null {
@@ -240,6 +269,125 @@ export class WorkspaceFiles {
       content: preview === "text" ? buffer.toString("utf8") : "",
       truncated: stat.size > length,
     };
+  }
+
+  /**
+   * 按行分页读取：只返回请求的行区间，支持超过 MAX_TEXT_BYTES 的大文件。
+   * 行按 \n 切分并去掉行尾 \r；单行本身超过页预算时在预算处截断并明确标注，
+   * 否则一条超长 JSON 会绕过页上限把整份文件带进上下文。
+   */
+  async readLines(
+    rawPath: string,
+    options: WorkspaceFileLineOptions = {},
+  ): Promise<WorkspaceFileLineRange> {
+    const { rel, abs, stat } = await this.existingFile(rawPath);
+    const startLine = Math.max(1, Math.round(options.startLine ?? 1));
+    const requestedEnd =
+      options.endLine === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.max(startLine, Math.round(options.endLine));
+    const maxLines = Math.max(
+      1,
+      Math.min(MAX_LINE_PAGE_LINES, Math.round(options.maxLines ?? MAX_LINE_PAGE_LINES)),
+    );
+    const maxBytes = Math.max(
+      1,
+      Math.min(MAX_PREVIEW_BYTES, Math.round(options.maxBytes ?? MAX_LINE_PAGE_BYTES)),
+    );
+    const image = inlineMimeFor(rel)?.startsWith("image/") === true;
+
+    const handle = await fs.open(abs, "r");
+    try {
+      const sniff = Buffer.alloc(Math.min(BINARY_SNIFF_BYTES, stat.size));
+      if (sniff.length > 0) await handle.read(sniff, 0, sniff.length, 0);
+      const binary = image || looksBinary(sniff);
+      if (binary) {
+        return {
+          path: rel,
+          sizeBytes: stat.size,
+          updatedAt: stat.mtimeMs,
+          binary: true,
+          startLine,
+          endLine: startLine - 1,
+          text: "",
+          more: false,
+        };
+      }
+
+      const decoder = new StringDecoder("utf8");
+      const page: string[] = [];
+      let current = "";
+      let lineNo = 0;
+      let usedBytes = 0;
+      let more = false;
+      let stopped = false;
+      let position = 0;
+      const buffer = Buffer.alloc(64 * 1024);
+
+      const finishLine = (): void => {
+        lineNo += 1;
+        if (stopped) {
+          current = "";
+          return;
+        }
+        if (lineNo < startLine) {
+          current = "";
+          return;
+        }
+        if (lineNo > requestedEnd) {
+          more = true;
+          stopped = true;
+          current = "";
+          return;
+        }
+        const line = current.endsWith("\r") ? current.slice(0, -1) : current;
+        const size = Buffer.byteLength(line, "utf8") + (page.length > 0 ? 1 : 0);
+        if (page.length >= maxLines || usedBytes + size > maxBytes) {
+          if (page.length === 0) {
+            page.push(
+              `${truncateUtf8(line, maxBytes)}\n…（本行超过单页上限，已截断；请缩小范围或先检索）`,
+            );
+            usedBytes = maxBytes;
+          }
+          more = true;
+          stopped = true;
+          current = "";
+          return;
+        }
+        page.push(line);
+        usedBytes += size;
+        current = "";
+      };
+
+      while (!stopped && position < stat.size) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+        if (bytesRead <= 0) break;
+        position += bytesRead;
+        const chunk = decoder.write(buffer.subarray(0, bytesRead));
+        for (const char of chunk) {
+          if (char === "\n") finishLine();
+          else current += char;
+        }
+      }
+      if (!stopped) {
+        current += decoder.end();
+        if (current.length > 0) finishLine();
+        if (position < stat.size) more = true;
+      }
+      const endLine = page.length > 0 ? startLine + page.length - 1 : startLine - 1;
+      return {
+        path: rel,
+        sizeBytes: stat.size,
+        updatedAt: stat.mtimeMs,
+        binary: false,
+        startLine,
+        endLine,
+        text: page.join("\n"),
+        more,
+      };
+    } finally {
+      await handle.close();
+    }
   }
 
   async write(

@@ -40,6 +40,8 @@ export interface ApplyContextBudgetParams {
   transport: SummarizationTransport;
   byteLatch?: TranscriptByteCompactionLatch;
   requestState?: "unresolved";
+  /** 压缩成功后追加到摘要消息末尾的确定性状态块；返回空串则不加。 */
+  compactionState?: () => string | Promise<string>;
 }
 
 export interface ContextBudgetOutcome {
@@ -118,8 +120,16 @@ export async function applyContextBudget(
           byteLatch = { memberId: params.memberId, maxBytes, activeBytes };
         }
       } else {
+        // 状态块是确定性清单，不调模型；读失败就不追加，绝不能因为状态块失败而放弃压缩。
+        let summaryText = summary.value.summary;
+        if (params.compactionState) {
+          const extra = await Promise.resolve()
+            .then(() => params.compactionState!())
+            .catch(() => "");
+          if (extra.trim().length > 0) summaryText = `${summaryText}\n\n${extra.trim()}`;
+        }
         const candidate = [
-          buildCompactionSummaryMessage(summary.value.summary),
+          buildCompactionSummaryMessage(summaryText),
           ...managed.slice(summary.value.firstKeptIndex),
         ];
         const candidateTokens = candidate.reduce((sum, m) => sum + estimateTokens(m), 0);

@@ -30,6 +30,7 @@ import { ModelUsageStore } from "../model/usage-store";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
 import { RecallLedger } from "../memory/recall-ledger";
+import { ToolOutputStore } from "../agent/content/offload";
 import { WorkspaceFiles } from "../files/workspace-files";
 import { RoomBus } from "../room/bus";
 import {
@@ -141,6 +142,8 @@ export class Workspace {
     readonly curation: CurationService,
     /** 记忆召回留痕：主动注入过什么、后来被引用没有；维护巡检的数据源。 */
     readonly recallLedger: RecallLedger,
+    /** 工具输出存档：大结果落盘后按成员隔离地检索与分页读取。 */
+    readonly toolOutputs: ToolOutputStore,
   ) {}
 
   static async load(
@@ -197,6 +200,8 @@ export class Workspace {
     const usage = new ModelUsageStore(join(dir, "model-usage.json"));
     // 记忆召回留痕：只追加、不参与检索，维护巡检用它找「召回了却没人用」的条目。
     const recallLedger = new RecallLedger(join(dir, "recall-ledger.jsonl"));
+    // 工具输出存档：大结果不整份进上下文，完整内容留在本账号工作区里。
+    const toolOutputs = new ToolOutputStore(join(dir, "tool-outputs"));
 
     // 学习层（P1）：成员一轮交付后的后台复盘。产出先落进本账号的 learning.json，
     // 事件按复盘所在的房间广播，前端「学习」面板据此刷新。
@@ -253,6 +258,7 @@ export class Workspace {
       learning,
       curation,
       recallLedger,
+      toolOutputs,
     );
     workspaceRef = workspace;
     workspace.groupBuses = groupBuses;
@@ -353,6 +359,7 @@ export class Workspace {
       learning: this.learning,
       skillUsage: this.curation.recordUsage,
       recallLedger: this.recallLedger,
+      toolOutputs: this.toolOutputs,
     });
     const instance: RoomInstance = { descriptor, bus, board, orchestrator, stateFile: this.stateFileFor(descriptor.id), saveTimer: null };
     bus.subscribe((event) => {

@@ -21,6 +21,7 @@ import type { MemberProfileHints } from "../memory/bootstrap-files";
 import type { MemorySearchManager } from "../memory/manager";
 import type { RecallLedger } from "../memory/recall-ledger";
 import type { WorkspaceFiles } from "../files/workspace-files";
+import type { ToolOutputStore } from "./content/offload";
 import { MemberRuntime } from "./member-runtime";
 import { AdvisorService } from "./advisors/service";
 import type { LearningHost } from "./learning/types";
@@ -52,6 +53,8 @@ export interface OrchestratorDeps {
   skillUsage?: SkillUsageRecorder;
   /** 记忆召回留痕：主动注入与后续引用都落进这个工作区级账本。 */
   recallLedger?: RecallLedger;
+  /** 工具输出存档：大结果落盘后由 output_search / output_read 取回。 */
+  toolOutputs?: ToolOutputStore;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -656,6 +659,7 @@ export class Orchestrator {
         ...(deps.learning ? { learning: deps.learning } : {}),
         ...(deps.skillUsage ? { skillUsage: deps.skillUsage } : {}),
         ...(deps.recallLedger ? { recallLedger: deps.recallLedger } : {}),
+        ...(deps.toolOutputs ? { toolOutputs: deps.toolOutputs } : {}),
         advisors: this.advisors,
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });

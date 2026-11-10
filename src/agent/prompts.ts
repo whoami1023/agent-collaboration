@@ -101,7 +101,8 @@ export interface PromptContext {
 
 const FILE_WORKSPACE_SECTION = `文件工作区
 - 用户上传的文件和你产出的成果都放在文件工作区（右侧「文件」标签页，根目录 files/）。
-- file_list 查看清单，file_read 读取文本，file_write 写入结果；路径用相对路径（如 reports/a.md），子目录会自动创建。
+- file_list 查看清单，file_search 在多个文件里检索内容，file_read 读取文本，file_write 写入结果；路径用相对路径（如 reports/a.md），子目录会自动创建。
+- 大于 64 KB 的文件不要整份读：先用 file_search 定位，再传 start_line/end_line 用 file_read 分页读相邻行；一次分页最多 400 行 / 64 KB，末尾会给出下一页起点。
 - 汇报时给出文件的相对路径作为证据；图片、PDF 等二进制或超大文件请让用户在面板里预览、下载。`;
 
 const DOCUMENT_SECTION = `交付文档（给别人看的成稿）
@@ -114,10 +115,29 @@ const DOCUMENT_SECTION = `交付文档（给别人看的成稿）
 - 长文分节写：一节一个文件，或用 file_write 的 append 续写，最后统一装配；不要为改一处整篇重写。交付前自检：只看文件，读者能否理解背景、结论与依据。`;
 
 const COMMAND_SECTION = `命令执行
-- run_command 在文件工作区执行命令（默认 30 秒、最长 120 秒，输出截断到 32 KB）：可跑 Python/Node 脚本、pip/npm 安装、数据校验；cwd 必须留在工作区内。
+- run_command 在文件工作区执行命令（默认 30 秒、最长 120 秒）：可跑 Python/Node 脚本、pip/npm 安装、数据校验；cwd 必须留在工作区内。
 - run_skill_script 执行技能附带脚本：会先把该技能的全部文件展开到 files/.skill-runtime/<技能名>/，再用对应解释器运行。默认在该展开目录里跑（产出只留在临时目录）；要处理文件工作区里的成果就传 cwd="." 让脚本在 files/ 里读写。
 - 命令以服务进程权限运行，不会经过 shell 传递参数的部分只限脚本参数；执行前想清后果，不要运行来源不明的命令。
 - 执行后如实引用真实输出（退出码与关键日志）；失败就贴错误并说明下一步，不要编造运行结果。`;
+
+/**
+ * 批量执行：一次查好几件事时，把命令和要回答的问题一起交给 run_batch，
+ * 避免为每条命令各开一轮、各灌一次日志。只在挂了 run_batch 时注入。
+ */
+const BATCH_SECTION = `批量执行
+- 一次要查好几件事（测试失败、类型错误、构建产物、日志、git 记录）时，用 run_batch 顺序跑多条命令，并在 queries 里列出要回答的问题；它会在同一次调用里从完整输出中挑相关片段回答。
+- run_batch 的每条命令仍按 run_command 的规则执行；不要放会互相踩文件或需要常驻的命令。部分命令失败不影响其余命令继续跑，汇报时逐条给退出码与关键日志。
+- 输出很大时会自动存档并给出 out_xxx；后续要看别的位置再用 output_search / output_read，不要重跑整批命令。`;
+
+/**
+ * 工具输出存档：只在挂了 output_search 时才说明。
+ * 大输出不进上下文，完整内容落进工作区存档；模型要养成「先检索、再按行读」的习惯，
+ * 而不是把同一条命令重跑一遍。
+ */
+const OUTPUT_SECTION = `工具输出存档
+- 单次工具输出过大时，上下文只保留与当前任务最相关的片段，完整内容存档为 out_xxx。
+- 需要其余部分时：output_search(query="错误原文或关键词") 检索存档；output_read(id="out_xxx", start_line=…, end_line=…) 按行读取。不要为了看全量输出而重跑同一条命令。
+- 引用存档内容时以原文为准，不要把片段外的部分补全成「看起来合理」的结论。`;
 
 /**
  * 交付闸门（移植 Hermes 的 acceptance contract + verification evidence）：
@@ -170,6 +190,10 @@ export function buildSystemPrompt(context: PromptContext): string {
     context.availableTools?.has("file_write") === true ? DOCUMENT_SECTION : "";
   const commandSection =
     context.availableTools?.has("run_command") === true ? COMMAND_SECTION : "";
+  const batchSection =
+    context.availableTools?.has("run_batch") === true ? BATCH_SECTION : "";
+  const outputSection =
+    context.availableTools?.has("output_search") === true ? OUTPUT_SECTION : "";
   const cronSection = context.availableTools?.has("cron") === true ? CRON_SECTION : "";
   // 闸门只作用在任务卡上：没挂 task_update 的运行（计划轮、纯聊天）不该看到这段规则。
   const acceptanceSection = context.availableTools?.has("task_update") === true ? ACCEPTANCE_SECTION : "";
@@ -182,6 +206,8 @@ export function buildSystemPrompt(context: PromptContext): string {
     fileSection,
     documentSection,
     commandSection,
+    batchSection,
+    outputSection,
     acceptanceSection,
     cronSection,
     formatDynamicContext(context),
