@@ -1,6 +1,6 @@
 {
   "name": "agent-collaboration",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "private": true,
   "type": "module",
   "description": "Group-chat multi-agent collaboration: users create members, agents dispatch work by @mention.",
