@@ -34,6 +34,7 @@ describe("agent loop", () => {
     expect(onToolResult).toHaveBeenCalledWith(
       expect.objectContaining({ name: "echo" }),
       "echo:hi",
+      expect.objectContaining({ ok: true }),
     );
   });
 

@@ -29,6 +29,12 @@ export type HybridSearchResult = {
   importance?: number;
   triggers?: string;
   projectKey?: string;
+  entryId?: string;
+  provenance?: string;
+  asOf?: string;
+  validUntil?: string;
+  retracted?: boolean;
+  supersedes?: string;
 };
 
 type RankedHybridResult = HybridSearchResult & {
@@ -124,6 +130,12 @@ export async function mergeHybridResults(params: {
     existing.importance ??= r.importance;
     existing.triggers ??= r.triggers;
     existing.projectKey ??= r.projectKey;
+    existing.entryId ??= r.entryId;
+    existing.provenance ??= r.provenance;
+    existing.asOf ??= r.asOf;
+    existing.validUntil ??= r.validUntil;
+    existing.supersedes ??= r.supersedes;
+    if (r.retracted) existing.retracted = true;
     if (r.snippet && r.snippet.length > 0) {
       existing.snippet = r.snippet;
     }
@@ -174,6 +186,12 @@ export async function mergeHybridResults(params: {
       importance: entry.importance,
       triggers: entry.triggers,
       projectKey: entry.projectKey,
+      entryId: entry.entryId,
+      provenance: entry.provenance,
+      asOf: entry.asOf,
+      validUntil: entry.validUntil,
+      retracted: entry.retracted,
+      supersedes: entry.supersedes,
     };
   });
 

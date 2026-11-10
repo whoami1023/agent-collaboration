@@ -19,6 +19,7 @@ import type { SkillLibrary } from "../skills/library";
 import { selectSkillsForText } from "../skills/matching";
 import type { MemberProfileHints } from "../memory/bootstrap-files";
 import type { MemorySearchManager } from "../memory/manager";
+import type { RecallLedger } from "../memory/recall-ledger";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import { MemberRuntime } from "./member-runtime";
 import { AdvisorService } from "./advisors/service";
@@ -49,6 +50,8 @@ export interface OrchestratorDeps {
   learning?: LearningHost;
   /** 策展层：技能使用记账回调，工具被真正调用时打点（工作区在建模时注入）。 */
   skillUsage?: SkillUsageRecorder;
+  /** 记忆召回留痕：主动注入与后续引用都落进这个工作区级账本。 */
+  recallLedger?: RecallLedger;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -652,6 +655,7 @@ export class Orchestrator {
         ...(deps.onUsageRecord ? { onUsageRecord: deps.onUsageRecord } : {}),
         ...(deps.learning ? { learning: deps.learning } : {}),
         ...(deps.skillUsage ? { skillUsage: deps.skillUsage } : {}),
+        ...(deps.recallLedger ? { recallLedger: deps.recallLedger } : {}),
         advisors: this.advisors,
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });

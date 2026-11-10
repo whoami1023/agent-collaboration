@@ -88,12 +88,15 @@ export const BUILTIN_SKILL_CATEGORIES: Readonly<Record<string, SkillCategory>> =
   "docx-writer": "product",
   "docx-track-changes": "product",
   "docx-formula": "product",
+  "internal-comms": "product",
 
   "docx-reader": "research",
+  pdf: "research",
 
   "diagram-maker": "design",
   "claude-design": "design",
   "accessibility-audit": "design",
+  "theme-factory": "design",
 
   "web-search": "web",
   "web-fetch": "web",

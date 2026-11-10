@@ -16,7 +16,8 @@ import { selectSkillsForMember } from "../skills/selection";
 import type { SkillUsageRecorder } from "../skills/curation/types";
 import type { MemorySearchManager } from "../memory/manager";
 import type { WorkspaceFiles } from "../files/workspace-files";
-import { resolveTriggerRecall } from "../memory/recall";
+import { resolveTriggerRecall, type TriggerRecallHit } from "../memory/recall";
+import { findCitedRecallHits, type RecallLedger } from "../memory/recall-ledger";
 import { runAgentLoop } from "./loop";
 import type { LearningHost } from "./learning/types";
 import type { AdvisorService } from "./advisors/service";
@@ -61,6 +62,8 @@ export interface RuntimeDeps {
   advisors?: AdvisorService;
   /** 技能使用记账（策展的输入）：由工作区注入全局使用账本，缺省不记。 */
   skillUsage?: SkillUsageRecorder;
+  /** 记忆召回留痕：主动注入过什么、交付时引用了没有；缺省不记。 */
+  recallLedger?: RecallLedger;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -183,6 +186,7 @@ export class MemberRuntime {
         evidence,
         getCron: () => this.deps.getCron?.(),
         ...(this.deps.memory ? { memory: this.deps.memory } : {}),
+        ...(this.deps.recallLedger ? { recallLedger: this.deps.recallLedger } : {}),
         ...(this.deps.files ? { files: this.deps.files } : {}),
         ...(this.deps.skillUsage ? { skillUsage: this.deps.skillUsage } : {}),
       });
@@ -208,9 +212,11 @@ export class MemberRuntime {
         })),
         ...(teamFile ? { teamFile } : {}),
         availableTools: new Set(tools.map((tool) => tool.schema.name)),
+        nowMs: Date.now(),
       });
       // Lane-1 触发召回（移植 active-memory）：在主模型请求前跑，失败即不注入（fail-open）。
       let recallContext: string | undefined;
+      let recalledHits: TriggerRecallHit[] = [];
       if (this.deps.memory) {
         const recall = await resolveTriggerRecall({
           manager: this.deps.memory,
@@ -219,6 +225,17 @@ export class MemberRuntime {
           ...(member.role === "sub" ? { agentId: member.id } : {}),
         }).catch(() => undefined);
         recallContext = recall?.context;
+        recalledHits = recall?.matches ?? [];
+        // 先记「主动注入了什么」；是否被引用等交付时再从正文里核对。
+        if (this.deps.recallLedger && recalledHits.length > 0) {
+          this.deps.recallLedger.record(
+            this.deps.recallLedger.volunteeredEvents(
+              { roomId: bus.roomId, agentId: member.id, runId },
+              trigger.text,
+              recalledHits,
+            ),
+          );
+        }
       }
       const windowMessages = bus.window(limits.maxRoomWindowChars);
       const window = formatRoomWindow(windowMessages);
@@ -325,8 +342,16 @@ export class MemberRuntime {
           usedTools.add(call.name);
           this.emit({ type: "tool", runId, memberId: this.member.id, name: call.name, args: call.args });
         },
-        onToolResult: (call, content) =>
-          this.emit({ type: "tool-result", runId, memberId: this.member.id, name: call.name, content }),
+        onToolResult: (call, content, status) =>
+          this.emit({
+            type: "tool-result",
+            runId,
+            memberId: this.member.id,
+            name: call.name,
+            content,
+            ok: status.ok,
+            ...(status.code ? { code: status.code } : {}),
+          }),
         onRepair: ({ toolNames }) =>
           this.notice(`@${this.member.name} 的文本式工具调用已被修复执行：${toolNames.join("、")}`),
         pullPending: () => this.pending.splice(0, this.pending.length),
@@ -390,6 +415,18 @@ export class MemberRuntime {
           memberId: this.member.id,
           text: passed ? "" : (result.text ?? ""),
         });
+      }
+      // 召回账本的另一半：交付正文里出现 `Source: path#Lx` 才算这条记忆真被引用。
+      if (this.deps.recallLedger && recalledHits.length > 0 && result.text && !silent && !passed) {
+        const cited = findCitedRecallHits(result.text, recalledHits);
+        if (cited.length > 0) {
+          this.deps.recallLedger.record(
+            this.deps.recallLedger.usedEvents(
+              { roomId: bus.roomId, agentId: member.id, runId },
+              cited,
+            ),
+          );
+        }
       }
       if (result.maxStepsReached) {
         this.notice(

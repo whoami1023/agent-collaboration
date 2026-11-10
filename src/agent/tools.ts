@@ -6,6 +6,8 @@ import { selectSkillsForMember, isSkillSelected } from "../skills/selection";
 import { formatSkillFileSize } from "../skills/skill-files";
 import type { MemorySearchManager } from "../memory/manager";
 import { buildMemoryTools } from "../memory/tools";
+import { buildMaintenanceTools } from "../memory/maintenance";
+import type { RecallLedger } from "../memory/recall-ledger";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import type { ToolImpl } from "./loop";
 import { formatRoomWindow } from "./prompts";
@@ -17,6 +19,7 @@ import { applyRunScope } from "./run-scope";
 import { verifyAcceptance, type EvidenceLedger } from "./evidence";
 import type { CronService } from "../cron/service";
 import type { SkillUsageRecorder } from "../skills/curation/types";
+import { toolFailureText } from "./tool-errors";
 
 export interface ToolDeps {
   bus: RoomBus;
@@ -24,6 +27,8 @@ export interface ToolDeps {
   skills: SkillLibrary;
   userId: string;
   memory?: MemorySearchManager;
+  /** 召回留痕账本：主智能体的 maintenance_scan 据此汇报「注入过但没人用」的记忆。 */
+  recallLedger?: RecallLedger;
   files?: WorkspaceFiles;
   /** 联网工具注入点：单测可替换 fetch/DNS，生产环境留空走真实网络。 */
   web?: WebToolOptions;
@@ -70,11 +75,18 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
     selectSkillsForMember(deps.skills.listForAgent(deps.userId), member.skillNames);
   const denialFor = (skillName: string): string => {
     const available = enabledSkills().map((item) => item.name);
-    return `错误：技能 ${skillName} 未对 @${member.name} 启用${
-      available.length > 0
-        ? `。可用技能：${available.join("、")}`
-        : "，该智能体当前没有启用任何技能（可在右侧「智能体文件 → 技能」中勾选）"
-    }`;
+    return toolFailureText(
+      "permission_denied",
+      `技能 ${skillName} 未对 @${member.name} 启用${
+        available.length > 0 ? `。可用技能：${available.join("、")}` : "，该智能体当前没有启用任何技能"
+      }`,
+      {
+        next:
+          available.length > 0
+            ? "换用上面列出的技能，或请用户在右侧「智能体文件 → 技能」中勾选后再试。"
+            : "请用户在右侧「智能体文件 → 技能」中勾选该技能后再试。",
+      },
+    );
   };
 
   // 成员只能由用户在左侧「新建成员」创建；运行中的智能体不再拥有创建子成员的通道。
@@ -94,13 +106,19 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
     },
     execute: async (args) => {
       const raw = readString(args, "name");
-      if (!raw) return "错误：name 不能为空";
+      if (!raw) {
+        return toolFailureText("invalid_argument", "name 不能为空", {
+          next: "传入 system prompt 中可用技能列表里的技能名称。",
+        });
+      }
       const skill = deps.skills.readForAgent(deps.userId, raw);
       if (!skill) {
         const available = enabledSkills().map((item) => item.name);
-        return `错误：没有可用的技能 ${raw}${
-          available.length > 0 ? `。可用技能：${available.join("、")}` : ""
-        }`;
+        return toolFailureText(
+          "not_found",
+          `没有可用的技能 ${raw}${available.length > 0 ? `。可用技能：${available.join("、")}` : ""}`,
+          { next: "用 system prompt 里列出的技能名重试，不要猜技能名。" },
+        );
       }
       if (!isSkillSelected(member.skillNames, skill.name)) return denialFor(skill.name);
       // 展开正文算一次真实使用：策展的闲置与归档判断只看这个计数，光在提示词里列出来不算被用过。
@@ -136,17 +154,25 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
     execute: async (args) => {
       const skillName = readString(args, "skill");
       const path = readString(args, "path");
-      if (!skillName) return "错误：skill 不能为空";
-      if (!path) return "错误：path 不能为空";
+      if (!skillName) return toolFailureText("invalid_argument", "skill 不能为空");
+      if (!path) {
+        return toolFailureText("invalid_argument", "path 不能为空", {
+          next: "先 use_skill 查看附带文件清单，再传入清单里的相对路径。",
+        });
+      }
       const skill = deps.skills.readForAgent(deps.userId, skillName);
-      if (!skill) return `错误：没有可用的技能 ${skillName}`;
+      if (!skill) return toolFailureText("not_found", `没有可用的技能 ${skillName}`);
       if (!isSkillSelected(member.skillNames, skill.name)) return denialFor(skill.name);
       const hit = deps.skills.readSkillFile(deps.userId, skillName, path);
       if (!hit) {
         const list = (skill.files ?? []).map((file) => file.path);
         return list.length > 0
-          ? `错误：技能 ${skillName} 里没有文件 ${path}。可选路径：${list.join("、")}`
-          : `错误：技能 ${skillName} 没有附带文件`;
+          ? toolFailureText("not_found", `技能 ${skillName} 里没有文件 ${path}。可选路径：${list.join("、")}`, {
+              next: "从上面列出的可选路径里选一个。",
+            })
+          : toolFailureText("not_found", `技能 ${skillName} 没有附带文件`, {
+              next: "直接用 use_skill 读技能正文。",
+            });
       }
       // 读附带文件只算「动过手」（viewCount），不计入 useCount：闲置判断看的是整份技能有没有被展开。
       deps.skillUsage?.(skill.id, "view");
@@ -183,10 +209,18 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
     },
     execute: async (args) => {
       const title = readString(args, "title");
-      if (!title) return "错误：title 不能为空";
+      if (!title) {
+        return toolFailureText("invalid_argument", "title 不能为空", {
+          next: "给任务卡一个一句话标题后重试。",
+        });
+      }
       const acceptance = readString(args, "acceptance");
       if (acceptance && acceptance.length > MAX_ACCEPTANCE_CHARS) {
-        return `错误：acceptance 最多 ${MAX_ACCEPTANCE_CHARS} 字；只保留能被逐条核对的验收客体，其余写进 detail`;
+        return toolFailureText(
+          "invalid_argument",
+          `acceptance 最多 ${MAX_ACCEPTANCE_CHARS} 字；只保留能被逐条核对的验收客体，其余写进 detail`,
+          { next: "精简验收条款，把背景说明挪到 detail。" },
+        );
       }
       const ownerName = readString(args, "owner");
       const owner = ownerName ? deps.bus.findMemberByName(ownerName) : undefined;
@@ -239,20 +273,28 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
     },
     execute: async (args) => {
       const taskId = readString(args, "task_id");
-      if (!taskId) return "错误：task_id 不能为空";
+      if (!taskId) {
+        return toolFailureText("invalid_argument", "task_id 不能为空", {
+          next: "先用 task_list 找到任务 id。",
+        });
+      }
       const status = readString(args, "status");
       if (status && !TASK_STATUSES.includes(status as TaskStatus)) {
-        return `错误：status 只能是 ${TASK_STATUSES.join(" / ")}`;
+        return toolFailureText("invalid_argument", `status 只能是 ${TASK_STATUSES.join(" / ")}`);
       }
       const acceptance = readString(args, "acceptance");
       if (acceptance && acceptance.length > MAX_ACCEPTANCE_CHARS) {
-        return `错误：acceptance 最多 ${MAX_ACCEPTANCE_CHARS} 字`;
+        return toolFailureText("invalid_argument", `acceptance 最多 ${MAX_ACCEPTANCE_CHARS} 字`);
       }
       const ownerName = readString(args, "owner");
       const owner = ownerName ? deps.bus.findMemberByName(ownerName) : undefined;
-      if (ownerName && !owner) return `错误：找不到成员 ${ownerName}`;
+      if (ownerName && !owner) return toolFailureText("not_found", `找不到成员 ${ownerName}`);
       const task = deps.board.get(taskId);
-      if (!task) return `更新失败：任务不存在：${taskId}`;
+      if (!task) {
+        return toolFailureText("not_found", `任务不存在：${taskId}`, {
+          next: "用 task_list 回读现有任务 id，再更新对应卡片。",
+        });
+      }
       const verifyKind = readString(args, "verify_kind");
       const verifyHandle = readString(args, "verify_handle");
       const willBeDone = status === "done";
@@ -311,7 +353,11 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
         });
         return `任务 ${updated.id} 已更新：状态 ${updated.status}${owner ? `，负责人 @${owner.name}` : ""}`;
       } catch (err) {
-        return `更新失败：${err instanceof Error ? err.message : String(err)}`;
+        return toolFailureText(
+          "conflict",
+          err instanceof Error ? err.message : String(err),
+          { next: "用 task_list 回读最新状态，再按现状重试。" },
+        );
       }
     },
   });
@@ -335,16 +381,22 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
     execute: async (args) => {
       const taskId = readString(args, "task_id");
       const name = readString(args, "name");
-      if (!taskId || !name) return "错误：task_id 和 name 都必须提供";
+      if (!taskId || !name) {
+        return toolFailureText("invalid_argument", "task_id 和 name 都必须提供");
+      }
       const relPath = readString(args, "path");
       if (relPath && deps.files) {
         // 指向工作区文件的成果必须真的在：登记一个不存在的路径等于伪造证据。
+        const cleanPath = relPath.replace(/^files\//, "");
         try {
-          await deps.files.read(relPath.replace(/^files\//, ""), { maxBytes: 1 });
+          await deps.files.read(cleanPath, { maxBytes: 1 });
         } catch (err) {
-          return `登记失败：files/${relPath.replace(/^files\//, "")} 读不到（${
-            err instanceof Error ? err.message : String(err)
-          }）。请先产出该文件，或把成果名与摘要写清楚、不带路径。`;
+          return [
+            `登记失败：files/${cleanPath} 读不到（${err instanceof Error ? err.message : String(err)}）。`,
+            "错误码：not_found",
+            "下一步：先用 file_write 产出该文件，或只登记成果名与摘要、不带 path。",
+            `核验：file_list 里能看到 ${cleanPath}，再重新登记。`,
+          ].join("\n");
         }
       }
       try {
@@ -360,7 +412,11 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
         }
         return `已登记成果到 ${task.id}，当前共 ${task.artifacts.length} 项`;
       } catch (err) {
-        return `登记失败：${err instanceof Error ? err.message : String(err)}`;
+        return toolFailureText(
+          "conflict",
+          `登记失败：${err instanceof Error ? err.message : String(err)}`,
+          { next: "用 task_list 回读任务现状，再重新登记。" },
+        );
       }
     },
   });
@@ -383,11 +439,11 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
     execute: async (args) => {
       const status = readString(args, "status");
       if (status && !TASK_STATUSES.includes(status as TaskStatus)) {
-        return `错误：status 只能是 ${TASK_STATUSES.join(" / ")}`;
+        return toolFailureText("invalid_argument", `status 只能是 ${TASK_STATUSES.join(" / ")}`);
       }
       const ownerName = readString(args, "owner");
       const owner = ownerName ? deps.bus.findMemberByName(ownerName) : undefined;
-      if (ownerName && !owner) return `错误：找不到成员 ${ownerName}`;
+      if (ownerName && !owner) return toolFailureText("not_found", `找不到成员 ${ownerName}`);
       let tasks = deps.board.list();
       if (status) tasks = tasks.filter((task) => task.status === status);
       if (owner) tasks = tasks.filter((task) => task.ownerId === owner.id);
@@ -440,6 +496,18 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   // 对应 OpenClaw memory-core 插件按 agent 注册工具通道的形态。
   if (deps.memory) {
     tools.push(...buildMemoryTools(deps.memory, member.role === "sub" ? { agentId: member.id } : {}));
+    // 巡检是工作区级动作（会读到全量记忆审计、账本与看板），只交给主智能体；
+    // 子成员的回答范围是它自己的记忆，不该看到别人的条目摘录。
+    if (member.role === "main") {
+      tools.push(
+        ...buildMaintenanceTools({
+          memory: deps.memory,
+          board: deps.board,
+          bus: deps.bus,
+          ...(deps.recallLedger ? { ledger: deps.recallLedger } : {}),
+        }),
+      );
+    }
   }
 
   // 文件工作区：用户上传与智能体产出共用 files/ 目录，对应 OpenClaw 的 read/write/ls 文件工具。

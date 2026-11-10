@@ -1,3 +1,4 @@
+import { ANTHROPIC_SKILLS } from "./builtin-anthropic-skills";
 import { CATALOG_SKILLS } from "./builtin-catalog";
 import { DATA_SKILLS } from "./builtin-data-skills";
 import { DOCX_SKILLS } from "./builtin-docx-skills";
@@ -19,7 +20,7 @@ export interface BuiltinSkillSeed {
 }
 
 /** 内置技能内容版本：升级时启动会刷新已有内置记录，用户自建的同名技能不受影响。 */
-export const BUILTIN_SKILLS_VERSION = 9;
+export const BUILTIN_SKILLS_VERSION = 10;
 
 const CORE_SKILLS: BuiltinSkillSeed[] = [
   {
@@ -437,5 +438,6 @@ export const BUILTIN_SHARED_SKILLS: BuiltinSkillSeed[] = [
   ...CATALOG_SKILLS,
   ...DATA_SKILLS,
   ...HERMES_SKILLS,
+  ...ANTHROPIC_SKILLS,
   ...DOCX_SKILLS,
 ];

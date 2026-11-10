@@ -3,9 +3,18 @@
  * packages/memory-host-sdk/src/host/curated-annotations.ts —— 逐字移植（无外部依赖）。
  * 策展记忆条目（MEMORY.md / memory/**.md 的 `- ` 列表项）上的行内注释：
  * <!-- trigger: ... --> / <!-- importance: 1..10 --> / <!-- project: key -->。
+ *
+ * 本项目扩展（移植 gbrain 的事实来源与时效模型）：
+ * <!-- id: 稳定标识 --> <!-- source: 出处 --> <!-- as-of: YYYY-MM-DD -->
+ * <!-- valid-until: YYYY-MM-DD --> <!-- retracted: YYYY-MM-DD 理由 -->
+ * <!-- supersedes: 旧条目 id -->
+ * 注释只做事实的元数据，不改变正文；读取时据此判断过期、已撤回与已被取代。
  */
 
 export const INVALID_PROJECT_ANNOTATION_KEY = "!invalid-project-annotation";
+
+const ENTRY_ID_RE = /^[A-Za-z0-9._:#-]{1,80}$/u;
+const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/u;
 
 function* scanMemoryAnnotations(text: string, marker: RegExp, lineScoped = false) {
   let closing = -1;
@@ -44,7 +53,11 @@ export function stripMemoryAnnotationCarriers(text: string): string {
   const parts: string[] = [];
   let cursor = 0;
   // Only the body is line-scoped; preserve the existing whitespace-prefix grammar.
-  for (const annotation of scanMemoryAnnotations(text, /<!--\s*(trigger|importance|project)\s*:/giu, true)) {
+  for (const annotation of scanMemoryAnnotations(
+    text,
+    /<!--\s*(trigger|importance|project|id|source|as-of|valid-until|retracted|supersedes)\s*:/giu,
+    true,
+  )) {
     parts.push(text.slice(cursor, annotation.start));
     cursor = annotation.end;
   }
@@ -111,13 +124,59 @@ export function extractProjectKeysFromCuratedEntry(text: string): CuratedProject
   };
 }
 
+export function normalizeMemoryDate(value: string): string | null {
+  const match = DATE_RE.exec(value.trim());
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return `${match[1]}-${match[2]}-${match[3]}`;
+}
+
+export function normalizeMemoryEntryId(value: string): string | null {
+  const trimmed = value.trim();
+  return ENTRY_ID_RE.test(trimmed) ? trimmed : null;
+}
+
+export interface CuratedEntryRecallMetadata {
+  importance: number | null;
+  triggers: string | null;
+  projectKey: string | null;
+  /** 稳定条目标识：更正、撤回与取代都靠它。 */
+  entryId: string | null;
+  /** 出处（群聊、文件、链接或用户原话）。 */
+  provenance: string | null;
+  /** 事实生效日期（YYYY-MM-DD）。 */
+  asOf: string | null;
+  /** 有效期至（含当日）；过了就是 stale。 */
+  validUntil: string | null;
+  /** 已显式撤回：默认不再检索，也不参与触发召回。 */
+  retracted: boolean;
+  /** 被本条取代的旧条目 id。 */
+  supersedes: string[];
+}
+
 export function extractCuratedEntryRecallMetadata(params: {
   sourceLines: string[];
   curatedRoot: boolean;
   projectScopeEligible: boolean;
-}): { importance: number | null; triggers: string | null; projectKey: string | null } {
+}): CuratedEntryRecallMetadata {
   const phrases = new Set<string>();
   let importance: number | null = null;
+  let entryId: string | null = null;
+  let provenance: string | null = null;
+  let asOf: string | null = null;
+  let validUntil: string | null = null;
+  let retracted = false;
+  const supersedes = new Set<string>();
   const projectAnnotations = params.projectScopeEligible
     ? extractProjectKeysFromCuratedEntry(params.sourceLines.join("\n"))
     : { annotated: false, valid: true, keys: [] };
@@ -127,7 +186,10 @@ export function extractCuratedEntryRecallMetadata(params: {
     if (!line.trimEnd().endsWith("-->")) {
       continue;
     }
-    for (const { kind, value } of scanMemoryAnnotations(line, /<!--\s*(trigger|importance|project)\s*:/giu)) {
+    for (const { kind, value } of scanMemoryAnnotations(
+      line,
+      /<!--\s*(trigger|importance|project|id|source|as-of|valid-until|retracted|supersedes)\s*:/giu,
+    )) {
       if (kind === "trigger") {
         for (const phrase of value.split(/[,;]/u).map((entry) => entry.trim())) {
           if (phrase) {
@@ -138,6 +200,23 @@ export function extractCuratedEntryRecallMetadata(params: {
         const parsed = Number.parseInt(value, 10);
         if (parsed >= 1 && parsed <= 10) {
           importance = Math.max(importance ?? parsed, parsed);
+        }
+      } else if (kind === "id") {
+        entryId = normalizeMemoryEntryId(value) ?? entryId;
+      } else if (kind === "source") {
+        // 出处是给人看的一行文本：不换行、不吞掉后续注释。
+        const clean = value.replace(/-->/g, "").replace(/[\r\n]+/gu, " ").trim();
+        if (clean) provenance = clean.slice(0, 240);
+      } else if (kind === "as-of") {
+        asOf = normalizeMemoryDate(value) ?? asOf;
+      } else if (kind === "valid-until") {
+        validUntil = normalizeMemoryDate(value) ?? validUntil;
+      } else if (kind === "retracted") {
+        retracted = !/^(false|no|0)$/iu.test(value.trim());
+      } else if (kind === "supersedes") {
+        for (const id of value.split(/[,;\s]+/u)) {
+          const normalized = normalizeMemoryEntryId(id);
+          if (normalized) supersedes.add(normalized);
         }
       }
     }
@@ -153,5 +232,20 @@ export function extractCuratedEntryRecallMetadata(params: {
         : projectAnnotations.keys.length > 0
           ? projectAnnotations.keys.join("; ")
           : null,
+    entryId,
+    provenance,
+    asOf,
+    validUntil,
+    retracted,
+    supersedes: [...supersedes],
   };
+}
+
+/** 有效期按「含当日」理解：valid-until 当天仍然有效，次日零点起 stale。 */
+export function isMemoryEntryStale(validUntil: string | null | undefined, nowMs: number): boolean {
+  if (!validUntil) return false;
+  const normalized = normalizeMemoryDate(validUntil);
+  if (!normalized) return false;
+  const expiresAtMs = Date.parse(`${normalized}T00:00:00.000Z`) + 24 * 60 * 60 * 1000;
+  return Number.isFinite(expiresAtMs) && nowMs >= expiresAtMs;
 }

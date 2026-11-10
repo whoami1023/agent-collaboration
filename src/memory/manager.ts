@@ -25,9 +25,13 @@ import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Member } from "../core/types";
+import { newId } from "../core/ids";
 import type { RoomBus } from "../room/bus";
 import {
   extractCuratedEntryRecallMetadata,
+  isMemoryEntryStale,
+  normalizeMemoryDate,
+  normalizeMemoryEntryId,
   stripMemoryAnnotationCarriers,
 } from "./annotations";
 import { AGENT_FILE_ORDER, ensureMemberAgentFiles, type MemberProfileHints } from "./bootstrap-files";
@@ -46,6 +50,7 @@ import { applyTemporalDecayToHybridResults } from "./temporal-decay";
 import { readTeamFileForPrompt, syncTeamFile, TEAM_FILE_NAME } from "./team-file";
 import {
   bm25RelevanceToScore,
+  escapeRegExp,
   literalSearchMatcher,
   normalizeSearchTokens,
 } from "./tokenize";
@@ -61,6 +66,8 @@ const BM25_B = 0.75;
 const SESSION_MAX_MESSAGES = 500;
 /** 「智能体文件」面板的保存上限（256 KB，与技能文件的单文件口径一致）。 */
 const MAX_AGENT_FILE_BYTES = 256 * 1024;
+/** 维护巡检单次返回的定位条目上限：够定位、不淹没上下文。 */
+const MAX_AUDIT_FINDINGS = 100;
 
 export interface MemorySearchSettings {
   chunking: { tokens: number; overlap: number };
@@ -106,6 +113,55 @@ export interface MemorySearchResult {
   importance?: number;
   triggers?: string;
   projectKey?: string;
+  /** 稳定条目标识（记忆条目才有）：更正与撤回都引用它。 */
+  entryId?: string;
+  /** 出处：这条事实是从哪来的。 */
+  provenance?: string;
+  /** 事实生效日期（YYYY-MM-DD）。 */
+  asOf?: string;
+  /** 有效期至（含当日）。 */
+  validUntil?: string;
+  /** 读取时判定的过期状态：valid-until 已过。 */
+  stale?: boolean;
+  /** 已在文件里显式撤回（检索默认排除，仅维护巡检可见）。 */
+  retracted?: boolean;
+  /** 本条取代的旧条目 id。 */
+  supersedes?: string;
+  /** 本条已被哪条新条目取代（旧条目默认不返回）。 */
+  supersededBy?: string;
+}
+
+export interface MemoryEntryAnnotations {
+  triggers?: string[];
+  importance?: number;
+  /** 出处：群聊 #seq、文件路径、链接或用户原话。 */
+  provenance?: string;
+  /** 事实生效日期（YYYY-MM-DD）。 */
+  asOf?: string;
+  /** 有效期至（含当日，YYYY-MM-DD）。 */
+  validUntil?: string;
+  /** 本次写入取代的旧条目 id。 */
+  supersedes?: string[];
+}
+
+export interface MemoryAuditFinding {
+  path: string;
+  startLine: number;
+  endLine: number;
+  entryId?: string;
+  excerpt: string;
+  issue: "retracted" | "stale" | "superseded";
+  /** 仅 issue=superseded 时给出取代它的新条目 id。 */
+  supersededBy?: string;
+}
+
+export interface MemoryAuditReport {
+  /** 策展记忆条目数（`- ` 开头；未过滤撤回与取代）。 */
+  entries: number;
+  retracted: number;
+  stale: number;
+  superseded: number;
+  findings: MemoryAuditFinding[];
 }
 
 interface IndexedChunk {
@@ -123,6 +179,12 @@ interface IndexedChunk {
   importance?: number;
   triggers?: string;
   projectKey?: string;
+  entryId?: string;
+  provenance?: string;
+  asOf?: string;
+  validUntil?: string;
+  retracted?: boolean;
+  supersedes?: string;
 }
 
 interface ExactPathHit {
@@ -149,6 +211,12 @@ interface BodyKeywordHit {
   importance?: number;
   triggers?: string;
   projectKey?: string;
+  entryId?: string;
+  provenance?: string;
+  asOf?: string;
+  validUntil?: string;
+  retracted?: boolean;
+  supersedes?: string;
 }
 
 type KeywordHit = BodyKeywordHit & {
@@ -297,6 +365,8 @@ export class MemorySearchManager {
   private sessionMtimes = new Map<string, number>();
   private memoryMtimes = new Map<string, number>();
   private syncPromise: Promise<void> | null = null;
+  /** 旧条目 id → 取代它的新条目 id：读取时隐藏旧条目。 */
+  private supersededBy = new Map<string, string>();
 
   constructor(private readonly options: MemorySearchManagerOptions) {
     this.settings = options.settings ?? structuredClone(DEFAULT_MEMORY_SEARCH_SETTINGS);
@@ -432,6 +502,7 @@ export class MemorySearchManager {
     });
 
     this.chunks = entries;
+    this.rebuildSupersedeMap();
     this.rebuildStatistics();
   }
 
@@ -451,6 +522,12 @@ export class MemorySearchManager {
     let importance: number | undefined;
     let triggers: string | undefined;
     let projectKey: string | undefined;
+    let entryId: string | undefined;
+    let provenance: string | undefined;
+    let asOf: string | undefined;
+    let validUntil: string | undefined;
+    let retracted: boolean | undefined;
+    let supersedes: string | undefined;
     if (source === "memory" && chunk.entryStartLine !== undefined && chunk.entryEndLine !== undefined) {
       const metadata = extractCuratedEntryRecallMetadata({
         sourceLines: lines.slice(chunk.entryStartLine - 1, chunk.entryEndLine),
@@ -460,6 +537,12 @@ export class MemorySearchManager {
       importance = metadata.importance ?? undefined;
       triggers = metadata.triggers ?? undefined;
       projectKey = metadata.projectKey ?? undefined;
+      entryId = metadata.entryId ?? undefined;
+      provenance = metadata.provenance ?? undefined;
+      asOf = metadata.asOf ?? undefined;
+      validUntil = metadata.validUntil ?? undefined;
+      retracted = metadata.retracted ? true : undefined;
+      supersedes = metadata.supersedes.length > 0 ? metadata.supersedes.join("; ") : undefined;
     }
     const tokens = normalizeSearchTokens(chunk.text);
     return {
@@ -477,7 +560,27 @@ export class MemorySearchManager {
       ...(importance !== undefined ? { importance } : {}),
       ...(triggers !== undefined ? { triggers } : {}),
       ...(projectKey !== undefined ? { projectKey } : {}),
+      ...(entryId !== undefined ? { entryId } : {}),
+      ...(provenance !== undefined ? { provenance } : {}),
+      ...(asOf !== undefined ? { asOf } : {}),
+      ...(validUntil !== undefined ? { validUntil } : {}),
+      ...(retracted ? { retracted } : {}),
+      ...(supersedes !== undefined ? { supersedes } : {}),
     };
+  }
+
+  /** 重建「旧 id → 新 id」表；只认显式 supersedes，不靠相似度猜。 */
+  private rebuildSupersedeMap(): void {
+    const map = new Map<string, string>();
+    for (const chunk of this.chunks) {
+      if (chunk.source !== "memory" || !chunk.entryId || !chunk.supersedes) continue;
+      for (const oldId of chunk.supersedes.split(/[,;\s]+/u)) {
+        if (oldId && oldId !== chunk.entryId && !map.has(oldId)) {
+          map.set(oldId, chunk.entryId);
+        }
+      }
+    }
+    this.supersededBy = map;
   }
 
   private rebuildStatistics(): void {
@@ -540,10 +643,15 @@ export class MemorySearchManager {
     sources: readonly MemorySource[],
     matchAny: boolean,
     agentId?: string,
+    includeRetracted = false,
   ): BodyKeywordHit[] {
     if (queryTokens.length === 0) return [];
-    const visibleChunks = this.chunks.filter((chunk) => this.chunkVisibleTo(chunk.path, agentId));
-    const totalDocs = visibleChunks.length;
+    const visibleChunks = this.chunks.filter((chunk) =>
+      this.chunkEligible(chunk, agentId, includeRetracted),
+    );
+    // df 与 avgBodyLen 都按整份索引统计；检索资格只过滤候选，不能缩小 N，
+    // 否则 df > N 会让 idf 变负、把命中项整批算丢。
+    const totalDocs = this.chunks.length;
     const sourceSet = new Set(sources);
     const hits: BodyKeywordHit[] = [];
     for (const chunk of visibleChunks) {
@@ -566,6 +674,12 @@ export class MemorySearchManager {
         ...(chunk.importance !== undefined ? { importance: chunk.importance } : {}),
         ...(chunk.triggers !== undefined ? { triggers: chunk.triggers } : {}),
         ...(chunk.projectKey !== undefined ? { projectKey: chunk.projectKey } : {}),
+        ...(chunk.entryId !== undefined ? { entryId: chunk.entryId } : {}),
+        ...(chunk.provenance !== undefined ? { provenance: chunk.provenance } : {}),
+        ...(chunk.asOf !== undefined ? { asOf: chunk.asOf } : {}),
+        ...(chunk.validUntil !== undefined ? { validUntil: chunk.validUntil } : {}),
+        ...(chunk.retracted ? { retracted: true } : {}),
+        ...(chunk.supersedes !== undefined ? { supersedes: chunk.supersedes } : {}),
       });
     }
     return hits
@@ -579,11 +693,15 @@ export class MemorySearchManager {
     sources: readonly MemorySource[],
     query: string,
     agentId?: string,
+    includeRetracted = false,
   ): ExactPathHit[] {
     const matchExactPath = prepareExactPathMatcher(query);
     const sourceSet = new Set(sources);
-    const visibleChunks = this.chunks.filter((chunk) => this.chunkVisibleTo(chunk.path, agentId));
-    const totalPaths = new Set(visibleChunks.map((chunk) => `${chunk.source}:${chunk.path}`)).size || 1;
+    const visibleChunks = this.chunks.filter((chunk) =>
+      this.chunkEligible(chunk, agentId, includeRetracted),
+    );
+    // 同 body 通道：pathDf 按整份索引统计，过滤后的可见集合不改变 N。
+    const totalPaths = new Set(this.chunks.map((chunk) => `${chunk.source}:${chunk.path}`)).size || 1;
     const results = new Map<string, ExactPathHit>();
     const firstChunks = new Map<string, IndexedChunk>();
     for (const chunk of visibleChunks) {
@@ -654,6 +772,8 @@ export class MemorySearchManager {
       nowMs?: number;
       /** 子成员 ID：只让该成员检索到自己的 agents/<id>/ 记忆文件。 */
       agentId?: string;
+      /** 维护巡检用：连已撤回、已被取代的条目一起返回。 */
+      includeRetracted?: boolean;
     },
   ): Promise<MemorySearchResult[]> {
     const normalizedQuery = query.trim();
@@ -678,10 +798,31 @@ export class MemorySearchManager {
       substring: literalSearchMatcher(token),
     }));
 
-    let bodyHits = this.searchBodyKeyword(queryTokens, candidates, sources, false, opts?.agentId);
-    const pathHits = this.searchPathKeyword(queryTokens, candidates, sources, normalizedQuery, opts?.agentId);
+    let bodyHits = this.searchBodyKeyword(
+      queryTokens,
+      candidates,
+      sources,
+      false,
+      opts?.agentId,
+      opts?.includeRetracted,
+    );
+    const pathHits = this.searchPathKeyword(
+      queryTokens,
+      candidates,
+      sources,
+      normalizedQuery,
+      opts?.agentId,
+      opts?.includeRetracted,
+    );
     if (bodyHits.length === 0 && pathHits.length === 0) {
-      bodyHits = this.searchBodyKeyword(queryTokens, candidates, sources, true, opts?.agentId);
+      bodyHits = this.searchBodyKeyword(
+        queryTokens,
+        candidates,
+        sources,
+        true,
+        opts?.agentId,
+        opts?.includeRetracted,
+      );
     }
     const boosted = bodyHits.map((hit) => ({
       ...hit,
@@ -726,6 +867,12 @@ export class MemorySearchManager {
         ...(chunk.importance !== undefined ? { importance: chunk.importance } : {}),
         ...(chunk.triggers !== undefined ? { triggers: chunk.triggers } : {}),
         ...(chunk.projectKey !== undefined ? { projectKey: chunk.projectKey } : {}),
+        ...(chunk.entryId !== undefined ? { entryId: chunk.entryId } : {}),
+        ...(chunk.provenance !== undefined ? { provenance: chunk.provenance } : {}),
+        ...(chunk.asOf !== undefined ? { asOf: chunk.asOf } : {}),
+        ...(chunk.validUntil !== undefined ? { validUntil: chunk.validUntil } : {}),
+        ...(chunk.retracted ? { retracted: true } : {}),
+        ...(chunk.supersedes !== undefined ? { supersedes: chunk.supersedes } : {}),
       });
     }
 
@@ -770,7 +917,7 @@ export class MemorySearchManager {
     const scoredVector: Array<{ hit: KeywordHit; vectorScore: number; exactPathSpecificity: 0 | 1 | 2 | 3 }> = [];
     for (const chunk of this.chunks) {
       if (!sourceSet.has(chunk.source) || chunk.embedding.length === 0) continue;
-      if (!this.chunkVisibleTo(chunk.path, opts?.agentId)) continue;
+      if (!this.chunkEligible(chunk, opts?.agentId, opts?.includeRetracted)) continue;
       const cosine = cosineSimilarity(queryVec, chunk.embedding);
       if (cosine <= 0) continue;
       scoredVector.push({
@@ -789,6 +936,12 @@ export class MemorySearchManager {
           ...(chunk.importance !== undefined ? { importance: chunk.importance } : {}),
           ...(chunk.triggers !== undefined ? { triggers: chunk.triggers } : {}),
           ...(chunk.projectKey !== undefined ? { projectKey: chunk.projectKey } : {}),
+          ...(chunk.entryId !== undefined ? { entryId: chunk.entryId } : {}),
+          ...(chunk.provenance !== undefined ? { provenance: chunk.provenance } : {}),
+          ...(chunk.asOf !== undefined ? { asOf: chunk.asOf } : {}),
+          ...(chunk.validUntil !== undefined ? { validUntil: chunk.validUntil } : {}),
+          ...(chunk.retracted ? { retracted: true } : {}),
+          ...(chunk.supersedes !== undefined ? { supersedes: chunk.supersedes } : {}),
         },
         vectorScore: (1 + cosine) / 2,
         exactPathSpecificity: prepareExactPathMatcher(normalizedQuery)(chunk.path),
@@ -823,7 +976,23 @@ export class MemorySearchManager {
       vectorCandidates: vectorTop.map((entry) => entry.hit),
       maxResults,
       minScore,
-    });
+    }).map((entry) => ({
+      ...entry,
+      ...this.freshnessOf(entry, opts?.nowMs ?? Date.now()),
+    }));
+  }
+
+  /** 读取时判新鲜度：valid-until 过期与显式取代都只在这里计算，不在索引期冻结。 */
+  private freshnessOf(
+    entry: { source: MemorySource; entryId?: string; validUntil?: string },
+    nowMs: number,
+  ): Pick<MemorySearchResult, "stale" | "supersededBy"> {
+    if (entry.source !== "memory") return {};
+    const supersededBy = entry.entryId ? this.supersededBy.get(entry.entryId) : undefined;
+    return {
+      ...(isMemoryEntryStale(entry.validUntil, nowMs) ? { stale: true } : {}),
+      ...(supersededBy ? { supersededBy } : {}),
+    };
   }
 
   /** 逐字移植自 manager-search-retrieval.ts finalizeKeywordOnlyResults。 */
@@ -877,6 +1046,7 @@ export class MemorySearchManager {
         ...entry,
         // keyword-only 通道没有向量命中，vectorScore 恒为 0（口径与 hybrid 结果的公开字段对齐）。
         vectorScore: 0,
+        ...this.freshnessOf(entry, params.nowMs ?? Date.now()),
       }));
   }
 
@@ -932,6 +1102,18 @@ export class MemorySearchManager {
   private chunkVisibleTo(relPath: string, agentId: string | undefined): boolean {
     if (!relPath.startsWith("agents/")) return true;
     return agentId !== undefined && relPath.startsWith(`agents/${agentId}/`);
+  }
+
+  /** 检索资格：可见、未撤回、未被显式取代；维护巡检可要求连撤回项一起看。 */
+  private chunkEligible(
+    chunk: IndexedChunk,
+    agentId: string | undefined,
+    includeRetracted = false,
+  ): boolean {
+    if (!this.chunkVisibleTo(chunk.path, agentId)) return false;
+    if (chunk.source !== "memory" || includeRetracted) return true;
+    if (chunk.retracted === true) return false;
+    return !(chunk.entryId !== undefined && this.supersededBy.has(chunk.entryId));
   }
 
   private async buildFileEntry(absPath: string): Promise<FileState | null> {
@@ -1124,6 +1306,25 @@ export class MemorySearchManager {
     refusal: string,
     params?: { from?: number; lines?: number; full?: boolean },
   ): Promise<{ content: string; truncated: boolean; totalLines: number; more: boolean }> {
+    const { realPath } = await this.resolveWithin(relPath, isAllowed, refusal);
+    const content = await fs.readFile(realPath, "utf8");
+    const lines = content.split("\n");
+    if (params?.full) {
+      return { content, truncated: false, totalLines: lines.length, more: false };
+    }
+    const from = Math.max(1, Math.floor(params?.from ?? 1));
+    const count = Math.min(400, Math.max(1, Math.floor(params?.lines ?? 200)));
+    const slice = lines.slice(from - 1, from - 1 + count);
+    const more = from - 1 + slice.length < lines.length;
+    return { content: slice.join("\n"), truncated: slice.length < lines.length, totalLines: lines.length, more };
+  }
+
+  /** 记忆路径的安全解析：必须落在工作区内，且通过调用方的白名单。 */
+  private async resolveWithin(
+    relPath: string,
+    isAllowed: (absPath: string, workspaceRoot: string) => boolean,
+    refusal: string,
+  ): Promise<{ realPath: string; relPath: string }> {
     const { workspaceDir } = this.options;
     const normalized = relPath.trim().replaceAll("\\", "/").replace(/^\.\//, "");
     if (!normalized || normalized.includes("\0") || path.isAbsolute(normalized)) {
@@ -1139,29 +1340,35 @@ export class MemorySearchManager {
     if (!realPath || !isPathInsideDir(realDir, realPath)) {
       throw new Error(`路径越出工作区：${relPath}`);
     }
-    const content = await fs.readFile(realPath, "utf8");
-    const lines = content.split("\n");
-    if (params?.full) {
-      return { content, truncated: false, totalLines: lines.length, more: false };
-    }
-    const from = Math.max(1, Math.floor(params?.from ?? 1));
-    const count = Math.min(400, Math.max(1, Math.floor(params?.lines ?? 200)));
-    const slice = lines.slice(from - 1, from - 1 + count);
-    const more = from - 1 + slice.length < lines.length;
-    return { content: slice.join("\n"), truncated: slice.length < lines.length, totalLines: lines.length, more };
+    return {
+      realPath,
+      relPath: path.relative(workspaceRoot, realPath).replaceAll("\\", "/"),
+    };
   }
 
   /**
    * 适配：本项目没有文件写工具，记忆写回走受控追加（策展条目格式与 OpenClaw 注释语法一致）。
    * 子成员传入 agentId 时写到它自己的 agents/<id>/MEMORY.md。
+   * 每条新条目自动带稳定 id；更正靠新条目 supersedes 旧 id，撤回走 retractEntry。
    */
   async appendEntry(
     text: string,
-    annotations?: { triggers?: string[]; importance?: number },
+    annotations?: MemoryEntryAnnotations,
     options?: { agentId?: string },
   ): Promise<string> {
+    const { path: written } = await this.appendEntryWithId(text, annotations, options);
+    return written;
+  }
+
+  /** 同 appendEntry，但把自动生成的条目 id 一并返回，供工具回执与后续更正引用。 */
+  async appendEntryWithId(
+    text: string,
+    annotations?: MemoryEntryAnnotations,
+    options?: { agentId?: string },
+  ): Promise<{ path: string; id: string }> {
     const clean = text.trim().replace(/\s+/gu, " ");
     if (!clean) throw new Error("记忆内容不能为空");
+    const entryId = newId("mem");
     const parts = [`- ${clean}`];
     if (annotations?.triggers?.length) {
       parts.push(`<!-- trigger: ${annotations.triggers.map((t) => t.trim().replace(/-->/g, "")).filter(Boolean).join(", ")} -->`);
@@ -1169,6 +1376,29 @@ export class MemorySearchManager {
     if (annotations?.importance !== undefined) {
       const value = Math.max(1, Math.min(10, Math.floor(annotations.importance)));
       parts.push(`<!-- importance: ${value} -->`);
+    }
+    parts.push(`<!-- id: ${entryId} -->`);
+    if (annotations?.provenance?.trim()) {
+      const provenance = annotations.provenance.replace(/-->/g, "").replace(/[\r\n]+/gu, " ").trim().slice(0, 240);
+      if (provenance) parts.push(`<!-- source: ${provenance} -->`);
+    }
+    if (annotations?.asOf) {
+      const asOf = normalizeMemoryDate(annotations.asOf);
+      if (!asOf) throw new Error("as-of 必须是 YYYY-MM-DD 日期");
+      parts.push(`<!-- as-of: ${asOf} -->`);
+    }
+    if (annotations?.validUntil) {
+      const validUntil = normalizeMemoryDate(annotations.validUntil);
+      if (!validUntil) throw new Error("valid-until 必须是 YYYY-MM-DD 日期");
+      parts.push(`<!-- valid-until: ${validUntil} -->`);
+    }
+    if (annotations?.supersedes?.length) {
+      const ids = annotations.supersedes.map((id) => {
+        const normalized = normalizeMemoryEntryId(id);
+        if (!normalized) throw new Error(`supersedes 里的条目 id 不合法：${id}`);
+        return normalized;
+      });
+      if (ids.length > 0) parts.push(`<!-- supersedes: ${[...new Set(ids)].join(", ")} -->`);
     }
     const relPath = options?.agentId ? `agents/${options.agentId}/MEMORY.md` : "MEMORY.md";
     const file = path.join(this.options.workspaceDir, relPath);
@@ -1182,7 +1412,99 @@ export class MemorySearchManager {
     }
     await fs.appendFile(file, `${prefix}${parts.join(" ")}\n`, "utf8");
     this.markDirty();
-    return relPath;
+    return { path: relPath, id: entryId };
+  }
+
+  /**
+   * 撤回一条策展记忆：按 id 或行号找到 `- ` 条目，在行末追加 retracted 注释。
+   * 不删除正文——撤回是可审计的状态，默认检索不再返回它。
+   */
+  async retractEntry(params: {
+    path: string;
+    id?: string;
+    line?: number;
+    reason?: string;
+    agentId?: string;
+  }): Promise<{ path: string; line: number; alreadyRetracted: boolean; text: string }> {
+    const { realPath, relPath } = await this.resolveWithin(
+      params.path,
+      (abs, root) => isMemoryRootPath(abs, root) || isMemberMemoryPath(abs, root, params.agentId),
+      params.agentId
+        ? `只允许撤回 MEMORY.md、USER.md、memory/ 或自己的 agents/<成员ID>/ 下的记忆条目：${params.path}`
+        : `只允许撤回 MEMORY.md、USER.md 或 memory/ 下的记忆条目：${params.path}`,
+    );
+    const content = await fs.readFile(realPath, "utf8");
+    const lines = content.split("\n");
+    let index = -1;
+    if (params.id) {
+      const normalized = normalizeMemoryEntryId(params.id);
+      if (!normalized) throw new Error(`条目 id 不合法：${params.id}`);
+      const marker = new RegExp(`<!--\\s*id\\s*:\\s*${escapeRegExp(normalized)}\\s*-->`, "iu");
+      index = lines.findIndex((line) => marker.test(line));
+      if (index < 0) throw new Error(`找不到记忆条目：${normalized}`);
+    } else if (params.line !== undefined) {
+      index = Math.floor(params.line) - 1;
+      if (index < 0 || index >= lines.length) throw new Error(`行号超出范围：${params.line}`);
+    } else {
+      throw new Error("必须提供 id 或 line");
+    }
+    const target = lines[index] ?? "";
+    if (!/^\s*-\s+/u.test(target)) {
+      throw new Error(`第 ${index + 1} 行不是策展记忆条目：${target.slice(0, 80)}`);
+    }
+    if (/<!--\s*retracted\s*:/iu.test(target)) {
+      return { path: relPath, line: index + 1, alreadyRetracted: true, text: stripMemoryAnnotationCarriers(target).trim() };
+    }
+    const reason = params.reason?.replace(/-->/g, "").replace(/[\r\n]+/gu, " ").trim().slice(0, 120);
+    const stamp = new Date().toISOString().slice(0, 10);
+    lines[index] = `${target.trimEnd()} <!-- retracted: ${stamp}${reason ? ` ${reason}` : ""} -->`;
+    await fs.writeFile(realPath, lines.join("\n"), "utf8");
+    this.markDirty();
+    return {
+      path: relPath,
+      line: index + 1,
+      alreadyRetracted: false,
+      text: stripMemoryAnnotationCarriers(target).trim(),
+    };
+  }
+
+  /** 维护巡检：已撤回、已过期、已被取代的条目各有多少，附可核验的定位。 */
+  async auditEntries(nowMs: number = Date.now()): Promise<MemoryAuditReport> {
+    await this.sync();
+    const findings: MemoryAuditFinding[] = [];
+    let entries = 0;
+    let retracted = 0;
+    let stale = 0;
+    let superseded = 0;
+    for (const chunk of this.chunks) {
+      if (chunk.source !== "memory") continue;
+      // 只有 `- ` 开头的策展条目才是「一条记忆」；标题与正文段落是容器，
+      // 撤回/有效期/取代这些注释也只写在条目上。
+      if (!chunk.text.trimStart().startsWith("- ")) continue;
+      entries += 1;
+      const excerpt = stripMemoryAnnotationCarriers(chunk.text).replace(/\s+/gu, " ").trim().slice(0, 200);
+      const supersededBy = chunk.entryId ? this.supersededBy.get(chunk.entryId) : undefined;
+      const finding: Omit<MemoryAuditFinding, "issue" | "supersededBy"> = {
+        path: chunk.path,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        excerpt,
+        ...(chunk.entryId !== undefined ? { entryId: chunk.entryId } : {}),
+      };
+      if (chunk.retracted) {
+        retracted += 1;
+        if (findings.length < MAX_AUDIT_FINDINGS) findings.push({ ...finding, issue: "retracted" });
+      } else if (supersededBy) {
+        superseded += 1;
+        if (findings.length < MAX_AUDIT_FINDINGS) {
+          findings.push({ ...finding, issue: "superseded", supersededBy });
+        }
+      } else if (isMemoryEntryStale(chunk.validUntil, nowMs)) {
+        stale += 1;
+        if (findings.length < MAX_AUDIT_FINDINGS) findings.push({ ...finding, issue: "stale" });
+      }
+    }
+    return { entries, retracted, stale, superseded, findings };
   }
 }
 

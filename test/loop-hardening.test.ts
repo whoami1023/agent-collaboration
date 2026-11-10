@@ -44,6 +44,7 @@ describe("agent loop hardening", () => {
     expect(onToolResult).toHaveBeenCalledWith(
       expect.objectContaining({ name: "echo" }),
       "echo:hi",
+      expect.objectContaining({ ok: true }),
     );
   });
 
@@ -76,6 +77,7 @@ describe("agent loop hardening", () => {
     expect(onToolResult).toHaveBeenCalledWith(
       expect.objectContaining({ name: "echo" }),
       "echo:bracket",
+      expect.objectContaining({ ok: true }),
     );
   });
 
@@ -218,7 +220,11 @@ describe("agent loop hardening", () => {
     const result = await run(handler, [flakyTool], { onToolResult });
     expect(result.text).toBe("完成");
     expect(attempts).toBe(2);
-    expect(onToolResult).toHaveBeenCalledWith(expect.objectContaining({ name: "flaky" }), "成功");
+    expect(onToolResult).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "flaky" }),
+      "成功",
+      expect.objectContaining({ ok: true }),
+    );
   });
 
   it("未知工具返回错误结果并继续，不中断循环", async () => {

@@ -32,10 +32,13 @@ const ACTIVE_MEMORY_CLOSE_TAG = "</active_memory_plugin>";
 export interface TriggerRecallHit {
   path: string;
   startLine: number;
+  endLine?: number;
   excerpt: string;
   score: number;
   citation: string;
   triggers: string;
+  /** 稳定条目 id：召回账本与后续更正都引用它。 */
+  entryId?: string;
   projectKeys?: string[];
 }
 
@@ -86,6 +89,8 @@ export function toTriggerRecallHits(entries: readonly MemorySearchResult[]): Tri
   const byKey = new Map<string, TriggerRecallHit>();
   for (const entry of entries) {
     if (entry.source !== "memory" || !entry.triggers) continue;
+    // 自动注入等同每轮常驻上下文：撤回、过期、已被取代的条目一律不注入。
+    if (entry.retracted || entry.stale || entry.supersededBy) continue;
     const projectKeys = entry.projectKey
       ? [
           ...new Set(
@@ -101,10 +106,12 @@ export function toTriggerRecallHits(entries: readonly MemorySearchResult[]): Tri
     const hit: TriggerRecallHit = {
       path: entry.path,
       startLine: entry.startLine,
+      endLine: entry.endLine,
       excerpt: stripMemoryAnnotationCarriers(entry.snippet).replace(/\s+/gu, " ").trim(),
       score: entry.score,
       citation: `${entry.path}#L${String(entry.startLine)}`,
       triggers: entry.triggers,
+      ...(entry.entryId ? { entryId: entry.entryId } : {}),
       ...(projectKeys ? { projectKeys } : {}),
     };
     const key = `${hit.path}:${hit.startLine}`;
@@ -168,7 +175,13 @@ export async function resolveTriggerRecall(params: {
   signal?: AbortSignal;
   /** 子成员 ID：只召回共享记忆与该成员自己的记忆文件。 */
   agentId?: string;
-}): Promise<{ context?: string; hasStrongHit: boolean; injectedCount: number }> {
+}): Promise<{
+  context?: string;
+  hasStrongHit: boolean;
+  injectedCount: number;
+  /** 本轮注入的命中明细：召回留痕账本据此记录「主动注入过什么」。 */
+  matches: Array<TriggerRecallHit & { matchScore: number }>;
+}> {
   params.signal?.throwIfAborted();
   // Lane-1 runs on every eligible inbound message; it must stay
   // deterministic and local, so query embedding is disabled.
@@ -190,6 +203,7 @@ export async function resolveTriggerRecall(params: {
     ...(context ? { context } : {}),
     hasStrongHit: matches.length > 0,
     injectedCount: matches.length,
+    matches,
   };
 }
 

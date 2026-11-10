@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Member, RoomMessage } from "../src/core/types";
-import { buildSystemPrompt, formatRoomWindow, type PromptContext } from "../src/agent/prompts";
+import {
+  buildSystemPrompt,
+  formatCurrentTime,
+  formatRoomWindow,
+  type PromptContext,
+} from "../src/agent/prompts";
 
 function member(overrides: Partial<Member> = {}): Member {
   return {
@@ -186,5 +191,57 @@ describe("行为准则与提示词分层（移植自 Hermes）", () => {
     expect(prompt.indexOf("群成员：")).toBeGreaterThan(prompt.indexOf(VOLATILE));
     expect(prompt.indexOf("可用技能（任务与描述匹配")).toBeGreaterThan(prompt.indexOf(VOLATILE));
     expect(prompt).toContain("@ 之前先在这里找名字与技能");
+  });
+});
+
+describe("时间感知", () => {
+  const NOW = Date.UTC(2026, 10, 10, 2, 5);
+  const VOLATILE = "当前群况（每轮更新";
+
+  it("当前时间按指定时区给出日期、星期与时分", () => {
+    expect(formatCurrentTime(NOW, "Asia/Shanghai")).toBe(
+      "当前时间：2026-11-10（周二）10:05，时区 Asia/Shanghai",
+    );
+  });
+
+  it("非法时区降级为 UTC 且不抛错，提示词仍能生成", () => {
+    expect(formatCurrentTime(NOW, "Not/AZone")).toBe(
+      `当前时间：${new Date(NOW).toISOString()}，时区 Not/AZone`,
+    );
+  });
+
+  it("时间行只在易变层，稳定规则段不随分钟变化", () => {
+    const early = buildSystemPrompt(
+      context({ nowMs: NOW, timeZone: "Asia/Shanghai", availableTools: new Set() }),
+    );
+    const later = buildSystemPrompt(
+      context({
+        nowMs: NOW + 3 * 60 * 60 * 1000,
+        timeZone: "Asia/Shanghai",
+        availableTools: new Set(),
+      }),
+    );
+    expect(early).toContain("当前时间：2026-11-10（周二）10:05");
+    expect(later).toContain("当前时间：2026-11-10（周二）13:05");
+    expect(later.indexOf("当前时间：")).toBeGreaterThan(later.indexOf(VOLATILE));
+    expect(later.slice(0, later.indexOf(VOLATILE))).toBe(early.slice(0, early.indexOf(VOLATILE)));
+    expect(early).toContain("判断「今天/明天/本周/逾期」以这一行为准");
+  });
+
+  it("群聊窗口的时间戳带月日，跨天记录分得清先后", () => {
+    const message: RoomMessage = {
+      id: "msg_day",
+      roomId: "room_main",
+      seq: 1,
+      ts: new Date(2026, 10, 9, 15, 30, 12).getTime(),
+      senderId: "u_1",
+      senderName: "甲",
+      senderKind: "user",
+      kind: "chat",
+      text: "昨天下午的结论",
+      mentions: [],
+      mentionsRaw: [],
+    };
+    expect(formatRoomWindow([message])).toContain("11-09 15:30");
   });
 });

@@ -16,6 +16,7 @@ import { MemorySearchManager } from "../src/memory/manager";
 import { ensureAgentFiles } from "../src/memory/bootstrap-files";
 import { resolveTriggerRecall, selectStrongTriggerMatches, toTriggerRecallHits } from "../src/memory/recall";
 import { buildMemoryTools } from "../src/memory/tools";
+import { RecallLedger } from "../src/memory/recall-ledger";
 
 let dir: string;
 
@@ -30,7 +31,7 @@ afterEach(async () => {
 const MEMORY_MD = [
   "# 长期记忆",
   "",
-  "- User's favorite database is PostgreSQL <!-- trigger: favorite database, database preference --> <!-- importance: 9 -->",
+  "- User's favorite database is PostgreSQL <!-- trigger: favorite database, database preference --> <!-- importance: 9 --> <!-- id: mem_favorite_db -->",
   "- 网关决策：内部服务间通信用 gRPC，边缘保留 REST",
 ].join("\n");
 
@@ -513,9 +514,10 @@ describe("运行时接线（workspace/orchestrator/member-runtime）", () => {
         return turn;
       }
       captured.toolResult = request.messages.filter((message) => message.role === "tool").pop()?.content;
-      return { text: "你的最爱数据库是 PostgreSQL。" };
+      return { text: "你的最爱数据库是 PostgreSQL（Source: MEMORY.md#L3）。" };
     };
 
+    const recallLedger = new RecallLedger(join(dir, "recall-ledger.jsonl"));
     const orchestrator = new Orchestrator({
       bus,
       board,
@@ -524,6 +526,7 @@ describe("运行时接线（workspace/orchestrator/member-runtime）", () => {
       ownerId: "u_test",
       mockHandler: handler,
       memory: m,
+      recallLedger,
     });
     orchestrator.sendUserMessage("What is my favorite database?");
 
@@ -532,13 +535,28 @@ describe("运行时接线（workspace/orchestrator/member-runtime）", () => {
       if (Date.now() - started > 15_000) throw new Error("等待超时");
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+    // 交付后再等账本写完（record 是同步入队、异步落盘）。
+    await recallLedger.flush();
     orchestrator.stop();
 
     expect(captured.system).toContain("## 记忆检索");
     expect(captured.system).toContain("memory_search");
+    // 主智能体额外挂载维护巡检（子成员不挂），提示词按实际工具注入。
+    expect(captured.system).toContain("maintenance_scan");
+    expect(captured.system).toContain("## 维护巡检");
     // lane-1 trigger recall 在首个用户消息前注入 <active_memory_plugin> 上下文
     expect(captured.firstUser).toContain("<active_memory_plugin>");
     expect(captured.firstUser).toContain("PostgreSQL");
     expect(captured.toolResult).toContain('"path":"MEMORY.md"');
+    // 召回留痕：先记主动注入，交付正文出现 Source 引用后再记 used。
+    const ledger = await recallLedger.list();
+    expect(ledger.filter((event) => event.type === "volunteered")).toHaveLength(1);
+    expect(ledger.filter((event) => event.type === "used")).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({
+      roomId: "room_main",
+      agentId: "m_main",
+      path: "MEMORY.md",
+      entryId: expect.any(String),
+    });
   }, 30_000);
 });

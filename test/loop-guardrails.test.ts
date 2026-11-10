@@ -203,6 +203,7 @@ describe("护栏接进循环", () => {
     expect(onToolResult).toHaveBeenCalledWith(
       expect.objectContaining({ name: "echo" }),
       '<untrusted source="echo">echo:hi</untrusted>',
+      expect.objectContaining({ ok: true }),
     );
   });
 });

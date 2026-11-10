@@ -362,7 +362,7 @@ export type AgentEvent =
   | { type: "run-start"; runId: string; memberId: string }
   | { type: "delta"; runId: string; memberId: string; text: string }
   | { type: "tool"; runId: string; memberId: string; name: string; args: Record<string, unknown> }
-  | { type: "tool-result"; runId: string; memberId: string; name: string; content: string }
+  | { type: "tool-result"; runId: string; memberId: string; name: string; content: string; ok: boolean; code?: string }
   | { type: "run-final"; runId: string; memberId: string; text: string }
   | { type: "run-error"; runId: string; memberId: string; error: string }
   | { type: "run-aborted"; runId: string; memberId: string };

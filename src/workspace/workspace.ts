@@ -29,6 +29,7 @@ import { newId } from "../core/ids";
 import { ModelUsageStore } from "../model/usage-store";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
+import { RecallLedger } from "../memory/recall-ledger";
 import { WorkspaceFiles } from "../files/workspace-files";
 import { RoomBus } from "../room/bus";
 import {
@@ -138,6 +139,8 @@ export class Workspace {
     readonly learning: LearningService,
     /** 策展层：技能生命周期与合并建议，扫描走惰性读路径，关房时要冲刷账本。 */
     readonly curation: CurationService,
+    /** 记忆召回留痕：主动注入过什么、后来被引用没有；维护巡检的数据源。 */
+    readonly recallLedger: RecallLedger,
   ) {}
 
   static async load(
@@ -192,6 +195,8 @@ export class Workspace {
     const files = new WorkspaceFiles(dir);
     // 用量账本：按模型 × UTC 自然日聚合 token 与成本，供设置面板统计。
     const usage = new ModelUsageStore(join(dir, "model-usage.json"));
+    // 记忆召回留痕：只追加、不参与检索，维护巡检用它找「召回了却没人用」的条目。
+    const recallLedger = new RecallLedger(join(dir, "recall-ledger.jsonl"));
 
     // 学习层（P1）：成员一轮交付后的后台复盘。产出先落进本账号的 learning.json，
     // 事件按复盘所在的房间广播，前端「学习」面板据此刷新。
@@ -247,6 +252,7 @@ export class Workspace {
       manifest,
       learning,
       curation,
+      recallLedger,
     );
     workspaceRef = workspace;
     workspace.groupBuses = groupBuses;
@@ -346,6 +352,7 @@ export class Workspace {
       onUsageRecord: (record) => bus.emit({ type: "model-usage", usage: record }),
       learning: this.learning,
       skillUsage: this.curation.recordUsage,
+      recallLedger: this.recallLedger,
     });
     const instance: RoomInstance = { descriptor, bus, board, orchestrator, stateFile: this.stateFileFor(descriptor.id), saveTimer: null };
     bus.subscribe((event) => {
@@ -815,6 +822,7 @@ export class Workspace {
     await this.usage.flush().catch(() => undefined);
     await this.learning.flush().catch(() => undefined);
     await this.curation.flush().catch(() => undefined);
+    await this.recallLedger.flush().catch(() => undefined);
     await this.cronService?.flush().catch(() => undefined);
   }
 }

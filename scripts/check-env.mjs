@@ -352,25 +352,40 @@ function addPythonResult(found, source) {
   }
 }
 
-/** Word 技能脚本依赖 python-docx + lxml：能跑 Python 但缺库时，技能会在第一步就失败。 */
+/** 内置技能的 Python 依赖：能跑 Python 但缺库时，技能会在第一步就失败。 */
 function checkPythonLibraries(spec) {
-  const result = runPythonSpec(spec, [
+  const docx = runPythonSpec(spec, [
     "-c",
     "import docx, lxml.etree; print('docx-libs-ok')",
   ]);
-  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-  if (!result.error && result.status === 0 && output.includes("docx-libs-ok")) {
+  const docxOutput = `${docx.stdout ?? ""}${docx.stderr ?? ""}`;
+  if (!docx.error && docx.status === 0 && docxOutput.includes("docx-libs-ok")) {
     add("python-docx", "可选能力", "Word 技能依赖", "pass", "python-docx 与 lxml 可用（docx 技能可直接运行）");
-    return;
+  } else {
+    add(
+      "python-docx",
+      "可选能力",
+      "Word 技能依赖",
+      "warn",
+      "当前 Python 缺少 python-docx 或 lxml",
+      `内置 Word 技能需要它们：${spec} -m pip install python-docx lxml`,
+    );
   }
-  add(
-    "python-docx",
-    "可选能力",
-    "Word 技能依赖",
-    "warn",
-    "当前 Python 缺少 python-docx 或 lxml",
-    `内置 Word 技能需要它们：${spec} -m pip install python-docx lxml`,
-  );
+
+  const pdf = runPythonSpec(spec, ["-c", "import pypdf, pdfplumber, PIL; print('pdf-libs-ok')"]);
+  const pdfOutput = `${pdf.stdout ?? ""}${pdf.stderr ?? ""}`;
+  if (!pdf.error && pdf.status === 0 && pdfOutput.includes("pdf-libs-ok")) {
+    add("python-pdf", "可选能力", "PDF 技能依赖", "pass", "pypdf、pdfplumber 与 Pillow 可用（pdf 技能可直接运行）");
+  } else {
+    add(
+      "python-pdf",
+      "可选能力",
+      "PDF 技能依赖",
+      "warn",
+      "当前 Python 缺少 pypdf、pdfplumber 或 Pillow",
+      `内置 PDF 技能需要它们：${spec} -m pip install pypdf pdfplumber Pillow`,
+    );
+  }
 }
 
 function checkPython() {

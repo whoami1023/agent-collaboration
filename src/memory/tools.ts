@@ -16,9 +16,14 @@
 
 import type { ToolImpl } from "../agent/loop";
 import { scanThreats, threatRefusal } from "../agent/content/threats";
+import { ToolFailure, type ToolErrorDetails } from "../agent/tool-errors";
 import type { MemorySearchManager, MemorySearchResult } from "./manager";
 
-class ToolInputError extends Error {}
+class ToolInputError extends ToolFailure {
+  constructor(message: string, details: ToolErrorDetails = {}) {
+    super("invalid_argument", message, details);
+  }
+}
 
 function readStringParam(
   params: Record<string, unknown>,
@@ -110,7 +115,47 @@ function presentSearchResult(result: MemorySearchResult): Record<string, unknown
     ...(result.importance !== undefined ? { importance: result.importance } : {}),
     ...(result.triggers ? { triggers: result.triggers } : {}),
     ...(result.projectKey ? { projectKey: result.projectKey } : {}),
+    ...(result.entryId ? { entryId: result.entryId } : {}),
+    ...(result.provenance ? { provenance: result.provenance } : {}),
+    ...(result.asOf ? { asOf: result.asOf } : {}),
+    ...(result.validUntil ? { validUntil: result.validUntil } : {}),
+    ...(result.stale ? { stale: true } : {}),
+    ...(result.supersededBy ? { supersededBy: result.supersededBy } : {}),
+    ...(result.supersedes ? { supersedes: result.supersedes } : {}),
+    ...(result.retracted ? { retracted: true } : {}),
   };
+}
+
+function readStringArrayParam(params: Record<string, unknown>, key: string): string[] | undefined {
+  const raw = params[key];
+  if (raw === undefined || raw === null) return undefined;
+  if (Array.isArray(raw)) {
+    const items = raw
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return items.length > 0 ? items : undefined;
+  }
+  if (typeof raw === "string") {
+    const items = raw
+      .split(/[,;\s]+/u)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return items.length > 0 ? items : undefined;
+  }
+  throw new ToolInputError(`${key} must be an array of strings`);
+}
+
+// 把 manager 的日期/id 校验错误收敛成结构化 invalid_argument，其余异常保持原样。
+function asInvalidArgument(error: unknown): never {
+  if (error instanceof ToolFailure) throw error;
+  const message = error instanceof Error ? error.message : String(error);
+  if (/日期|id 不合法|不能为空|必须/u.test(message)) {
+    throw new ToolFailure("invalid_argument", message, {
+      next: "改用 YYYY-MM-DD 日期和条目回执里的 id；本次没有写入任何内容。",
+    });
+  }
+  throw error;
 }
 
 export interface MemoryToolOptions {
@@ -176,6 +221,7 @@ export function buildMemoryTools(
         return JSON.stringify({
           disabled: true,
           warning: "记忆检索暂时不可用",
+          code: "unavailable",
           error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -220,6 +266,7 @@ export function buildMemoryTools(
         const notFound = /不存在|not found/i.test(message);
         return JSON.stringify({
           status: notFound ? "not_found" : "error",
+          code: notFound ? "not_found" : "tool_failed",
           error: message,
         });
       }
@@ -230,7 +277,7 @@ export function buildMemoryTools(
     schema: {
       name: "memory_append",
       description:
-        "把一条值得长期保留的事实追加到 MEMORY.md 策展条目区（子成员追加到自己的 MEMORY.md）。一条只写一个事实（用户偏好、项目决定、日期/人物、可复用做法），别塞过程性废话。写入格式：- 正文 <!-- trigger: 触发短语, 另一个说法 --> <!-- importance: 1-10 -->。",
+        "把一条值得长期保留的事实追加到 MEMORY.md 策展条目区（子成员追加到自己的 MEMORY.md）。一条只写一个事实（用户偏好、项目决定、日期/人物、可复用做法），别塞过程性废话。写入格式：- 正文 <!-- trigger: 触发短语 --> <!-- importance: 1-10 -->，每次写入都会生成稳定 id。出处用 source，时效用 asOf/validUntil；更正旧事实时用 supersedes 传旧条目 id，撤回用 memory_retract。",
       parameters: {
         type: "object",
         properties: {
@@ -241,6 +288,14 @@ export function buildMemoryTools(
             description: "以后提问可能用到的触发词/短语（用于自动召回）",
           },
           importance: { type: "integer", minimum: 1, maximum: 10, description: "重要度 1-10" },
+          source: { type: "string", description: "出处：群聊 #seq、文件路径、链接或用户原话" },
+          asOf: { type: "string", description: "事实生效日期 YYYY-MM-DD（默认今天）" },
+          validUntil: { type: "string", description: "有效期至 YYYY-MM-DD（含当日）；过期后检索会标记 stale" },
+          supersedes: {
+            type: "array",
+            items: { type: "string" },
+            description: "被本条取代的旧条目 id（来自此前写入回执或检索结果 entryId）",
+          },
         },
         required: ["text"],
         additionalProperties: false,
@@ -248,27 +303,96 @@ export function buildMemoryTools(
     },
     execute: async (rawArgs) => {
       const text = readStringParam(rawArgs, "text", { required: true });
-      const triggersRaw = rawArgs.triggers;
-      const triggers = Array.isArray(triggersRaw)
-        ? triggersRaw.filter((item): item is string => typeof item === "string" && item.trim() !== "").map((item) => item.trim())
-        : undefined;
+      const triggers = readStringArrayParam(rawArgs, "triggers");
       const importance = readPositiveIntegerParam(rawArgs, "importance");
       if (importance !== undefined && importance > 10) {
         throw new ToolInputError("importance must be between 1 and 10");
       }
+      const provenance = readStringParam(rawArgs, "source");
+      const asOf = readStringParam(rawArgs, "asOf");
+      const validUntil = readStringParam(rawArgs, "validUntil");
+      const supersedes = readStringArrayParam(rawArgs, "supersedes");
       // 长期记忆会被自动召回、每轮注入上下文：等于一条会长期生效的指令。
       // 因此这里用最高档（block）扫描，命中就不写，而不是写进去再指望模型自觉。
       const refusal = threatRefusal(scanThreats(text ?? "", "block"), "这条记忆");
       if (refusal) return refusal;
-      const written = await manager.appendEntry(
-        text ?? "",
-        {
-          ...(triggers?.length ? { triggers } : {}),
-          ...(importance !== undefined ? { importance } : {}),
+      try {
+        const written = await manager.appendEntryWithId(
+          text ?? "",
+          {
+            ...(triggers?.length ? { triggers } : {}),
+            ...(importance !== undefined ? { importance } : {}),
+            ...(provenance ? { provenance } : {}),
+            ...(asOf ? { asOf } : {}),
+            ...(validUntil ? { validUntil } : {}),
+            ...(supersedes?.length ? { supersedes } : {}),
+          },
+          options.agentId ? { agentId: options.agentId } : undefined,
+        );
+        return JSON.stringify({ status: "ok", path: written.path, entryId: written.id });
+      } catch (error) {
+        asInvalidArgument(error);
+      }
+    },
+  });
+
+  tools.push({
+    schema: {
+      name: "memory_retract",
+      description:
+        "撤回一条策展记忆条目（按 entryId 或行号）。撤回不删除正文，而是在行末写入 retracted 注释；之后检索默认不再返回这条，但维护巡检仍能看到。事实被新事实更正时用 memory_append 的 supersedes，而不是撤回。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "条目所在记忆文件，如 MEMORY.md" },
+          id: { type: "string", description: "条目 id（检索结果或写入回执里的 entryId）" },
+          line: { type: "integer", minimum: 1, description: "条目行号（1 基）；没有 id 时用" },
+          reason: { type: "string", description: "撤回原因，写进注释便于日后审计" },
         },
-        options.agentId ? { agentId: options.agentId } : undefined,
-      );
-      return JSON.stringify({ status: "ok", path: written });
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+    execute: async (rawArgs) => {
+      const relPath = readStringParam(rawArgs, "path", { required: true });
+      const id = readStringParam(rawArgs, "id");
+      const line = readPositiveIntegerParam(rawArgs, "line");
+      const reason = readStringParam(rawArgs, "reason");
+      if (!id && line === undefined) {
+        throw new ToolFailure("invalid_argument", "memory_retract 需要 id 或 line", {
+          next: "先用 memory_search 拿到 entryId，或给出条目所在行号。",
+        });
+      }
+      try {
+        const result = await manager.retractEntry({
+          path: relPath ?? "",
+          ...(id ? { id } : {}),
+          ...(line !== undefined ? { line } : {}),
+          ...(reason ? { reason } : {}),
+          ...(options.agentId ? { agentId: options.agentId } : {}),
+        });
+        return JSON.stringify({
+          status: "ok",
+          path: result.path,
+          line: result.line,
+          alreadyRetracted: result.alreadyRetracted,
+          text: result.text,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/找不到记忆条目|找不到条目/u.test(message)) {
+          throw new ToolFailure("not_found", message, {
+            next: "用 memory_search 重新确认条目 id 或行号；条目可能已被更正或删除。",
+            verify: `回读 ${relPath} 对应行是否为 '- ' 开头的策展条目。`,
+          });
+        }
+        if (/只允许|越出工作区/u.test(message)) {
+          throw new ToolFailure("permission_denied", message, {
+            next: "只撤回 MEMORY.md、USER.md、memory/ 或自己 agents/<成员ID>/ 下的记忆条目。",
+          });
+        }
+        asInvalidArgument(error);
+      }
     },
   });
 

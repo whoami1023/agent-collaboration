@@ -12,7 +12,9 @@ export function buildMemoryPromptSection(params: {
   const hasMemorySearch = params.availableTools.has("memory_search");
   const hasMemoryGet = params.availableTools.has("memory_get");
   const hasMemoryAppend = params.availableTools.has("memory_append");
-  if (!hasMemorySearch && !hasMemoryGet && !hasMemoryAppend) {
+  const hasMemoryRetract = params.availableTools.has("memory_retract");
+  const hasMaintenance = params.availableTools.has("maintenance_scan");
+  if (!hasMemorySearch && !hasMemoryGet && !hasMemoryAppend && !hasMemoryRetract && !hasMaintenance) {
     return [];
   }
 
@@ -32,10 +34,40 @@ export function buildMemoryPromptSection(params: {
     ? [
         "值得长期保留的结论（用户偏好、项目决定、日期/人物、可复用做法）用 memory_append 写成一条策展条目；一条只写一个事实，别塞过程性废话。",
         "条目格式：- 事实正文 <!-- trigger: 触发短语, 另一个说法 --> <!-- importance: 1-10 -->；trigger 用你以后提问时可能用的词。",
+        "写事实顺手给出处（source：群聊 #seq、文件路径、链接或用户原话）和生效日期 asOf；有明确失效条件的写 validUntil。",
+        "与旧事实冲突时不要重复新增：用 memory_append 写更正条目并传 supersedes=旧条目 entryId，旧条目会自动退出检索。",
+      ]
+    : [];
+  const retractGuidance = hasMemoryRetract
+    ? [
+        "事实不再成立又没有被新事实取代时，用 memory_retract 按 entryId 撤回；撤回保留正文供审计，不要直接删文件内容。",
       ]
     : [];
   const outcomeGuidance =
-    "检索结果带 warning、disabled=true 或 stale=true 时，如实向用户说明记忆检索是部分可用/不可用/过期。";
+    "检索结果带 warning 或 disabled=true 时，如实向用户说明记忆检索是部分可用/不可用；命中带 stale=true 表示已过有效期，采用前先核实或向用户说明。";
+  const provenanceGuidance =
+    "命中里的 provenance/asOf/validUntil 是这条事实的出处与时效；转述结论时一并交代出处，别把过期事实当现状。";
   const citationGuidance = "引用记忆时给出 Source: <path>#L<start>-L<end>，方便用户核对。";
-  return ["## 记忆检索", guidance, ...sessionGuidance, ...writeGuidance, outcomeGuidance, citationGuidance, ""];
+  const maintenanceGuidance = hasMaintenance
+    ? [
+        "",
+        "## 维护巡检",
+        "用户要求整理/检查记忆、做定期维护，或怀疑记忆过时、任务卡停滞时，用 maintenance_scan 汇总：撤回/过期/被取代的记忆条目、反复注入却从未被交付引用的召回、以及停滞或缺依赖/负责人/核验回执的任务卡。",
+        "巡检只报告、不自动改。看完报告再决定：过时事实用 memory_append 更正或 memory_retract 撤回，问题任务卡用 task_update 改派或关闭；不要凭报告批量删除记忆。",
+        "某条记忆反复被主动召回却从未被引用，通常是触发词过宽或事实已过时——先看正文，再决定改 trigger 还是撤回。",
+        "召回账本过大时才用 compact=true 压缩（默认保留最近 2000 条）；压缩不可恢复，先征得用户同意。",
+      ]
+    : [];
+  return [
+    "## 记忆检索",
+    guidance,
+    ...sessionGuidance,
+    ...writeGuidance,
+    ...retractGuidance,
+    outcomeGuidance,
+    provenanceGuidance,
+    citationGuidance,
+    ...maintenanceGuidance,
+    "",
+  ];
 }

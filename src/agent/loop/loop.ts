@@ -16,6 +16,12 @@ import { RepetitionWatch } from "./repetition-guard";
 import { retryAsync, type RetryOptions } from "./retry";
 import { ToolGuardrails } from "./guardrails";
 import {
+  ToolFailure,
+  classifyToolResult,
+  toolErrorText,
+  type ToolResultStatus,
+} from "../tool-errors";
+import {
   detectToolCallShapedText,
   parseJsonToolCallPayload,
   parseStandalonePlainTextToolCallBlocks,
@@ -67,7 +73,7 @@ export interface LoopOptions {
   onUsage?: (usage: UsageTotals) => void;
   onDelta?: (text: string) => void;
   onToolCall?: (call: ToolCall) => void;
-  onToolResult?: (call: ToolCall, result: string) => void;
+  onToolResult?: (call: ToolCall, result: string, status: ToolResultStatus) => void;
   /** 模型以文本形式输出工具调用、被修复为原生调用时触发。 */
   onRepair?: (info: { toolNames: string[] }) => void;
   /** 拉取排队中的 steering 消息；每个检查点调用一次并清空。 */
@@ -580,7 +586,7 @@ async function executeToolBatch(
         }
         return outcome.halt;
       }
-      options.onToolResult?.(entry.call, outcome.content);
+      options.onToolResult?.(entry.call, outcome.content, outcome.status);
     }
     return undefined;
   }
@@ -595,7 +601,7 @@ async function executeToolBatch(
     const entry = resolved[index];
     const outcome = outcomes[index];
     if (entry && outcome) {
-      options.onToolResult?.(entry.call, outcome.content);
+      options.onToolResult?.(entry.call, outcome.content, outcome.status);
     }
   }
   return outcomes.find((outcome) => outcome.halt)?.halt;
@@ -603,6 +609,7 @@ async function executeToolBatch(
 
 interface CallOutcome {
   content: string;
+  status: ToolResultStatus;
   halt?: string;
 }
 
@@ -618,30 +625,43 @@ async function executeOne(
   if (verdict.action !== "allow") {
     if (verdict.action === "halt") {
       messages.push({ role: "tool", toolCallId: call.id, content: `未执行：${verdict.reason}` });
-      return { content: verdict.reason, halt: verdict.reason };
+      return {
+        content: verdict.reason,
+        status: { ok: false, code: "guardrail_halt" },
+        halt: verdict.reason,
+      };
     }
     messages.push({ role: "tool", toolCallId: call.id, content: verdict.reason });
     guardrails.recordRefusal();
-    return { content: verdict.reason };
+    return { content: verdict.reason, status: { ok: false, code: "guardrail_block" } };
   }
 
   let raw: string;
+  let status: ToolResultStatus;
   let refused = false;
   if (!tool) {
     raw = options.toolUnavailable?.(call.name) ?? `错误：没有名为 ${call.name} 的工具`;
+    status = { ok: false, code: "unknown_tool" };
     // 运行姿态没挂载这个工具：模型已经拿到说明，不再累加失败计数（护栏拒绝不算失败）。
     refused = true;
     guardrails.recordRefusal();
   } else {
     try {
       raw = await retryAsync(() => tool.execute(call.args, options.signal), retryOptions);
+      status = classifyToolResult(raw);
     } catch (err) {
-      raw = `工具执行失败：${err instanceof Error ? err.message : String(err)}`;
+      if (err instanceof ToolFailure) {
+        raw = toolErrorText(err);
+        status = { ok: false, code: err.code };
+      } else {
+        raw = `工具执行失败：${err instanceof Error ? err.message : String(err)}`;
+        status = { ok: false, code: "tool_exception" };
+      }
     }
   }
   const transformed = options.transformToolResult?.(call.name, raw) ?? raw;
   const observed = guardrails.observe(call.name, call.args, transformed, { refused });
   const content = observed.note ? `${observed.content}\n\n${observed.note}` : observed.content;
   messages.push({ role: "tool", toolCallId: call.id, content });
-  return { content, ...(observed.halt ? { halt: observed.halt } : {}) };
+  return { content, status, ...(observed.halt ? { halt: observed.halt } : {}) };
 }

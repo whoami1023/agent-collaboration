@@ -11,6 +11,38 @@ export function clock(ts: number): string {
     .join(":");
 }
 
+/** 群聊窗口里的时间戳：跨天的记录只给时分分不清先后，带上月日。 */
+export function roomStamp(ts: number): string {
+  const date = new Date(ts);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${month}-${day} ${clock(ts).slice(0, 5)}`;
+}
+
+/**
+ * 当前时间行：模型默认不知道「今天几号」，判断截止日期、本周、逾期时只能靠这行。
+ * 与定时任务的 formatCronTimeLine 同口径（服务进程时区或显式 IANA 时区）。
+ */
+export function formatCurrentTime(nowMs: number = Date.now(), timeZone?: string): string {
+  const zone = timeZone?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  try {
+    const parts = new Intl.DateTimeFormat("zh-CN", {
+      timeZone: zone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(new Date(nowMs));
+    const pick = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+    return `当前时间：${pick("year")}-${pick("month")}-${pick("day")}（${pick("weekday")}）${pick("hour")}:${pick("minute")}，时区 ${zone}`;
+  } catch {
+    return `当前时间：${new Date(nowMs).toISOString()}，时区 ${zone}`;
+  }
+}
+
 export function formatRoomWindow(messages: RoomMessage[]): string {
   return messages
     .map((message) => {
@@ -20,7 +52,7 @@ export function formatRoomWindow(messages: RoomMessage[]): string {
           : message.senderKind === "system"
             ? "系统"
             : `@${message.senderName}`;
-      const meta = [`#${message.seq}`, who, clock(message.ts)];
+      const meta = [`#${message.seq}`, who, roomStamp(message.ts)];
       if (message.taskId) meta.push(`任务 ${message.taskId}`);
       if (message.kind === "announce") meta.push("汇报");
       return `${meta.join(" · ")}\n${message.text}`;
@@ -61,6 +93,10 @@ export interface PromptContext {
   teamFile?: string;
   /** 本轮实际注册的工具名；记忆指引只描述可用工具（对应 OpenClaw availableTools）。 */
   availableTools?: Set<string>;
+  /** 注入「当前时间」用的时钟；测试可传固定值，缺省取本轮启动时刻。 */
+  nowMs?: number;
+  /** IANA 时区；缺省用服务进程时区（与定时任务的时间行同口径）。 */
+  timeZone?: string;
 }
 
 const FILE_WORKSPACE_SECTION = `文件工作区
@@ -156,7 +192,13 @@ export function buildSystemPrompt(context: PromptContext): string {
 
 /** 系统提示的易变层：只放每轮都可能变化的群况。 */
 function formatDynamicContext(context: PromptContext): string {
-  const parts = ["当前群况（每轮更新，@ 之前先在这里找名字与技能）", "群成员：", formatRoster(context.member, context.members, context.taskTitles)];
+  const parts = [
+    "当前群况（每轮更新，@ 之前先在这里找名字与技能）",
+    formatCurrentTime(context.nowMs, context.timeZone),
+    "判断「今天/明天/本周/逾期」以这一行为准；群聊记录里的时间只到分钟，跨天时先后看记录顺序与这里的日期。",
+    "群成员：",
+    formatRoster(context.member, context.members, context.taskTitles),
+  ];
   // 能力档案是给统筹者挑人用的，成员看它没有意义，也不该由成员决定派谁。
   if (context.teamFile && context.member.role === "main") {
     parts.push(

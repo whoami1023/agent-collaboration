@@ -40,17 +40,19 @@ describe("docx 内置技能", () => {
     expect(builtinCategoryOf("docx-reader")).toBe("research");
     expect(builtinCategoryOf("docx-track-changes")).toBe("product");
     expect(builtinCategoryOf("docx-formula")).toBe("product");
-    expect(BUILTIN_SKILLS_VERSION).toBe(9);
+    expect(BUILTIN_SKILLS_VERSION).toBeGreaterThanOrEqual(9);
   });
 
-  it("脚本路径全在技能目录内，且整套内置技能都过技能附带文件校验", () => {
+  it("Word 脚本路径全在技能目录内，且整套内置技能都过技能附带文件校验", () => {
     for (const seed of BUILTIN_SHARED_SKILLS) {
       if (!seed.files?.length) continue;
       const normalized = normalizeSkillFiles(
         seed.files.map((file) => ({ path: file.path, content: file.content })),
       );
       expect(normalized.length).toBe(seed.files.length);
-      for (const file of seed.files) {
+    }
+    for (const name of DOCX_NAMES) {
+      for (const file of seedOf(name).files ?? []) {
         expect(file.path.startsWith("scripts/")).toBe(true);
         expect(file.path.endsWith(".py")).toBe(true);
       }
