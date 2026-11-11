@@ -78,7 +78,17 @@ function ActorCard({
   );
 }
 
+const LANE_TOOL_PREVIEW = 3;
+const LANE_MILESTONE_PREVIEW = 4;
+
 function Lane({ actor, focused, onFocus }: { actor: TraceActor; focused: boolean; onFocus(): void }) {
+  const [showAllTools, setShowAllTools] = useState(false);
+  const [showAllMilestones, setShowAllMilestones] = useState(false);
+  const visibleTools = showAllTools ? actor.toolRuns : actor.toolRuns.slice(-LANE_TOOL_PREVIEW);
+  const toolOffset = actor.toolRuns.length - visibleTools.length;
+  const visibleMilestones = showAllMilestones
+    ? actor.milestones
+    : actor.milestones.slice(-LANE_MILESTONE_PREVIEW);
   return (
     <article className={`trace-lane ${actor.mood}${focused ? " focused" : ""}`}>
       <button
@@ -99,16 +109,31 @@ function Lane({ actor, focused, onFocus }: { actor: TraceActor; focused: boolean
         <>
           <div className="trace-subhead">
             <span>工具轨迹</span>
-            <span>最近 {actor.toolRuns.length} 次</span>
+            <span className="trace-subhead-actions">
+              <span>
+                {showAllTools || actor.toolRuns.length <= LANE_TOOL_PREVIEW
+                  ? `共 ${actor.toolRuns.length} 次`
+                  : `最近 ${visibleTools.length} / ${actor.toolRuns.length} 次`}
+              </span>
+              {actor.toolRuns.length > LANE_TOOL_PREVIEW ? (
+                <button
+                  type="button"
+                  className="trace-lane-more"
+                  onClick={() => setShowAllTools((current) => !current)}
+                >
+                  {showAllTools ? "收起" : "展开全部"}
+                </button>
+              ) : null}
+            </span>
           </div>
           <div className="trace-tools">
-            {actor.toolRuns.map((run, index) => (
+            {visibleTools.map((run, index) => (
               <div
                 key={run.id}
                 className={`trace-tool${run.ok === false ? " failed" : run.ok === true ? " ok" : " pending"}`}
               >
                 <div className="trace-tool-head">
-                  <span className="trace-tool-index">{index + 1}</span>
+                  <span className="trace-tool-index">{toolOffset + index + 1}</span>
                   <span className="trace-tool-name">{run.name}</span>
                   <span className={`trace-tool-state ${run.ok === false ? "failed" : run.ok === true ? "ok" : "pending"}`}>
                     {run.ok === false ? "失败" : run.ok === true ? "完成" : "调用中"}
@@ -139,9 +164,25 @@ function Lane({ actor, focused, onFocus }: { actor: TraceActor; focused: boolean
         <>
           <div className="trace-subhead">
             <span>里程碑</span>
+            <span className="trace-subhead-actions">
+              <span>
+                {showAllMilestones || actor.milestones.length <= LANE_MILESTONE_PREVIEW
+                  ? `共 ${actor.milestones.length} 个`
+                  : `最近 ${visibleMilestones.length} / ${actor.milestones.length} 个`}
+              </span>
+              {actor.milestones.length > LANE_MILESTONE_PREVIEW ? (
+                <button
+                  type="button"
+                  className="trace-lane-more"
+                  onClick={() => setShowAllMilestones((current) => !current)}
+                >
+                  {showAllMilestones ? "收起" : "展开全部"}
+                </button>
+              ) : null}
+            </span>
           </div>
           <div className="trace-track">
-            {actor.milestones.map((event) => (
+            {visibleMilestones.map((event) => (
               <span
                 key={event.id}
                 className={`trace-chip ${ACTIVITY_META[event.kind].tone}`}

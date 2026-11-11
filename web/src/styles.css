@@ -6367,6 +6367,8 @@ body.pane-dragging * {
 
 .trace-scene {
   position: relative;
+  /* 运行现场固定完整高度，不参与和下方轨迹带的 flex 压缩。 */
+  flex: none;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -7176,6 +7178,21 @@ body.pane-dragging * {
 .trace-subhead > span:first-child {
   color: var(--text-strong);
   font-size: var(--text-xs);
+}
+
+.trace-subhead-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.trace-lane-more {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: normal;
 }
 
 .trace-tools {

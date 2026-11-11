@@ -47,6 +47,42 @@ function activity(): ActivityEvent[] {
   ];
 }
 
+function busyActivity(): ActivityEvent[] {
+  const events: ActivityEvent[] = [];
+  for (let index = 1; index <= 5; index += 1) {
+    events.push({
+      id: `tool-${index}`,
+      memberId: "m_main",
+      memberName: "主智能体",
+      kind: "tool",
+      title: `调用 tool_${index}`,
+      detail: JSON.stringify({ path: `files/${index}.md` }),
+      at: index * 10,
+    });
+    events.push({
+      id: `result-${index}`,
+      memberId: "m_main",
+      memberName: "主智能体",
+      kind: "tool-result",
+      title: `tool_${index} 返回`,
+      detail: `结果 ${index}`,
+      ok: true,
+      at: index * 10 + 1,
+    });
+  }
+  for (let index = 1; index <= 6; index += 1) {
+    events.push({
+      id: `think-${index}`,
+      memberId: "m_main",
+      memberName: "主智能体",
+      kind: "thinking",
+      title: `思考 ${index}`,
+      at: 100 + index,
+    });
+  }
+  return events;
+}
+
 describe("运行轨迹面板", () => {
   it("实时运行显示角色气泡、运行中数量与轨迹带", () => {
     const markup = renderToStaticMarkup(
@@ -75,6 +111,24 @@ describe("运行轨迹面板", () => {
     expect(markup).toContain("工具 1 · 发言 1");
     expect(markup).toContain('tabindex="0"');
     expect(markup).toContain("运行现场，可上下滑动查看全部成员");
+  });
+
+  it("轨迹带默认只展示最近几条，避免把运行现场挤小", () => {
+    const markup = renderToStaticMarkup(
+      createElement(RunTracePanel, {
+        members: [member({ status: "idle" })],
+        activity: busyActivity(),
+        runs: {},
+        roomName: "作战室",
+        roomId: "room_main",
+        onClose: () => undefined,
+      }),
+    );
+    expect(markup).toContain("最近 3 / 5 次");
+    expect(markup).toContain("最近 4 / 6 个");
+    expect(markup).toContain("tool_5");
+    expect(markup).not.toContain("tool_1");
+    expect(markup).toContain("展开全部");
   });
 
   it("空闲成员显示最近一次交付，空房间显示占位文案", () => {
