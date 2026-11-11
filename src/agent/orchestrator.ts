@@ -30,6 +30,9 @@ import type { RecallLedger } from "../memory/recall-ledger";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import type { ToolOutputStore } from "./content/offload";
 import type { RunJournalStore } from "./run-journal";
+import type { MissionStore } from "./mission-ledger";
+import { TurnBudgetBook, type TurnStopReason } from "../room/turn-budget";
+import { promptTokensOf } from "../model/usage-cost";
 import { MemberRuntime } from "./member-runtime";
 import { AdvisorService } from "./advisors/service";
 import type { LearningHost } from "./learning/types";
@@ -70,6 +73,8 @@ export interface OrchestratorDeps {
   questions?: QuestionStore;
   /** 运行日志：进程中断后按断点续跑；不传时每次唤醒都从头开始。 */
   journals?: RunJournalStore;
+  /** 任务台账：按用户任务链统计任务卡进展与停滞，注入主智能体。 */
+  missions?: MissionStore;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -118,6 +123,10 @@ export class Orchestrator {
   private readonly advisors: AdvisorService;
   /** 持久工作队列：一条义务一行，进程重启后仍能续跑。 */
   private readonly workQueue: WorkQueue;
+  /** 整轮预算：按用户任务链共享 token / 时间 / 运行次数。 */
+  private readonly turnBudget: TurnBudgetBook;
+  /** 正在运行的成员属于哪条任务链：用量回调据此记到正确的整轮预算上。 */
+  private readonly chainByMember = new Map<string, string>();
   /** 已经排进运行槽的队列行：同一行不会被并发调度两次。 */
   private readonly scheduledWork = new Set<string>();
   /** 持续审计：成员一轮交付后核对任务验收，由工作区在两边都建好后回灌。 */
@@ -125,12 +134,17 @@ export class Orchestrator {
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.workQueue = deps.workQueue ?? new WorkQueue(deps.bus.roomId);
+    this.turnBudget = new TurnBudgetBook(() => deps.getSettings().limits);
     this.advisors = new AdvisorService({
       getSettings: deps.getSettings,
       ...(deps.usage ? { usage: deps.usage } : {}),
       onUsageRecord: (record) => this.deps.bus.emit({ type: "model-usage", usage: record }),
     });
     deps.bus.subscribe((event) => {
+      if (event.type === "messages-cleared") {
+        this.turnBudget.clear();
+        return;
+      }
       if (event.type !== "message" || event.message.senderKind === "system") return;
       queueMicrotask(() => {
         if (!this.stopped) this.dispatch(event.message);
@@ -528,6 +542,18 @@ export class Orchestrator {
   private dispatch(message: RoomMessage): void {
     const limits = this.deps.getSettings().limits;
     if (message.seq <= this.stoppedThroughSeq) return;
+    const chainId = message.chainRootId ?? message.id;
+    // 用户消息开一条新的任务链；成员消息沿 chainRootId 继续同一份台账。
+    if (message.senderKind === "user" && !message.chainRootId) {
+      this.turnBudget.begin(chainId);
+      this.deps.missions?.begin(message);
+    } else {
+      const stopped = this.turnBudget.stopReason(chainId);
+      if (stopped) {
+        this.notifyTurnBudget(chainId, stopped);
+        return;
+      }
+    }
     const depthTurn = message.depthTurn ?? 0;
     if (depthTurn > limits.maxTurnsPerUserMessage) {
       const chain = message.chainRootId ?? message.id;
@@ -678,6 +704,26 @@ export class Orchestrator {
     this.collectorDue = null;
   }
 
+  /** 整轮预算到顶只提醒一次：被拦下的每个唤醒都刷一条只会淹没群聊。 */
+  private notifyTurnBudget(chainId: string, reason: TurnStopReason): void {
+    if (!this.turnBudget.markNotified(chainId, reason)) return;
+    const limits = this.deps.getSettings().limits;
+    const view = this.turnBudget.view(chainId);
+    const text =
+      reason === "tokens"
+        ? `本消息的整轮 token 预算已用尽（已用 ${view.tokens} / 上限 ${limits.turnTokenBudget}），已停止继续唤醒成员。已完成的内容保留；发「继续」或新消息可另开一轮。`
+        : reason === "time"
+          ? `本消息已达到整轮时长上限（${Math.round(limits.turnTimeoutMs / 60_000)} 分钟），已停止继续唤醒成员。已完成的内容保留；发「继续」或新消息可另开一轮。`
+          : `本消息已运行 ${view.runs} 次成员任务，达到单条消息的运行次数上限（${limits.turnMaxRuns}），已停止继续派发。已完成的内容保留；发「继续」或新消息可另开一轮。`;
+    this.deps.bus.append({
+      senderId: SYSTEM_ID,
+      senderName: "系统",
+      senderKind: "system",
+      kind: "system",
+      text,
+    });
+  }
+
   private wake(
     memberId: string,
     trigger: RoomMessage,
@@ -686,6 +732,12 @@ export class Orchestrator {
   ): void {
     const member = this.deps.bus.getMember(memberId);
     if (!member || member.status === "cancelled") return;
+    const chainId = trigger.chainRootId ?? trigger.id;
+    const stopped = this.turnBudget.stopReason(chainId);
+    if (stopped) {
+      this.notifyTurnBudget(chainId, stopped);
+      return;
+    }
     const key = `${trigger.id}:${memberId}`;
     if (this.seen.has(key)) return;
     this.seen.add(key);
@@ -733,6 +785,16 @@ export class Orchestrator {
       this.scheduledWork.delete(itemId);
       return;
     }
+    const chainId = trigger.chainRootId ?? trigger.id;
+    const gate = this.turnBudget.beginRun(chainId);
+    if (!gate.allowed) {
+      this.workQueue.cancel(itemId, "整轮预算已用尽");
+      this.notifyTurnBudget(chainId, gate.reason ?? "runs");
+      this.scheduledWork.delete(itemId);
+      this.drainMemberWork(memberId);
+      return;
+    }
+    this.chainByMember.set(memberId, chainId);
     const observed: {
       runId?: string;
       terminal?:
@@ -740,6 +802,16 @@ export class Orchestrator {
         | { status: "error"; error: string }
         | { status: "aborted"; reason?: "timeout" | "cancelled" | "silent" | "removed" };
     } = {};
+    let missionObserved = false;
+    // 必须在终局事件同步回调里记账：成员交付消息的派发是微任务，晚一步主智能体就会拿到旧台账。
+    const observeMission = () => {
+      if (missionObserved) return;
+      missionObserved = true;
+      this.deps.missions?.observe({
+        chainRootId: trigger.chainRootId ?? trigger.id,
+        tasks: this.deps.board.list(),
+      });
+    };
     const unsubscribe = this.deps.bus.subscribe((event) => {
       if (event.type !== "run" || event.event.memberId !== memberId) return;
       const run = event.event;
@@ -749,6 +821,7 @@ export class Orchestrator {
       else if (run.type === "run-aborted") {
         observed.terminal = { status: "aborted", ...(run.reason ? { reason: run.reason } : {}) };
       }
+      if (observed.terminal) observeMission();
     });
     // 断点续跑：上次中断的运行日志还在且没有终局，就沿用它，把已完成的调用原样放回上下文。
     const prior = this.workQueue.get(itemId);
@@ -770,7 +843,11 @@ export class Orchestrator {
     } finally {
       unsubscribe();
       this.scheduledWork.delete(itemId);
+      if (this.chainByMember.get(memberId) === chainId) this.chainByMember.delete(memberId);
     }
+    observeMission();
+    const budgetStop = this.turnBudget.stopReason(chainId);
+    if (budgetStop) this.notifyTurnBudget(chainId, budgetStop);
     if (this.stopped) return;
     const terminal = observed.terminal;
     if (!terminal) {
@@ -904,13 +981,20 @@ export class Orchestrator {
         ...(deps.memory ? { memory: deps.memory } : {}),
         ...(deps.files ? { files: deps.files } : {}),
         ...(deps.usage ? { usage: deps.usage } : {}),
-        ...(deps.onUsageRecord ? { onUsageRecord: deps.onUsageRecord } : {}),
+        onUsageRecord: (record) => {
+          const chainId = this.chainByMember.get(member.id);
+          if (chainId) {
+            this.turnBudget.addTokens(chainId, promptTokensOf(record.usage) + record.usage.output);
+          }
+          this.deps.onUsageRecord?.(record);
+        },
         ...(deps.learning ? { learning: deps.learning } : {}),
         ...(deps.skillUsage ? { skillUsage: deps.skillUsage } : {}),
         ...(deps.recallLedger ? { recallLedger: deps.recallLedger } : {}),
         ...(deps.toolOutputs ? { toolOutputs: deps.toolOutputs } : {}),
         ...(deps.questions ? { questions: deps.questions } : {}),
         ...(deps.journals ? { journals: deps.journals } : {}),
+        ...(deps.missions ? { missions: deps.missions } : {}),
         advisors: this.advisors,
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });

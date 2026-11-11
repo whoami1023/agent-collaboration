@@ -286,7 +286,7 @@ ${modeSection}
 节奏
 - 分派后不要轮询、不要反复催问，等它的汇报；到点自然会被唤醒。
 - 一次回复只做一件事：要么分派，要么综合汇报；不要刷屏。
-- 派活优先用 task_dispatch（建卡 + 派发 + 唤醒一次完成）；已有卡用 task_update 更新，结果用 task_attach_artifact 登记。
+- 派活优先用 task_dispatch（建卡 + 派发 + 唤醒一次完成）；把接收成员真正需要的背景、输入摘录、前序结论和约束写进 context，相关文件路径写进 files。已有卡用 task_update 更新，结果用 task_attach_artifact 登记。
 - 单次运行最多 ${limits.maxStepsPerRun} 步工具调用：相互独立的调用放在同一轮发起（例如改任务状态与登记产出），接近上限时先收尾汇报，不要一步只做一个工具调用。
 
 约束：总并发 ${limits.maxConcurrent}；成员创建由用户操作，你只做任务分派与汇总。`;

@@ -36,6 +36,7 @@ import { scopeToolUnavailable } from "./run-scope";
 import { isPassText } from "../room/routing";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
 import type { LoadedRunJournal, RunJournalRecorder, RunJournalStore } from "./run-journal";
+import type { MissionStore } from "./mission-ledger";
 
 export interface MemberUsageRecord {
   ref: string;
@@ -73,6 +74,8 @@ export interface RuntimeDeps {
   questions?: QuestionStore;
   /** 运行日志：进程中断后续跑；未提供时不做检查点。 */
   journals?: RunJournalStore;
+  /** 任务台账：主智能体每轮读取本用户任务的进展、停滞与重规划要求。 */
+  missions?: MissionStore;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -80,6 +83,17 @@ export interface RuntimeDeps {
 
 function isAbort(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
+}
+
+/** 交接上下文包只给被派发的成员：先看这段，再决定是否回读文件与群聊。 */
+function formatHandoff(handoff: NonNullable<RoomMessage["handoff"]>): string {
+  const lines = [`【交接上下文包】来自 @${handoff.fromName}`];
+  if (handoff.context.trim()) lines.push(handoff.context.trim());
+  if (handoff.files && handoff.files.length > 0) {
+    lines.push(`相关文件：${handoff.files.join("、")}`);
+  }
+  lines.push("先核对上面的输入与文件再动手；不要假设派发者已经替你完成。");
+  return lines.join("\n");
 }
 
 export interface MemberRunOptions {
@@ -241,6 +255,8 @@ export class MemberRuntime {
         ...(this.deps.toolOutputs ? { toolOutputs: this.deps.toolOutputs } : {}),
         ...(this.deps.questions ? { questions: this.deps.questions } : {}),
         runId,
+        chainRootId: trigger.chainRootId ?? trigger.id,
+        depthTurn: trigger.depthTurn ?? 0,
       });
       // 主智能体要按成员能力档案决定把活派给谁：每次运行前同步 TEAM.md 再读进来，
       // 保证新建、移除成员或改技能授权后下一轮就看到最新值（读失败则不注入，fail-open）。
@@ -292,6 +308,12 @@ export class MemberRuntime {
       }
       const windowMessages = bus.window(limits.maxRoomWindowChars);
       const window = formatRoomWindow(windowMessages);
+      // 任务台账只给主智能体：它负责统筹，其他成员拿到交接上下文包就够。
+      const missionContext =
+        !resume && member.role === "main" && this.deps.missions
+          ? this.deps.missions.takeContext(trigger.chainRootId ?? trigger.id, board.list())
+          : null;
+      const handoffContext = !resume && trigger.handoff ? formatHandoff(trigger.handoff) : null;
       const messages: LlmMessage[] = resume
         ? [...resume.initialMessages]
         : [
@@ -299,7 +321,10 @@ export class MemberRuntime {
               role: "user",
               content:
                 `${recallContext ? `${recallContext}\n\n` : ""}` +
-                `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(member, trigger, bus.roomMode, bus.roomRouting)}`,
+                `${window ? `群聊最近记录：\n${window}\n\n` : ""}` +
+                `${missionContext ? `${missionContext}\n\n` : ""}` +
+                `${handoffContext ? `${handoffContext}\n\n` : ""}` +
+                `${buildInstruction(member, trigger, bus.roomMode, bus.roomRouting)}`,
             },
           ];
       // 顾问扇出（Hermes 的 MoA 群聊版）：动手之前先请几位在册成员出建议。

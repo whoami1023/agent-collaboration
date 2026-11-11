@@ -15,6 +15,8 @@ export interface CreateTaskInput {
   ownerId?: string | null;
   deps?: string[];
   acceptance?: string;
+  /** 所属用户任务链；任务台账据此只统计这一轮的任务。 */
+  chainRootId?: string;
 }
 
 export interface UpdateTaskPatch {
@@ -52,6 +54,7 @@ export class Workboard {
       roomId: this.roomId,
       title: input.title.trim(),
       detail: input.detail?.trim() ?? "",
+      ...(input.chainRootId ? { chainRootId: input.chainRootId } : {}),
       ...(input.acceptance?.trim() ? { acceptance: input.acceptance.trim() } : {}),
       ownerId: input.ownerId ?? null,
       status: "todo",

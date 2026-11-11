@@ -41,6 +41,7 @@ import { MemorySearchManager } from "../memory/manager";
 import { RecallLedger } from "../memory/recall-ledger";
 import { ToolOutputStore } from "../agent/content/offload";
 import { RunJournalStore } from "../agent/run-journal";
+import { MissionStore, type MissionSnapshot } from "../agent/mission-ledger";
 import { WorkspaceFiles } from "../files/workspace-files";
 import { RoomBus } from "../room/bus";
 import {
@@ -77,6 +78,8 @@ interface PersistedState {
   activity?: ActivityEvent[];
   /** 持续审计：结构化结论与每任务进度随房间保存，重启后不重复催办。 */
   audits?: AuditSnapshot;
+  /** 任务台账：用户任务链的进展、停滞计数与重规划状态。 */
+  missions?: MissionSnapshot;
 }
 
 /** v3 及更早的成员档案用 `providerId`，v4 统一为 `modelRef`（`provider/model` 或别名）。 */
@@ -129,6 +132,8 @@ export interface RoomInstance {
   auditService: AuditService;
   /** 运行日志：断点续跑与时间旅行的检查点来源。 */
   journals: RunJournalStore;
+  /** 任务台账：主智能体每轮看到的进展、停滞与重规划要求。 */
+  missions: MissionStore;
   /** 作战室落在 `state.json`，群聊落在 `rooms/<roomId>.json`。 */
   stateFile: string;
   saveTimer: NodeJS.Timeout | null;
@@ -436,6 +441,10 @@ export class Workspace {
       });
     }
     const journals = new RunJournalStore(join(this.dir, "journals", descriptor.id));
+    const missions = new MissionStore(descriptor.id, {
+      onChange: () => this.scheduleSave(descriptor.id),
+    });
+    missions.hydrate(persisted?.missions);
     const orchestrator = new Orchestrator({
       bus,
       board,
@@ -454,6 +463,7 @@ export class Workspace {
       workQueue,
       questions,
       journals,
+      missions,
     });
     // 持续审计：运行收尾后核对任务验收；结论落盘并经 SSE 推给执行面板。
     // 催办走编排器的系统消息 + 唤醒，升级只发系统提醒，不自动改任务状态。
@@ -509,6 +519,7 @@ export class Workspace {
       audits,
       auditService,
       journals,
+      missions,
       stateFile: this.stateFileFor(descriptor.id),
       saveTimer: null,
     };
@@ -524,6 +535,7 @@ export class Workspace {
       } else if (event.type === "messages-cleared") {
         activity.clear();
         audits.clear();
+        missions.clear();
       }
       if (SAVE_TRIGGERS.includes(event.type)) this.scheduleSave(descriptor.id);
       if (DIRTY_TRIGGERS.includes(event.type)) this.memory.markDirty();
@@ -1082,6 +1094,7 @@ export class Workspace {
       questions: room.questions.snapshot(),
       activity: room.activity.snapshot(),
       audits: room.audits.snapshot(),
+      missions: room.missions.snapshot(),
     } satisfies PersistedState);
   }
 

@@ -96,6 +96,12 @@ export interface Limits {
   contextWindowTokens?: number;
   /** Hard model-view byte ceiling (number or "2mb" style string); unset disables bounding. */
   maxActiveTranscriptBytes?: number | string;
+  /** 单条用户消息允许消耗的 token 总量（该任务链上所有模型调用合计）。 */
+  turnTokenBudget: number;
+  /** 单条用户消息最多允许多少次成员运行。 */
+  turnMaxRuns: number;
+  /** 单条用户消息从首次派发到停止的总时长。 */
+  turnTimeoutMs: number;
 }
 
 export const DEFAULT_LIMITS: Limits = {
@@ -108,6 +114,9 @@ export const DEFAULT_LIMITS: Limits = {
   runTimeoutMs: 420000,
   contextWindowTokens: 64000,
   maxActiveTranscriptBytes: "2mb",
+  turnTokenBudget: 200000,
+  turnMaxRuns: 24,
+  turnTimeoutMs: 900000,
 };
 
 /** `Limits` 里按整数校验的字段（可选的 token 预算/字节上限除外）。 */
@@ -118,7 +127,10 @@ export type LimitCountKey =
   | "maxStepsPerRun"
   | "maxRoomWindowChars"
   | "maxTurnsPerUserMessage"
-  | "runTimeoutMs";
+  | "runTimeoutMs"
+  | "turnTokenBudget"
+  | "turnMaxRuns"
+  | "turnTimeoutMs";
 
 export interface LimitFieldSpec {
   key: LimitCountKey;
@@ -157,6 +169,34 @@ export const LIMIT_FIELDS: readonly LimitFieldSpec[] = [
     displayDivisor: 1000,
     inSettingsPanel: true,
     hint: "整轮运行的墙上时钟上限，与步数同时生效：只调大步数不调超时会先触发超时中止。",
+  },
+  {
+    key: "turnTokenBudget",
+    label: "单条消息 token 预算",
+    min: 10_000,
+    max: 2_000_000,
+    displayUnit: "tokens",
+    inSettingsPanel: true,
+    hint: "一条用户消息触发的成员运行主模型调用合计达到这个值后，不再继续唤醒成员。",
+  },
+  {
+    key: "turnMaxRuns",
+    label: "单条消息运行次数",
+    min: 1,
+    max: 64,
+    displayUnit: "次",
+    inSettingsPanel: true,
+    hint: "一条用户消息最多唤醒成员运行多少次；到顶后保留已完成内容并停止继续派发。",
+  },
+  {
+    key: "turnTimeoutMs",
+    label: "单条消息总时长",
+    min: 30_000,
+    max: 3_600_000,
+    displayUnit: "秒",
+    displayDivisor: 1000,
+    inSettingsPanel: true,
+    hint: "从首次派发算起，达到这个时长后不再继续唤醒成员；单次运行自己的超时仍然单独生效。",
   },
   {
     key: "maxConcurrent",
@@ -242,6 +282,17 @@ export interface Member {
   lastActiveAt: number;
 }
 
+/** 结构化交接：派发方整理好的上下文只给接收成员，不要求它从整段群聊里自己捞。 */
+export interface HandoffContext {
+  /** 上下文包来自哪位成员。 */
+  fromId: string;
+  fromName: string;
+  /** 背景、输入、约束与前序结论。 */
+  context: string;
+  /** 相关文件路径（相对工作区）。 */
+  files?: string[];
+}
+
 export interface RoomMessage {
   id: string;
   roomId: string;
@@ -260,6 +311,8 @@ export interface RoomMessage {
   chainRootId?: string;
   depthTurn?: number;
   resume?: ResumeHint;
+  /** 派发时附带的上下文包；只有被派发的成员在运行时注入。 */
+  handoff?: HandoffContext;
   /**
    * 本轮的运行姿态（run scope）。由用户消息带上，该轮里智能体发回的消息继承同一个值，
    * 于是「这一轮被收窄成什么」既能决定工具清单，也能决定唤醒规则。缺省等于 normal。
@@ -317,6 +370,8 @@ export interface TaskCard {
   roomId: string;
   title: string;
   detail: string;
+  /** 所属用户任务链（根消息 id）：任务台账据此判断这一轮有没有实际进展。 */
+  chainRootId?: string;
   /** 验收条款：每条一个可独立核对的客体。写了它，done 就必须带查得通的证据。 */
   acceptance?: string;
   /** 本轮台账留在卡上的证据（最多 40 条），供续跑核验。 */

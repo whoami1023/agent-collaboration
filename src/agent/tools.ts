@@ -58,6 +58,10 @@ export interface ToolDeps {
   toolOutputs?: ToolOutputStore;
   /** 本轮运行 id：run_batch 存档时带上，便于把一次调用与这一轮对应起来。 */
   runId?: string;
+  /** 本轮所属用户任务链；新建任务卡时落上，任务台账据此统计进展。 */
+  chainRootId?: string;
+  /** 当前消息在任务链里的接力轮数；派发消息继承并加一。 */
+  depthTurn?: number;
   /** 结构化提问：提出需要用户决定的问题，答案回来后由消息链路唤醒提问者。 */
   questions?: QuestionStore;
 }
@@ -244,6 +248,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
         ...(acceptance ? { acceptance } : {}),
         createdBy: member.id,
         ownerId: owner?.id ?? null,
+        ...(deps.chainRootId ? { chainRootId: deps.chainRootId } : {}),
         ...(readStringArray(args, "deps") ? { deps: readStringArray(args, "deps") } : {}),
       });
       return `已创建任务 ${task.id}：${task.title}（状态 ${task.status}${owner ? `，负责人 @${owner.name}` : ""}）${
@@ -268,6 +273,16 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
           detail: {
             type: "string",
             description: "任务简报：背景、输入文件、约束与完成标准。成员看不到你的推理，这里要写全",
+          },
+          context: {
+            type: "string",
+            description:
+              "可选：交接上下文包。只给接收成员注入，用来放它最需要的背景、输入摘录、前序结论与约束；不要复述整段群聊",
+          },
+          files: {
+            type: "array",
+            items: { type: "string" },
+            description: "可选：本次交接涉及的文件相对路径（工作区 files/ 下），会随上下文包一起注入",
           },
           acceptance: {
             type: "string",
@@ -340,14 +355,26 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
         });
       }
       const detail = readString(args, "detail");
+      const context = readString(args, "context");
+      const contextFiles = readStringArray(args, "files");
       const task = deps.board.create({
         title,
         ...(detail ? { detail } : {}),
         ...(acceptance ? { acceptance } : {}),
         createdBy: member.id,
         ownerId: target.id,
+        ...(deps.chainRootId ? { chainRootId: deps.chainRootId } : {}),
         ...(readStringArray(args, "deps") ? { deps: readStringArray(args, "deps") } : {}),
       });
+      const handoff =
+        context || contextFiles
+          ? {
+              fromId: member.id,
+              fromName: member.name,
+              context: context ?? "",
+              ...(contextFiles ? { files: contextFiles } : {}),
+            }
+          : undefined;
       const message = deps.bus.append({
         senderId: member.id,
         senderName: member.name,
@@ -358,12 +385,18 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
           `任务卡：${task.id}`,
           ...(detail ? [detail] : []),
           ...(acceptance ? [`验收条款：${acceptance}`] : []),
+          ...(handoff ? ["（已附交接上下文包，只对该成员注入）"] : []),
         ].join("\n"),
         mentions: [target.id],
         taskId: task.id,
+        ...(handoff ? { handoff } : {}),
+        ...(deps.chainRootId ? { chainRootId: deps.chainRootId } : {}),
+        ...(deps.depthTurn !== undefined ? { depthTurn: deps.depthTurn + 1 } : {}),
         ...(deps.runId ? { runId: deps.runId } : {}),
       });
-      return `已派发任务 ${task.id} 给 @${target.name}（消息 ${message.id}），任务卡与派发消息都已落账，对方已被唤醒。`;
+      return `已派发任务 ${task.id} 给 @${target.name}（消息 ${message.id}），任务卡与派发消息都已落账，对方已被唤醒${
+        handoff ? "，交接上下文包已随之传递" : ""
+      }。`;
     },
   });
 

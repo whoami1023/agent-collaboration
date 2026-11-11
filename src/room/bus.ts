@@ -1,6 +1,7 @@
 import {
   isRoomRoutingMode,
   type Member,
+  type HandoffContext,
   type MessageKind,
   type ResumeHint,
   type RoomEvent,
@@ -26,6 +27,8 @@ export interface AppendInput {
   chainRootId?: string;
   depthTurn?: number;
   resume?: ResumeHint;
+  /** 派发时附带的上下文包；只给被派发的成员注入。 */
+  handoff?: HandoffContext;
   /** 本轮运行姿态；见 RoomMessage.runScope。缺省按 normal 处理。 */
   runScope?: RunScopeKind;
 }
@@ -157,6 +160,7 @@ export class RoomBus {
       ...(input.chainRootId ? { chainRootId: input.chainRootId } : {}),
       ...(input.depthTurn !== undefined ? { depthTurn: input.depthTurn } : {}),
       ...(input.resume ? { resume: input.resume } : {}),
+      ...(input.handoff ? { handoff: input.handoff } : {}),
       ...(input.runScope ? { runScope: input.runScope } : {}),
     };
     this.messages.push(message);
