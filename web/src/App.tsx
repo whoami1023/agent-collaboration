@@ -2991,6 +2991,8 @@ function RoomView({
                 type="button"
                 role="tab"
                 aria-selected={rightTab === "tasks"}
+                aria-label={`任务 ${tasks.length}`}
+                title={`任务看板 · ${tasks.length} 项`}
                 className={`right-tab${rightTab === "tasks" ? " active" : ""}`}
                 onClick={() => setRightTab("tasks")}
               >
@@ -3002,6 +3004,8 @@ function RoomView({
                 type="button"
                 role="tab"
                 aria-selected={rightTab === "files"}
+                aria-label={`文件 ${workspaceFileCount ?? "未知"}`}
+                title={`文件工作区 · ${workspaceFileCount ?? "统计中"}`}
                 className={`right-tab${rightTab === "files" ? " active" : ""}`}
                 onClick={() => setRightTab("files")}
               >
@@ -3013,6 +3017,8 @@ function RoomView({
                 type="button"
                 role="tab"
                 aria-selected={rightTab === "activity"}
+                aria-label={`执行 ${Object.keys(runs).length}`}
+                title="执行状态 · 成员运行与工具轨迹"
                 className={`right-tab${rightTab === "activity" ? " active" : ""}`}
                 onClick={() => setRightTab("activity")}
               >
@@ -3024,6 +3030,8 @@ function RoomView({
                 type="button"
                 role="tab"
                 aria-selected={rightTab === "archives"}
+                aria-label={`归档 ${archives?.length ?? "未知"}`}
+                title={`归档区 · ${archives?.length ?? "统计中"}`}
                 className={`right-tab${rightTab === "archives" ? " active" : ""}`}
                 onClick={() => setRightTab("archives")}
               >

@@ -1988,6 +1988,8 @@ body.pane-dragging * {
   border-left: 1px solid var(--border);
   background: var(--panel);
   transition: border-color 0.24s var(--ease);
+  /* 侧栏可以拖到 220px：标签栏按容器宽度自适应，不靠视口宽度猜。 */
+  container-type: inline-size;
 }
 
 .shell.board-closed .board-panel {
@@ -2008,8 +2010,9 @@ body.pane-dragging * {
   justify-content: space-between;
   gap: 8px;
   flex: none;
-  height: 52px;
-  padding: 0 10px 0 14px;
+  flex-wrap: wrap;
+  min-height: 52px;
+  padding: 6px 10px 6px 14px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -2059,6 +2062,8 @@ body.pane-dragging * {
   align-items: center;
   gap: 2px;
   min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
   padding: 3px;
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -2103,6 +2108,28 @@ body.pane-dragging * {
 .right-tab.active .chip {
   background: var(--accent-subtle);
   color: var(--accent);
+}
+
+/* 面板拖窄时逐级减负：先收计数，再收文字，保证四个标签始终完整可点。 */
+@container (max-width: 400px) {
+  .right-tab {
+    padding: 0 8px;
+  }
+
+  .right-tab .chip {
+    display: none;
+  }
+}
+
+@container (max-width: 320px) {
+  .right-tab {
+    gap: 0;
+    padding: 0 8px;
+  }
+
+  .right-tab > span:not(.chip) {
+    display: none;
+  }
 }
 
 /* ---------- 文件工作区 ---------- */
