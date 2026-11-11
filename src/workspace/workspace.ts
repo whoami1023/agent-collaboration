@@ -40,6 +40,7 @@ import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
 import { RecallLedger } from "../memory/recall-ledger";
 import { ToolOutputStore } from "../agent/content/offload";
+import { RunJournalStore } from "../agent/run-journal";
 import { WorkspaceFiles } from "../files/workspace-files";
 import { RoomBus } from "../room/bus";
 import {
@@ -126,6 +127,8 @@ export interface RoomInstance {
   /** 持续审计：任务验收的独立核对记录与每任务进度。 */
   audits: AuditStore;
   auditService: AuditService;
+  /** 运行日志：断点续跑与时间旅行的检查点来源。 */
+  journals: RunJournalStore;
   /** 作战室落在 `state.json`，群聊落在 `rooms/<roomId>.json`。 */
   stateFile: string;
   saveTimer: NodeJS.Timeout | null;
@@ -148,10 +151,31 @@ const DIRTY_TRIGGERS: RoomEvent["type"][] = [
   "session-restored",
 ];
 
+/** SSE 的一帧：seq 单调递增，断线重连按它补发；roomId 让一个连接喂多间房。 */
+export interface RoomFrame {
+  seq: number;
+  roomId: string;
+  event: RoomEvent;
+}
+
+/** 回放缓冲上限：断得太久就不逐帧补，直接让前端 resync。 */
+const REPLAY_MAX_FRAMES = 800;
+const REPLAY_MAX_BYTES = 2 * 1024 * 1024;
+
+/** 流式增量是瞬时的：重连后没有补发价值，也不该挤占回放缓冲。 */
+function isEphemeral(event: RoomEvent): boolean {
+  return (
+    event.type === "run" && (event.event.type === "delta" || event.event.type === "reasoning")
+  );
+}
+
 export class Workspace {
   private closed = false;
   private readonly rooms = new Map<string, RoomInstance>();
-  private readonly roomListeners = new Set<(roomId: string, event: RoomEvent) => void>();
+  private readonly roomListeners = new Set<(frame: RoomFrame) => void>();
+  private eventSeq = 0;
+  private readonly replayLog: RoomFrame[] = [];
+  private replayBytes = 0;
   /** 群聊总线列表：交给记忆层当作 sessions 语料，开房与删房时同步增删。 */
   private groupBuses: RoomBus[] = [];
   private cronService: CronService | null = null;
@@ -388,14 +412,14 @@ export class Workspace {
     const questions = new QuestionStore(descriptor.id, {
       onChange: (question) => {
         this.scheduleSave(descriptor.id);
-        for (const listener of [...this.roomListeners]) listener(descriptor.id, { type: "question", question });
+        this.broadcast(descriptor.id, { type: "question", question });
       },
     });
     questions.hydrate(persisted?.questions);
     const activity = new ActivityStore(descriptor.id, {
       onChange: (event) => {
         this.scheduleSave(descriptor.id);
-        for (const listener of [...this.roomListeners]) listener(descriptor.id, { type: "activity", event });
+        this.broadcast(descriptor.id, { type: "activity", event });
       },
     });
     activity.hydrate(persisted?.activity);
@@ -411,6 +435,7 @@ export class Workspace {
         triggerText: item.trigger.text,
       });
     }
+    const journals = new RunJournalStore(join(this.dir, "journals", descriptor.id));
     const orchestrator = new Orchestrator({
       bus,
       board,
@@ -428,6 +453,7 @@ export class Workspace {
       toolOutputs: this.toolOutputs,
       workQueue,
       questions,
+      journals,
     });
     // 持续审计：运行收尾后核对任务验收；结论落盘并经 SSE 推给执行面板。
     // 催办走编排器的系统消息 + 唤醒，升级只发系统提醒，不自动改任务状态。
@@ -444,6 +470,11 @@ export class Workspace {
       activityByMember: (memberId) =>
         activity.list().filter((event) => event.memberId === memberId),
       usage: this.usage,
+      onSpan: (span) =>
+        bus.emit({
+          type: "run",
+          event: { type: "span", ...span },
+        }),
       requestNudge: (memberId, text, taskId) =>
         orchestrator.requestAuditNudge(memberId, text, taskId),
       requestEscalation: (record) => {
@@ -477,6 +508,7 @@ export class Workspace {
       activity,
       audits,
       auditService,
+      journals,
       stateFile: this.stateFileFor(descriptor.id),
       saveTimer: null,
     };
@@ -495,11 +527,11 @@ export class Workspace {
       }
       if (SAVE_TRIGGERS.includes(event.type)) this.scheduleSave(descriptor.id);
       if (DIRTY_TRIGGERS.includes(event.type)) this.memory.markDirty();
-      for (const listener of [...this.roomListeners]) listener(descriptor.id, event);
+      this.broadcast(descriptor.id, event);
     });
     board.subscribe((event) => {
       this.scheduleSave(descriptor.id);
-      for (const listener of [...this.roomListeners]) listener(descriptor.id, event);
+      this.broadcast(descriptor.id, event);
     });
     this.rooms.set(descriptor.id, instance);
     return instance;
@@ -966,10 +998,48 @@ export class Workspace {
     void this.manifest.save();
   }
 
-  /** 房间事件多路复用：一间房的事件带上它的 roomId 交给上层（SSE 用它按房间过滤）。 */
-  subscribeRooms(listener: (roomId: string, event: RoomEvent) => void): () => void {
+  /** 房间事件多路复用：每帧带 seq 与 roomId，SSE 用它续传并按房间过滤。 */
+  subscribeRooms(listener: (frame: RoomFrame) => void): () => void {
     this.roomListeners.add(listener);
     return () => this.roomListeners.delete(listener);
+  }
+
+  /**
+   * 从 afterSeq 之后补发事件。
+   *
+   * `exact=false` 表示请求的位置已经滑出缓冲（或服务重启导致 seq 回退），
+   * 调用方应发一条 resync 让前端重新拉状态，而不是假装连续。
+   */
+  replaySince(afterSeq: number | undefined): {
+    frames: RoomFrame[];
+    exact: boolean;
+    latestSeq: number;
+  } {
+    const latestSeq = this.eventSeq;
+    if (afterSeq === undefined) return { frames: [], exact: true, latestSeq };
+    const firstRetained = this.replayLog[0]?.seq ?? latestSeq + 1;
+    if (afterSeq > latestSeq || afterSeq < firstRetained - 1) {
+      return { frames: [], exact: false, latestSeq };
+    }
+    return { frames: this.replayLog.filter((frame) => frame.seq > afterSeq), exact: true, latestSeq };
+  }
+
+  /** 统一广播：先编号入回放缓冲，再分发给当前连接。 */
+  private broadcast(roomId: string, event: RoomEvent): void {
+    const frame: RoomFrame = { seq: ++this.eventSeq, roomId, event };
+    if (!isEphemeral(event)) {
+      this.replayLog.push(frame);
+      this.replayBytes += Buffer.byteLength(JSON.stringify(frame), "utf8");
+      while (
+        this.replayLog.length > 0 &&
+        (this.replayLog.length > REPLAY_MAX_FRAMES || this.replayBytes > REPLAY_MAX_BYTES)
+      ) {
+        const dropped = this.replayLog.shift();
+        if (!dropped) break;
+        this.replayBytes -= Buffer.byteLength(JSON.stringify(dropped), "utf8");
+      }
+    }
+    for (const listener of [...this.roomListeners]) listener(frame);
   }
 
   private scheduleSave(roomId: string): void {

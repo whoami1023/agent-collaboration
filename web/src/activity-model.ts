@@ -13,6 +13,7 @@ export const ACTIVITY_META: Record<ActivityKind, { label: string; tone: string }
   thinking: { label: "思考", tone: "thinking" },
   tool: { label: "工具", tone: "tool" },
   "tool-result": { label: "结果", tone: "result" },
+  span: { label: "子调用", tone: "tool" },
   final: { label: "完成", tone: "final" },
   error: { label: "失败", tone: "error" },
   aborted: { label: "中止", tone: "aborted" },

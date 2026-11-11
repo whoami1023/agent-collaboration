@@ -19,6 +19,17 @@ export const TRACE_MOOD_LABEL: Record<TraceMood, string> = {
   cancelled: "已取消",
 };
 
+export interface ToolRun {
+  id: string;
+  name: string;
+  at: number;
+  /** 已格式化的调用摘要：run_command 优先展示命令行。 */
+  args: string;
+  ok?: boolean;
+  result?: string;
+  resultAt?: number;
+}
+
 export interface TraceActor {
   member: Member;
   look: TraceLook;
@@ -27,7 +38,10 @@ export interface TraceActor {
   startedAt?: number;
   /** 角色头顶气泡里的短句：当前工具、最近一段推理或最近一条活动。 */
   thought: string;
-  trail: ActivityEvent[];
+  /** 最近几次工具调用（参数摘要 + 结果），按时间正序。 */
+  toolRuns: ToolRun[];
+  /** 工具之外的里程碑（开始/思考/发言/交付），避免和工具轨迹重复。 */
+  milestones: ActivityEvent[];
   counts: { tool: number; message: number; error: number };
   lastAt: number;
 }
@@ -74,6 +88,129 @@ export function latestClause(text: string, max = 88): string {
   return last.length > max ? `…${last.slice(-max)}` : last;
 }
 
+/** 从工具标题里取出名字：`调用 X` / `X 返回` / `X 报错`。 */
+function toolNameOf(event: ActivityEvent): { name: string; isResult: boolean } | null {
+  if (event.kind === "tool") {
+    return { name: event.title.replace(/^调用\s*/, "") || "工具", isResult: false };
+  }
+  if (event.kind === "tool-result") {
+    const match = /^(.+?)\s+(返回|报错)$/.exec(event.title);
+    return { name: match?.[1] ?? event.title, isResult: true };
+  }
+  return null;
+}
+
+function parseArgs(detail: string | undefined): Record<string, unknown> | null {
+  if (!detail?.trim().startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(detail) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function valueText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map(valueText).join(" ");
+  if (value && typeof value === "object") return JSON.stringify(value);
+  return "";
+}
+
+function clipLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+/** 把工具参数整理成一眼能看懂的一行；命令类工具优先露出完整命令行。 */
+export function formatToolArgs(name: string, detail: string | undefined): string {
+  const args = parseArgs(detail);
+  if (!args) return clipLine(detail ?? "", 180);
+  if (name === "run_command") {
+    const command = valueText(args["command"]);
+    if (command) {
+      const cwd = valueText(args["cwd"]);
+      return clipLine(`$ ${command}${cwd ? `  (cwd: ${cwd})` : ""}`, 260);
+    }
+  }
+  if (name === "run_skill_script") {
+    const skill = valueText(args["skill"] ?? args["name"] ?? args["script"]);
+    const extra = valueText(args["args"]);
+    return clipLine(`▸ ${skill || "脚本"}${extra ? ` ${extra}` : ""}`, 220);
+  }
+  if (name === "file_read" || name === "file_write") {
+    const path = valueText(args["path"]);
+    return clipLine(`${path}${args["append"] === true ? "（追加）" : ""}`, 180);
+  }
+  if (name === "file_search") {
+    const query = valueText(args["query"]);
+    const path = valueText(args["path"]);
+    return clipLine(`${query}${path ? ` @ ${path}` : " @ files/"}`, 180);
+  }
+  if (name === "file_list") return clipLine(valueText(args["path"]) || "files/", 120);
+  if (name === "web_search") return clipLine(valueText(args["query"]), 180);
+  if (name === "web_fetch") return clipLine(valueText(args["url"]), 180);
+  if (name === "task_create") return clipLine(valueText(args["title"]), 180);
+  if (name === "task_update") {
+    const id = valueText(args["task_id"] ?? args["taskId"]);
+    const status = valueText(args["status"]);
+    return clipLine(`${id}${status ? ` → ${status}` : ""}`, 160);
+  }
+  if (name === "task_attach_artifact") {
+    return clipLine(valueText(args["name"] ?? args["path"]), 160);
+  }
+  const parts: string[] = [];
+  for (const key of ["command", "path", "query", "url", "name", "title", "skill", "status"]) {
+    if (args[key] !== undefined) parts.push(`${key}=${valueText(args[key])}`);
+  }
+  return clipLine(parts.join(" ") || JSON.stringify(args), 180);
+}
+
+/** 把工具调用与随后的结果配成一条轨迹；对不上名字的结果单独成行，不静默丢。 */
+export function buildToolRuns(events: readonly ActivityEvent[], limit = 8): ToolRun[] {
+  const runs: ToolRun[] = [];
+  for (const event of events) {
+    const info = toolNameOf(event);
+    if (!info) continue;
+    if (!info.isResult) {
+      runs.push({
+        id: event.id,
+        name: info.name,
+        at: event.at,
+        args: formatToolArgs(info.name, event.detail),
+      });
+      continue;
+    }
+    let target: ToolRun | undefined;
+    for (let index = runs.length - 1; index >= 0; index -= 1) {
+      if (runs[index]?.name === info.name && runs[index]?.result === undefined) {
+        target = runs[index];
+        break;
+      }
+    }
+    const result = clipLine(event.detail ?? "", 180);
+    const ok = event.ok;
+    if (target) {
+      target.ok = ok;
+      target.result = result;
+      target.resultAt = event.at;
+    } else {
+      runs.push({
+        id: event.id,
+        name: info.name,
+        at: event.at,
+        args: "",
+        ...(ok !== undefined ? { ok } : {}),
+        result,
+      });
+    }
+  }
+  return runs.slice(-Math.max(1, limit));
+}
+
 function moodAndThought(
   member: Member,
   run: RunningView | undefined,
@@ -111,11 +248,10 @@ export function buildTraceActors(
   members: readonly Member[],
   activity: readonly ActivityEvent[],
   runs: Readonly<Record<string, RunningView>>,
-  trailLimit = 9,
+  toolLimit = 8,
 ): TraceActor[] {
   const actors = members.map((member) => {
     const mine = activity.filter((event) => event.memberId === member.id);
-    const trail = mine.slice(-trailLimit);
     const last = mine.at(-1);
     const run = runs[member.id];
     const { mood, thought } = moodAndThought(member, run, last);
@@ -126,7 +262,10 @@ export function buildTraceActors(
       mood,
       ...(run ? { startedAt: run.startedAt } : {}),
       thought,
-      trail,
+      toolRuns: buildToolRuns(mine, toolLimit),
+      milestones: mine
+        .filter((event) => event.kind !== "tool" && event.kind !== "tool-result")
+        .slice(-8),
       counts: {
         tool: mine.filter((event) => event.kind === "tool").length,
         message: mine.filter((event) => event.kind === "message" || event.kind === "final").length,

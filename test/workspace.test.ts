@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { PublicUser } from "../src/core/types";
 import { SkillLibrary } from "../src/skills/library";
-import { WorkspaceRegistry } from "../src/workspace/workspace";
+import { WorkspaceRegistry, type RoomFrame } from "../src/workspace/workspace";
 
 let dir: string;
 let skills: SkillLibrary;
@@ -55,6 +55,37 @@ describe("WorkspaceRegistry", () => {
     expect(bob.bus.listMessages(10)).toHaveLength(0);
     expect(alice.board.list()).toHaveLength(1);
     expect(bob.board.list()).toHaveLength(0);
+  });
+
+  it("房间事件带单调 seq，可按断点回放，滑出窗口时要求全量重拉", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    const frames: RoomFrame[] = [];
+    alice.subscribeRooms((frame) => frames.push(frame));
+
+    alice.bus.append({
+      senderId: "system",
+      senderName: "系统",
+      senderKind: "system",
+      kind: "system",
+      text: "第一条",
+    });
+    alice.board.create({ title: "回放测试任务", createdBy: "u_alice" });
+
+    expect(frames.length).toBeGreaterThanOrEqual(2);
+    const seqs = frames.map((frame) => frame.seq);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    expect(new Set(seqs).size).toBe(seqs.length);
+
+    const last = seqs.at(-1)!;
+    const replay = alice.replaySince(last - 1);
+    expect(replay.exact).toBe(true);
+    expect(replay.frames.map((frame) => frame.seq)).toEqual([last]);
+
+    // 已经追平：没有可补的帧，但仍然是连续状态。
+    expect(alice.replaySince(last)).toEqual({ frames: [], exact: true, latestSeq: last });
+
+    // 服务重启后 seq 回退：客户端手里的位置比服务端还新，必须重拉。
+    expect(alice.replaySince(last + 10).exact).toBe(false);
   });
 
   it("按模板创建成员：技能白名单只留可用的，档案文件写入模板设定", async () => {

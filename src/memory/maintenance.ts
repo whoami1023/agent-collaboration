@@ -245,6 +245,8 @@ function readPositiveInteger(args: Record<string, unknown>, key: string): number
 export function buildMaintenanceTools(options: MaintenanceToolOptions): ToolImpl[] {
   return [
     {
+      // compact=true 会改写召回账本，重跑会把本轮扫描再记一遍。
+      retry: "never",
       schema: {
         name: "maintenance_scan",
         description:

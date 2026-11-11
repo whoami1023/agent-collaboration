@@ -45,6 +45,22 @@ async function call(
   };
 }
 
+async function readSse(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  until: (text: string) => boolean,
+  label: string,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let text = "";
+  while (!until(text)) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    text += decoder.decode(chunk.value, { stream: true });
+  }
+  if (!until(text)) throw new Error(`SSE 未等到${label}，已收到：${text}`);
+  return text;
+}
+
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "ac-server-"));
   const auth = new AuthService(join(dir, "auth.json"));
@@ -803,6 +819,69 @@ describe("多用户 API", () => {
     const logout = await call("/api/auth/logout", { method: "POST", cookie });
     expect(logout.status).toBe(200);
     expect((await call("/api/auth/me", { cookie })).status).toBe(401);
+  });
+
+  it("SSE 断线后按 Last-Event-ID 补发，序号超前时要求全量重拉", async () => {
+    const setup = await call("/api/auth/setup", {
+      method: "POST",
+      body: { username: "owner", password: "secret123" },
+    });
+    const cookie = setup.cookie as string;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const live = await fetch(`${baseUrl}/api/events`, {
+        headers: { cookie },
+        signal: controller.signal,
+      });
+      expect(live.status).toBe(200);
+      const liveReader = live.body!.getReader();
+      const opened = await readSse(liveReader, (text) => text.includes(": connected"), "connected");
+      expect(opened).toContain("retry: 2000");
+
+      const created = await call("/api/tasks", {
+        method: "POST",
+        cookie,
+        body: { title: "断线重连期间的看板变更" },
+      });
+      expect(created.status).toBe(201);
+      const streamed = await readSse(
+        liveReader,
+        (text) => /^data: \{"seq":\d+.*\}\n\n$/m.test(text),
+        "带序号的房间事件",
+      );
+      const seq = Number(/^id: (\d+)$/m.exec(streamed)?.[1]);
+      expect(Number.isInteger(seq)).toBe(true);
+      expect(streamed).toContain(`"seq":${seq}`);
+      await liveReader.cancel();
+
+      const replayRes = await fetch(`${baseUrl}/api/events`, {
+        headers: { cookie, "last-event-id": String(seq - 1) },
+        signal: controller.signal,
+      });
+      const replayReader = replayRes.body!.getReader();
+      const replayed = await readSse(
+        replayReader,
+        (text) => text.includes(`id: ${seq}`) && text.includes(`"seq":${seq}`),
+        "补发的帧",
+      );
+      expect(replayed).toContain(`"seq":${seq}`);
+      expect(replayed).not.toContain("event: resync");
+      await replayReader.cancel();
+
+      const aheadRes = await fetch(`${baseUrl}/api/events`, {
+        headers: { cookie, "last-event-id": String(seq + 100000) },
+        signal: controller.signal,
+      });
+      const aheadReader = aheadRes.body!.getReader();
+      const ahead = await readSse(aheadReader, (text) => text.includes("event: resync"), "resync");
+      expect(ahead).toMatch(/"seq":\d+/);
+      await aheadReader.cancel();
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+    }
   });
 });
 

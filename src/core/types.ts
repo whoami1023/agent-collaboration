@@ -366,7 +366,31 @@ export type AgentEvent =
   | { type: "reasoning"; runId: string; memberId: string; text: string }
   | { type: "delta"; runId: string; memberId: string; text: string }
   | { type: "tool"; runId: string; memberId: string; name: string; args: Record<string, unknown> }
-  | { type: "tool-result"; runId: string; memberId: string; name: string; content: string; ok: boolean; code?: string }
+  | {
+      type: "tool-result";
+      runId: string;
+      memberId: string;
+      name: string;
+      content: string;
+      ok: boolean;
+      code?: string;
+      /** 这次调用在成功/最终失败前自动重试过几次。 */
+      retries?: number;
+    }
+  | {
+      /**
+       * 主运行下的子调用（顾问扇出、持续审计、学习复盘）。
+       * runId 是父运行；spanId 把 start/end 配成一对，执行轨迹据此分层。
+       */
+      type: "span";
+      runId: string;
+      memberId: string;
+      spanId: string;
+      name: string;
+      phase: "start" | "end";
+      ok?: boolean;
+      detail?: string;
+    }
   | { type: "run-final"; runId: string; memberId: string; text: string }
   | { type: "run-error"; runId: string; memberId: string; error: string }
   | {

@@ -35,6 +35,7 @@ import type { QuestionStore } from "../room/questions";
 import { scopeToolUnavailable } from "./run-scope";
 import { isPassText } from "../room/routing";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
+import type { LoadedRunJournal, RunJournalRecorder, RunJournalStore } from "./run-journal";
 
 export interface MemberUsageRecord {
   ref: string;
@@ -70,6 +71,8 @@ export interface RuntimeDeps {
   toolOutputs?: ToolOutputStore;
   /** 结构化提问：真正需要用户决定的点做成卡片，答案回来再唤醒本成员。 */
   questions?: QuestionStore;
+  /** 运行日志：进程中断后续跑；未提供时不做检查点。 */
+  journals?: RunJournalStore;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -77,6 +80,14 @@ export interface RuntimeDeps {
 
 function isAbort(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
+}
+
+export interface MemberRunOptions {
+  /** 编排器为该工作项预分配的运行 id；续跑时沿用上次的 id。 */
+  runId?: string;
+  workItemId?: string;
+  /** 上次中断的 runId：存在可用日志时从断点继续，而不是重跑整轮。 */
+  resumeRunId?: string;
 }
 
 export class MemberRuntime {
@@ -117,7 +128,7 @@ export class MemberRuntime {
     return true;
   }
 
-  async run(trigger: RoomMessage): Promise<void> {
+  async run(trigger: RoomMessage, options: MemberRunOptions = {}): Promise<void> {
     if (this.running) {
       this.steer(trigger);
       return;
@@ -126,7 +137,8 @@ export class MemberRuntime {
     try {
       let current = trigger;
       for (let round = 0; round < 3; round += 1) {
-        await this.runOnce(current);
+        // 运行日志只覆盖第一回合：后续回合是「运行中又收到消息」的追加轮，各自独立。
+        await this.runOnce(current, round === 0 ? options : {});
         if (this.pending.length === 0 || this.member.status === "cancelled") break;
         const drained = this.pending.splice(0, this.pending.length);
         current = {
@@ -142,10 +154,13 @@ export class MemberRuntime {
     }
   }
 
-  private async runOnce(trigger: RoomMessage): Promise<void> {
+  private async runOnce(trigger: RoomMessage, runOptions: MemberRunOptions = {}): Promise<void> {
     const { bus, board } = this.deps;
     const limits = this.deps.getLimits();
-    const runId = newId("run");
+    const runId = runOptions.runId ?? newId("run");
+    const loaded = runOptions.resumeRunId ? this.deps.journals?.load(runOptions.resumeRunId) : null;
+    const resume =
+      loaded && !loaded.done && loaded.memberId === this.member.id ? loaded : undefined;
     const controller = new AbortController();
     this.controller = controller;
     /** 区分「跑满整轮超时」与「用户手动取消」：前者要给出可继续的恢复入口。 */
@@ -158,6 +173,15 @@ export class MemberRuntime {
 
     this.setStatus("running");
     this.emit({ type: "run-start", runId, memberId: this.member.id });
+
+    /** 运行日志：每一步已完成的回合与工具结果都落盘，进程中断后据此续跑。 */
+    let journal: RunJournalRecorder | null = null;
+    let journalFinished = false;
+    const finishJournal = (terminal: Parameters<RunJournalRecorder["finish"]>[0]): void => {
+      if (!journal || journalFinished) return;
+      journalFinished = true;
+      journal.finish(terminal);
+    };
 
     // 运行中止或报错时也要把已产生的 token 用量入账，所以记账函数声明在 try 外。
     let flushUsage: () => void = () => {};
@@ -243,9 +267,10 @@ export class MemberRuntime {
         nowMs: Date.now(),
       });
       // Lane-1 触发召回（移植 active-memory）：在主模型请求前跑，失败即不注入（fail-open）。
+      // 续跑时上下文取自日志里模型真正看过的那一份，不再重新召回/扇出，避免重复花销与重复注入。
       let recallContext: string | undefined;
       let recalledHits: TriggerRecallHit[] = [];
-      if (this.deps.memory) {
+      if (!resume && this.deps.memory) {
         const recall = await resolveTriggerRecall({
           manager: this.deps.memory,
           message: trigger.text,
@@ -267,17 +292,19 @@ export class MemberRuntime {
       }
       const windowMessages = bus.window(limits.maxRoomWindowChars);
       const window = formatRoomWindow(windowMessages);
-      const messages: LlmMessage[] = [
-        {
-          role: "user",
-          content:
-            `${recallContext ? `${recallContext}\n\n` : ""}` +
-            `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(member, trigger, bus.roomMode, bus.roomRouting)}`,
-        },
-      ];
+      const messages: LlmMessage[] = resume
+        ? [...resume.initialMessages]
+        : [
+            {
+              role: "user",
+              content:
+                `${recallContext ? `${recallContext}\n\n` : ""}` +
+                `${window ? `群聊最近记录：\n${window}\n\n` : ""}${buildInstruction(member, trigger, bus.roomMode, bus.roomRouting)}`,
+            },
+          ];
       // 顾问扇出（Hermes 的 MoA 群聊版）：动手之前先请几位在册成员出建议。
       // 建议块作为**独立的一条用户消息**进本轮上下文，系统提示词一个字节都不动，前缀缓存照旧命中。
-      const guidance = await this.collectAdvice(member, trigger, windowMessages, controller);
+      const guidance = resume ? undefined : await this.collectAdvice(member, trigger, windowMessages, controller, runId);
       if (guidance) messages.push({ role: "user", content: guidance });
       const transport = resolveModelRuntime(
         member.modelRef,
@@ -346,6 +373,42 @@ export class MemberRuntime {
         query: trigger.text,
       });
 
+      // 每次工具调用重试了几次：终局事件要把它带进执行轨迹。
+      const retryCounts = new Map<string, number>();
+
+      // 运行日志：刚开始就写一份初始快照，进程在任何一步中断都能从这里接着恢复。
+      journal = this.deps.journals?.start({
+        roomId: bus.roomId,
+        runId,
+        memberId: this.member.id,
+        initialMessages: messages,
+        ...(runOptions.workItemId ? { workItemId: runOptions.workItemId } : {}),
+        ...(resume ? { resumeFrom: resume } : {}),
+      }) ?? null;
+      if (resume) {
+        const retryable = resume.pendingCalls.filter((call) => {
+          const tool = tools.find((candidate) => candidate.schema.name === call.name);
+          return tool !== undefined && (tool.retry === "safe" || tool.retry === "idempotent");
+        }).length;
+        const unknown = resume.pendingCalls.length - retryable;
+        const detail =
+          `已恢复 ${resume.steps} 步、跳过 ${resume.summary.replayedTools} 个已完成工具调用` +
+          (resume.pendingCalls.length > 0
+            ? `；重跑 ${retryable} 个只读/幂等调用，${unknown} 个副作用调用结果未知`
+            : "");
+        this.notice(`@${this.member.name} 从上次中断处继续：${detail}`);
+        this.emit({
+          type: "span",
+          runId,
+          memberId: this.member.id,
+          spanId: newId("span"),
+          name: "断点续跑",
+          phase: "end",
+          ok: true,
+          detail,
+        });
+      }
+
       const result = await runAgentLoop({
         provider: transport.provider,
         model: transport.model.id,
@@ -354,6 +417,16 @@ export class MemberRuntime {
         system,
         messages,
         tools,
+        ...(journal ? { journal } : {}),
+        ...(resume
+          ? {
+              resume: {
+                messages: resume.messages,
+                pendingCalls: resume.pendingCalls,
+                steps: resume.steps,
+              },
+            }
+          : {}),
         ...(runScope ? { toolUnavailable: (name: string) => scopeToolUnavailable(runScope, name) } : {}),
         maxSteps: limits.maxStepsPerRun,
         signal: controller.signal,
@@ -397,7 +470,12 @@ export class MemberRuntime {
           usedTools.add(call.name);
           this.emit({ type: "tool", runId, memberId: this.member.id, name: call.name, args: call.args });
         },
-        onToolResult: (call, content, status) =>
+        onToolRetry: (info) => {
+          retryCounts.set(info.callId, info.attempt);
+        },
+        onToolResult: (call, content, status) => {
+          const retries = retryCounts.get(call.id);
+          retryCounts.delete(call.id);
           this.emit({
             type: "tool-result",
             runId,
@@ -406,7 +484,9 @@ export class MemberRuntime {
             content,
             ok: status.ok,
             ...(status.code ? { code: status.code } : {}),
-          }),
+            ...(retries ? { retries } : {}),
+          });
+        },
         onRepair: ({ toolNames }) =>
           this.notice(`@${this.member.name} 的文本式工具调用已被修复执行：${toolNames.join("、")}`),
         pullPending: () => this.pending.splice(0, this.pending.length),
@@ -418,11 +498,18 @@ export class MemberRuntime {
       // 运行期间成员被移除：不再以已移除成员的身份往群里发言。
       if (!bus.getMember(this.member.id)) {
         this.emit({ type: "run-aborted", runId, memberId: this.member.id, reason: "removed" });
+        finishJournal({ status: "aborted", reason: "removed" });
         return;
       }
 
       if (result.error) {
         this.emit({ type: "run-error", runId, memberId: this.member.id, error: result.error });
+        finishJournal({
+          status: "error",
+          error: result.error,
+          ...(result.errorCode ? { code: result.errorCode } : {}),
+          steps: result.steps,
+        });
         this.notice(
           `@${this.member.name} 运行中止：${result.error}`,
           result.errorCode === "max_steps_reached" ? this.resumeHint(trigger) : undefined,
@@ -430,6 +517,13 @@ export class MemberRuntime {
         this.setStatus("error");
         return;
       }
+      finishJournal({
+        status: "ok",
+        text: result.text,
+        steps: result.steps,
+        ...(result.maxStepsReached ? { maxStepsReached: true } : {}),
+        ...(result.truncated ? { truncated: true } : {}),
+      });
 
       // 定时任务的静默交付（OpenClaw 的 NO_REPLY）：整条回复只是静默标记时群里不发这条消息，
       // 但终局事件仍带原文，让 CronService 照常记账。
@@ -504,20 +598,52 @@ export class MemberRuntime {
       // 回 pass 的这一轮没有交付，不值得复盘。
       const learning = this.deps.learning;
       if (learning && result.text && !passed) {
-        void learning.afterRun({
-          memberId: this.member.id,
-          memberName: member.name,
-          memberRole: member.role,
-          modelRef: member.modelRef,
-          roomId: bus.roomId,
-          roomName: bus.roomName,
+        const spanId = newId("span");
+        this.emit({
+          type: "span",
           runId,
-          triggerText: trigger.text,
-          finalText: result.text,
-          toolNames: [...usedTools],
-          transcript: window,
-          unattended: trigger.senderId === CRON_SENDER_ID,
+          memberId: this.member.id,
+          spanId,
+          name: "学习复盘",
+          phase: "start",
         });
+        void learning
+          .afterRun({
+            memberId: this.member.id,
+            memberName: member.name,
+            memberRole: member.role,
+            modelRef: member.modelRef,
+            roomId: bus.roomId,
+            roomName: bus.roomName,
+            runId,
+            triggerText: trigger.text,
+            finalText: result.text,
+            toolNames: [...usedTools],
+            transcript: window,
+            unattended: trigger.senderId === CRON_SENDER_ID,
+          })
+          .then(
+            () =>
+              this.emit({
+                type: "span",
+                runId,
+                memberId: this.member.id,
+                spanId,
+                name: "学习复盘",
+                phase: "end",
+                ok: true,
+              }),
+            () =>
+              this.emit({
+                type: "span",
+                runId,
+                memberId: this.member.id,
+                spanId,
+                name: "学习复盘",
+                phase: "end",
+                ok: false,
+              }),
+          );
       }
     } catch (err) {
       if (isAbort(err)) {
@@ -525,6 +651,10 @@ export class MemberRuntime {
           type: "run-aborted",
           runId,
           memberId: this.member.id,
+          reason: timedOut ? "timeout" : this.silentAbort ? "silent" : "cancelled",
+        });
+        finishJournal({
+          status: "aborted",
           reason: timedOut ? "timeout" : this.silentAbort ? "silent" : "cancelled",
         });
         if (this.silentAbort) {
@@ -546,9 +676,12 @@ export class MemberRuntime {
       }
       const detail = err instanceof Error ? err.message : String(err);
       this.emit({ type: "run-error", runId, memberId: this.member.id, error: detail });
+      finishJournal({ status: "error", error: detail });
       this.notice(`@${this.member.name} 运行失败：${detail}`);
       this.setStatus("error");
     } finally {
+      // 任何未显式收尾的退出都按「中断」记账：日志保持可续跑，而不是伪装成成功。
+      finishJournal({ status: "aborted", reason: "interrupted" });
       flushReasoning(true);
       flushUsage();
       clearTimeout(timeout);
@@ -566,12 +699,24 @@ export class MemberRuntime {
     trigger: RoomMessage,
     window: RoomMessage[],
     controller: AbortController,
+    runId: string,
   ): Promise<string | undefined> {
     const service = this.deps.advisors;
     if (!service) return undefined;
-    let outcome;
+    // 顾问是主运行下的子调用：执行轨迹里要能看出它何时开始、是否产出。
+    const spanId = newId("span");
+    this.emit({
+      type: "span",
+      runId,
+      memberId: member.id,
+      spanId,
+      name: "顾问扇出",
+      phase: "start",
+    });
+    let note: string | undefined;
+    let ok = false;
     try {
-      outcome = await service.run({
+      const outcome = await service.run({
         acting: member,
         members: this.deps.bus.listMembers(),
         messages: window,
@@ -581,12 +726,25 @@ export class MemberRuntime {
         getModelDeps: this.deps.getModelDeps,
         signal: controller.signal,
       });
+      ok = Boolean(outcome.guidance);
+      note = outcome.note;
+      // 已经被取消的这一轮不必再补一句参谋说明。
+      if (outcome.note && !controller.signal.aborted) this.notice(`顾问扇出：${outcome.note}`);
+      return outcome.guidance;
     } catch {
       return undefined;
+    } finally {
+      this.emit({
+        type: "span",
+        runId,
+        memberId: member.id,
+        spanId,
+        name: "顾问扇出",
+        phase: "end",
+        ok,
+        ...(note ? { detail: note } : {}),
+      });
     }
-    // 已经被取消的这一轮不必再补一句参谋说明。
-    if (outcome.note && !controller.signal.aborted) this.notice(`顾问扇出：${outcome.note}`);
-    return outcome.guidance;
   }
 
   private setStatus(status: Member["status"]): void {

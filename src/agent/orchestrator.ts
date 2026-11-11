@@ -29,6 +29,7 @@ import type { MemorySearchManager } from "../memory/manager";
 import type { RecallLedger } from "../memory/recall-ledger";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import type { ToolOutputStore } from "./content/offload";
+import type { RunJournalStore } from "./run-journal";
 import { MemberRuntime } from "./member-runtime";
 import { AdvisorService } from "./advisors/service";
 import type { LearningHost } from "./learning/types";
@@ -67,6 +68,8 @@ export interface OrchestratorDeps {
   workQueue?: WorkQueue;
   /** 结构化提问：成员把需要用户决定的点做成卡片，答案回来再唤醒它。 */
   questions?: QuestionStore;
+  /** 运行日志：进程中断后按断点续跑；不传时每次唤醒都从头开始。 */
+  journals?: RunJournalStore;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -314,6 +317,44 @@ export class Orchestrator {
       text: `取人方式已改为「${ROOM_ROUTING_LABELS[routing]}」：${ROUTING_SWITCH_NOTICES[routing]}`,
     });
     return routing;
+  }
+
+  /**
+   * 时间旅行：从某条运行的检查点另起一轮。保留检查点之前的完整历史，换一条新指令继续；
+   * 原运行日志不删不改，新分支有自己的 runId 与队列行。
+   */
+  forkFromCheckpoint(
+    sourceRunId: string,
+    step: number,
+    instruction: string,
+  ): { runId: string; messageId: string } {
+    const journals = this.deps.journals;
+    if (!journals) throw new Error("运行日志未接入，暂时不能从检查点继续");
+    const source = journals.load(sourceRunId);
+    if (!source) throw new Error("找不到这条运行日志，可能已被清理");
+    const member = this.deps.bus.getMember(source.memberId);
+    if (!member || member.status === "cancelled") {
+      throw new Error("原运行所属成员已不在房间里，无法从检查点继续");
+    }
+    if (this.runtimeFor(member).isRunning) {
+      throw new Error(`@${member.name} 正在运行，等这一轮结束后再从检查点继续`);
+    }
+    if (!Number.isFinite(step) || step < 0) throw new Error("检查点步数不合法");
+    const note = instruction.trim();
+    if (!note) throw new Error("请写清楚从检查点继续后要做什么");
+    const forked = journals.fork(sourceRunId, step, note);
+    if (!forked) throw new Error("创建分支日志失败，请稍后重试");
+    // 用系统消息承载入口，避免这条消息再触发一次普通分流；分支历史里已经有用户指令。
+    const message = this.deps.bus.append({
+      senderId: SYSTEM_ID,
+      senderName: "时间旅行",
+      senderKind: "system",
+      kind: "system",
+      text: `@${member.name}：从第 ${forked.steps} 步的检查点另起一轮。${note}`,
+      depthTurn: 0,
+    });
+    this.wake(member.id, message, undefined, forked.runId);
+    return { runId: forked.runId, messageId: message.id };
   }
 
   /** 清空聊天记录前中止所有在跑的成员：静默取消，且丢弃它们排队中的 steer。 */
@@ -637,7 +678,12 @@ export class Orchestrator {
     this.collectorDue = null;
   }
 
-  private wake(memberId: string, trigger: RoomMessage, steerNote?: string): void {
+  private wake(
+    memberId: string,
+    trigger: RoomMessage,
+    steerNote?: string,
+    resumeRunId?: string,
+  ): void {
     const member = this.deps.bus.getMember(memberId);
     if (!member || member.status === "cancelled") return;
     const key = `${trigger.id}:${memberId}`;
@@ -657,6 +703,8 @@ export class Orchestrator {
     });
     // 同一条触发消息已经在队列里：这条唤醒是重复的，不再开一轮。
     if (!item) return;
+    // 时间旅行：先挂上分支日志，再排运行；runWorkItem 会把它当作断点续跑。
+    if (resumeRunId) this.workQueue.attachRun(item.id, resumeRunId);
     this.scheduleWorkItem(runtime, member.id, trigger, item.id);
   }
 
@@ -702,8 +750,21 @@ export class Orchestrator {
         observed.terminal = { status: "aborted", ...(run.reason ? { reason: run.reason } : {}) };
       }
     });
+    // 断点续跑：上次中断的运行日志还在且没有终局，就沿用它，把已完成的调用原样放回上下文。
+    const prior = this.workQueue.get(itemId);
+    const loaded =
+      prior?.runId && this.deps.journals
+        ? this.deps.journals.load(prior.runId)
+        : null;
+    const resumeRunId = loaded && !loaded.done ? prior?.runId : undefined;
+    const runId = resumeRunId ?? newId("run");
+    this.workQueue.attachRun(itemId, runId);
     try {
-      await runtime.run(trigger);
+      await runtime.run(trigger, {
+        runId,
+        workItemId: itemId,
+        ...(resumeRunId ? { resumeRunId } : {}),
+      });
     } catch (err) {
       observed.terminal = { status: "error", error: err instanceof Error ? err.message : String(err) };
     } finally {
@@ -849,6 +910,7 @@ export class Orchestrator {
         ...(deps.recallLedger ? { recallLedger: deps.recallLedger } : {}),
         ...(deps.toolOutputs ? { toolOutputs: deps.toolOutputs } : {}),
         ...(deps.questions ? { questions: deps.questions } : {}),
+        ...(deps.journals ? { journals: deps.journals } : {}),
         advisors: this.advisors,
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });

@@ -21,6 +21,39 @@ function message(overrides: Partial<RoomMessage> = {}): RoomMessage {
 }
 
 describe("ActivityStore", () => {
+  it("子调用 span 执行轨迹里可见，带上成败", () => {
+    const store = new ActivityStore("room_test");
+    const start = store.recordRunEvent(
+      {
+        type: "span",
+        runId: "run_1",
+        memberId: "m_main",
+        spanId: "span_1",
+        name: "持续审计",
+        phase: "start",
+      },
+      "主智能体",
+    );
+    const end = store.recordRunEvent(
+      {
+        type: "span",
+        runId: "run_1",
+        memberId: "m_main",
+        spanId: "span_1",
+        name: "持续审计",
+        phase: "end",
+        ok: true,
+        detail: "结论：pass",
+      },
+      "主智能体",
+    );
+    expect(start?.kind).toBe("span");
+    expect(start?.title).toBe("持续审计 开始");
+    expect(end?.title).toBe("持续审计 完成");
+    expect(end?.ok).toBe(true);
+    expect(end?.detail).toContain("pass");
+  });
+
   it("记录用户与成员消息，系统提示跳过，同一消息不重复", () => {
     const changes: string[] = [];
     const store = new ActivityStore("room_test", { onChange: (event) => changes.push(event.id) });

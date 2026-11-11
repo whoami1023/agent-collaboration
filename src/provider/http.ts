@@ -13,13 +13,16 @@ export class ProviderHttpError extends Error {
   }
 }
 
-export async function* readSseLines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+export async function* readSseLines(
+  body: ReadableStream<Uint8Array>,
+  options: ReadSseOptions = {},
+): AsyncGenerator<string> {
   const decoder = new TextDecoder();
   let buffer = "";
   const reader = body.getReader();
   try {
     for (;;) {
-      const { value, done } = await reader.read();
+      const { value, done } = await readChunk(reader, options.idleMs);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let newline = buffer.indexOf("\n");
@@ -33,6 +36,45 @@ export async function* readSseLines(body: ReadableStream<Uint8Array>): AsyncGene
     if (buffer.trim()) yield buffer.replace(/\r$/, "");
   } finally {
     reader.releaseLock();
+  }
+}
+
+/** 连续这么久一个字节都没收到就判定上游挂死：总请求超时管不住「连接还在、数据不来」。 */
+export const DEFAULT_STREAM_IDLE_MS = 180_000;
+
+export class ProviderStreamIdleError extends Error {
+  constructor(readonly idleMs: number) {
+    super(
+      `模型流式响应超过 ${Math.round(idleMs / 1000)} 秒没有收到任何新数据，已中止这次请求；` +
+        "请检查网络或供应商状态后重试。",
+    );
+    this.name = "ProviderStreamIdleError";
+  }
+}
+
+/** 空闲窗口可覆盖：探针和测试需要更短的等待，正常对话用默认值。 */
+export interface ReadSseOptions {
+  idleMs?: number;
+}
+
+async function readChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  idleMs = DEFAULT_STREAM_IDLE_MS,
+): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>> {
+  if (!(idleMs > 0) || !Number.isFinite(idleMs)) return reader.read();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const idle = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      // 先让竞速以超时结束；再取消读流，把挂起的 read 结算掉并断开底层连接。
+      reject(new ProviderStreamIdleError(idleMs));
+      void reader.cancel().catch(() => {});
+    }, idleMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([reader.read(), idle]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

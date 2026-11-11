@@ -50,6 +50,16 @@ export interface AuditServiceDeps {
   /** 升级：只提醒用户，不再自动催办。 */
   requestEscalation(record: AuditRecord): void;
   onRecord?(record: AuditRecord): void;
+  /** 审计是主运行之后的独立模型调用：执行轨迹把它挂回父运行。 */
+  onSpan?(span: {
+    runId: string;
+    memberId: string;
+    spanId: string;
+    name: string;
+    phase: "start" | "end";
+    ok?: boolean;
+    detail?: string;
+  }): void;
   now?(): number;
   /** 测试注入：替换真实模型补全。 */
   complete?(prompt: { system: string; user: string }, signal: AbortSignal): Promise<{
@@ -139,32 +149,60 @@ export class AuditService implements AuditHost {
       });
       if (this.deps.store.hasState(task.id, hash)) return;
 
-      const completion = await this.complete(
-        buildAuditPrompt({
-          taskTitle: task.title,
-          taskDetail: task.detail,
-          acceptance: task.acceptance ?? "",
-          taskStatus: task.status,
-          memberName: member.name,
-          messages: evidence.messages.map((message) => ({
-            senderName: message.senderName,
-            text: message.text,
-          })),
-          activities: evidence.activities.map((activity) => ({
-            time: clock(activity.at),
-            kind: activity.kind,
-            title: activity.title,
-            ...(activity.detail ? { detail: activity.detail } : {}),
-          })),
-          files: evidence.files,
-        }),
-      );
-      if (!completion) return;
+      const runId = input.runId;
+      const spanId = newId("span");
+      const emitSpan = (phase: "start" | "end", ok?: boolean, detail?: string) => {
+        if (!runId) return;
+        this.deps.onSpan?.({
+          runId,
+          memberId: member.id,
+          spanId,
+          name: "持续审计",
+          phase,
+          ...(ok === undefined ? {} : { ok }),
+          ...(detail ? { detail } : {}),
+        });
+      };
+      emitSpan("start");
+      let completion: { text: string; usage?: UsageTotals; modelRef?: string } | null;
+      try {
+        completion = await this.complete(
+          buildAuditPrompt({
+            taskTitle: task.title,
+            taskDetail: task.detail,
+            acceptance: task.acceptance ?? "",
+            taskStatus: task.status,
+            memberName: member.name,
+            messages: evidence.messages.map((message) => ({
+              senderName: message.senderName,
+              text: message.text,
+            })),
+            activities: evidence.activities.map((activity) => ({
+              time: clock(activity.at),
+              kind: activity.kind,
+              title: activity.title,
+              ...(activity.detail ? { detail: activity.detail } : {}),
+            })),
+            files: evidence.files,
+          }),
+        );
+      } catch (err) {
+        emitSpan("end", false, err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+      if (!completion) {
+        emitSpan("end", false, "审计模型没有返回可用结果");
+        return;
+      }
       const criteria = parseAuditResponse(completion.text, task.acceptance ?? "");
-      if (!criteria) return;
+      if (!criteria) {
+        emitSpan("end", false, "审计结论无法解析");
+        return;
+      }
 
       const summary = summarizeCriteria(criteria);
       const verdict = overallVerdict(summary);
+      emitSpan("end", true, `结论：${verdict}`);
       const solved = verdict === "pass";
       const at = this.now();
       const previous = this.deps.store.stateOf(task.id) ?? {

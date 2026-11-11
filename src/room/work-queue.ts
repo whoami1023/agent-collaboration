@@ -61,6 +61,8 @@ export interface WorkItem {
   attempts: number;
   /** 进程中断后恢复的次数；超过上限不再自动续跑，避免崩溃循环。 */
   recoveries: number;
+  /** 本次义务最近一次运行的 runId：续跑时用它找到运行日志，不重跑已完成的调用。 */
+  runId?: string;
   claimedAt?: number;
   finishedAt?: number;
   outcome?: WorkItemOutcome;
@@ -241,6 +243,17 @@ export class WorkQueue {
     return item;
   }
 
+  /** 把运行日志的 id 挂到义务行上；状态不变，但必须落盘，重启后才能找到断点。 */
+  attachRun(id: string, runId: string): WorkItem | null {
+    const item = this.get(id);
+    if (!item || !isActive(item.state)) return null;
+    if (item.runId === runId) return item;
+    item.runId = runId;
+    item.updatedAt = this.now();
+    this.onChange();
+    return item;
+  }
+
   complete(id: string, text: string): WorkItem | null {
     const item = this.get(id);
     if (!item || item.state !== "in_progress") return null;
@@ -390,6 +403,7 @@ export class WorkQueue {
       state: state as WorkItemState,
       attempts: typeof raw["attempts"] === "number" ? Math.max(0, raw["attempts"]) : 0,
       recoveries: typeof raw["recoveries"] === "number" ? Math.max(0, raw["recoveries"]) : 0,
+      ...(typeof raw["runId"] === "string" ? { runId: raw["runId"] } : {}),
       ...(typeof raw["claimedAt"] === "number" ? { claimedAt: raw["claimedAt"] } : {}),
       ...(typeof raw["finishedAt"] === "number" ? { finishedAt: raw["finishedAt"] } : {}),
       ...(outcome ? { outcome } : {}),

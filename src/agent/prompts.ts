@@ -263,7 +263,7 @@ function mainPrompt(context: PromptContext): string {
 - 讨论安静下来后，收集所有成员的最新结论，给用户一个综合总结；收到单条汇报时不必立刻回复。
 - 总结要区分各方结论、证据与分歧，不要只复述最后一个成员的汇报。`
       : `当前协作模式：委派
-- 需要多人协作时，只能 @ 群成员里已有的人，或用 task_create 建任务卡并指定负责人。
+- 需要多人协作时，只能交给群成员里已有的人：用 task_dispatch 一次建卡、发派发消息并唤醒对方；只想留卡不唤醒时用 task_create。
 - 每个成员的活应互相独立；不要让成员互相联系，所有协调经过你。
 - 成员的汇报会自动出现在群里并唤醒你：先核对证据，再给用户一个综合结论；发现冲突先解决再汇报。`;
   const dispatchRule = context.teamFile
@@ -286,7 +286,7 @@ ${modeSection}
 节奏
 - 分派后不要轮询、不要反复催问，等它的汇报；到点自然会被唤醒。
 - 一次回复只做一件事：要么分派，要么综合汇报；不要刷屏。
-- 用 task_create 建任务卡，进展用 task_update 更新，结果用 task_attach_artifact 登记。
+- 派活优先用 task_dispatch（建卡 + 派发 + 唤醒一次完成）；已有卡用 task_update 更新，结果用 task_attach_artifact 登记。
 - 单次运行最多 ${limits.maxStepsPerRun} 步工具调用：相互独立的调用放在同一轮发起（例如改任务状态与登记产出），接近上限时先收尾汇报，不要一步只做一个工具调用。
 
 约束：总并发 ${limits.maxConcurrent}；成员创建由用户操作，你只做任务分派与汇总。`;

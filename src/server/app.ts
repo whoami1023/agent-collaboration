@@ -44,7 +44,7 @@ import { summaryOf } from "../archive/session-archive";
 import { buildRichPreview } from "../files/rich-preview";
 import { RoomError, roomIdFromQuery } from "../room/registry";
 import { ROOM_ROUTING_MODES, isRoomRoutingMode } from "../core/types";
-import type { RoomInstance, Workspace, WorkspaceRegistry } from "../workspace/workspace";
+import type { RoomFrame, RoomInstance, Workspace, WorkspaceRegistry } from "../workspace/workspace";
 import type { RoomInfo } from "../core/types";
 
 export interface AppDeps {
@@ -652,6 +652,46 @@ export function createApp(deps: AppDeps): express.Express {
     });
   });
 
+  // 时间旅行：列出房间最近的运行日志、某条运行的检查点，并从检查点另起一轮。
+  app.get("/api/runs", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    res.json({ roomId: scope.room.descriptor.id, runs: scope.room.journals.listRuns() });
+  });
+
+  app.get("/api/runs/:runId/checkpoints", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    const runId = String(req.params["runId"] ?? "");
+    if (!scope.room.journals.has(runId)) {
+      res.status(404).json({ error: "找不到这条运行日志，可能已被清理" });
+      return;
+    }
+    res.json({ runId, checkpoints: scope.room.journals.checkpoints(runId) });
+  });
+
+  app.post("/api/runs/:runId/fork", async (req: Request, res: Response) => {
+    const scope = await roomScope(req, res);
+    if (!scope) return;
+    const runId = String(req.params["runId"] ?? "");
+    const step = bodyOf(req)["step"];
+    const instruction = bodyOf(req)["instruction"];
+    if (typeof step !== "number" || !Number.isFinite(step) || step < 0) {
+      res.status(400).json({ error: "step 必须是不小于 0 的数字" });
+      return;
+    }
+    if (typeof instruction !== "string" || instruction.trim() === "") {
+      res.status(400).json({ error: "请写清楚从检查点继续后要做什么" });
+      return;
+    }
+    try {
+      const result = scope.room.orchestrator.forkFromCheckpoint(runId, step, instruction);
+      res.status(201).json({ ...result, roomId: scope.room.descriptor.id });
+    } catch (err) {
+      res.status(400).json({ error: errorMessage(err) });
+    }
+  });
+
   // 房间列表：作战室排在最前，其后是「群聊区」里自建的每间群聊。
   app.get("/api/rooms", async (_req: Request, res: Response) => {
     const workspace = await workspaceFor(res);
@@ -772,12 +812,25 @@ export function createApp(deps: AppDeps): express.Express {
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
+    res.write("retry: 2000\n\n");
     res.write(": connected\n\n");
-    // 每帧都带上 roomId：一个连接要同时喂作战室和「群聊区」里的所有群，
+    // 每帧都带上 seq 与 roomId：一个连接要同时喂作战室和「群聊区」里的所有群，
     // 前端按当前房间过滤，别的房间靠它来刷新群聊列表上的人数与消息数。
-    const send = (roomId: string, event: unknown) => {
-      res.write(`data: ${JSON.stringify({ roomId, event })}\n\n`);
+    const send = (frame: RoomFrame) => {
+      res.write(
+        `id: ${frame.seq}\ndata: ${JSON.stringify({ seq: frame.seq, roomId: frame.roomId, event: frame.event })}\n\n`,
+      );
     };
+    // 浏览器重连会带 Last-Event-ID；能补就逐帧补，补不了就让前端重拉状态。
+    // 补发与订阅之间没有 await，所以不会漏事件或重复帧。
+    const rawLastId = req.headers["last-event-id"];
+    const lastId = typeof rawLastId === "string" && rawLastId.trim() ? Number(rawLastId) : NaN;
+    const replay = workspace.replaySince(Number.isFinite(lastId) ? lastId : undefined);
+    if (!replay.exact) {
+      res.write(`event: resync\ndata: ${JSON.stringify({ seq: replay.latestSeq })}\n\n`);
+    } else {
+      for (const frame of replay.frames) send(frame);
+    }
     const unsubscribeRooms = workspace.subscribeRooms(send);
     const open = streams.get(user.id) ?? new Set<Response>();
     open.add(res);

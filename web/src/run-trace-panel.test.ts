@@ -57,6 +57,7 @@ describe("运行轨迹面板", () => {
           m_main: { startedAt: Date.now(), text: "", reasoning: "", tools: ["file_write"] },
         },
         roomName: "老板的作战室",
+        roomId: "room_main",
         onClose: () => undefined,
       }),
     );
@@ -68,6 +69,8 @@ describe("运行轨迹面板", () => {
     expect(markup).toContain("trace-fig-root working");
     expect(markup).toContain("trace-fig-arm working");
     expect(markup).toContain("轨迹带");
+    expect(markup).toContain("工具轨迹");
+    expect(markup).toContain("file_write");
     expect(markup).toContain("交付完成");
     expect(markup).toContain("工具 1 · 发言 1");
   });
@@ -79,6 +82,7 @@ describe("运行轨迹面板", () => {
         activity: activity(),
         runs: {},
         roomName: "作战室",
+        roomId: "room_main",
         onClose: () => undefined,
       }),
     );
@@ -91,6 +95,7 @@ describe("运行轨迹面板", () => {
         activity: [],
         runs: {},
         roomName: "作战室",
+        roomId: "room_main",
         onClose: () => undefined,
       }),
     );

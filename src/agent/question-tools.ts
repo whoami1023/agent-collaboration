@@ -30,6 +30,8 @@ function readString(args: Record<string, unknown>, key: string): string | undefi
 export function buildQuestionTools(deps: QuestionToolDeps): ToolImpl[] {
   return [
     {
+      // 重复提问会在房间里生成重复的问题卡。
+      retry: "never",
       schema: {
         name: "ask_user",
         description:

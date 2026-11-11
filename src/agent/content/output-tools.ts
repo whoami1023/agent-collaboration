@@ -32,6 +32,7 @@ function readLine(args: Record<string, unknown>, key: string): number | undefine
 export function buildOutputTools(deps: OutputToolDeps): ToolImpl[] {
   return [
     {
+      retry: "safe",
       schema: {
         name: "output_search",
         description:
@@ -101,6 +102,7 @@ export function buildOutputTools(deps: OutputToolDeps): ToolImpl[] {
       },
     },
     {
+      retry: "safe",
       schema: {
         name: "output_read",
         description:

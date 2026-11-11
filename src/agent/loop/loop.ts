@@ -19,6 +19,7 @@ import { ToolGuardrails } from "./guardrails";
 import {
   ToolFailure,
   classifyToolResult,
+  toolErrorIsRetriable,
   toolErrorText,
   type ToolResultStatus,
 } from "../tool-errors";
@@ -29,11 +30,26 @@ import {
   stripPlainTextToolCallBlocks,
   type PlainTextToolCallNameMatcher,
 } from "./tool-call-repair";
+import type { RunJournalRecorder } from "../run-journal";
+
+/**
+ * 工具失败后的自动重试策略。
+ *
+ * - `"safe"`：只读、可安全重跑（检索、读取、联网查询）。
+ * - `"idempotent"`：重复执行结果一致（覆盖写、幂等更新）。
+ * - `"never"`：有副作用或不可重复执行（追加写、跑命令、改任务、提问）。
+ *
+ * 缺省是 `"never"`：新工具必须显式声明才能获得重试。宁可少重试，
+ * 也不能让写文件、跑命令这类调用在异常后退避重跑一遍。
+ */
+export type ToolRetryMode = "safe" | "idempotent" | "never";
 
 export interface ToolImpl {
   schema: ToolSchema;
   /** 必须独占执行（与同一批其它工具串行）的工具。 */
   executionMode?: "sequential";
+  /** 失败自动重试策略；未声明视为 `"never"`。 */
+  retry?: ToolRetryMode;
   execute(args: Record<string, unknown>, signal: AbortSignal): Promise<string>;
 }
 
@@ -42,6 +58,18 @@ export interface LoopRetryConfig {
   minDelayMs?: number;
   maxDelayMs?: number;
   jitter?: number | "full";
+}
+
+/**
+ * 断点续跑状态：上一次进程已经完成的消息，以及最后一批没有结果的调用。
+ *
+ * 已完成的 assistant / tool 消息原样放回上下文，不重新请求模型；
+ * 只有 `pendingCalls` 需要处理——只读/幂等工具重新执行，有副作用的调用只标注「结果未知」。
+ */
+export interface LoopResumeState {
+  messages: LlmMessage[];
+  pendingCalls: ToolCall[];
+  steps: number;
 }
 
 /** 每次请求都要带上的模型设置（已由分层参数合并算出）。 */
@@ -82,6 +110,15 @@ export interface LoopOptions {
   onDelta?: (text: string) => void;
   onToolCall?: (call: ToolCall) => void;
   onToolResult?: (call: ToolCall, result: string, status: ToolResultStatus) => void;
+  /** 工具失败后准备发起下一次尝试时触发；用于在运行轨迹里标出重试。 */
+  onToolRetry?: (info: {
+    callId: string;
+    name: string;
+    /** 刚刚失败的尝试序号（1 表示第一次失败，接下来是第 2 次尝试）。 */
+    attempt: number;
+    delayMs: number;
+    error: string;
+  }) => void;
   /** 模型以文本形式输出工具调用、被修复为原生调用时触发。 */
   onRepair?: (info: { toolNames: string[] }) => void;
   /** 拉取排队中的 steering 消息；每个检查点调用一次并清空。 */
@@ -108,6 +145,10 @@ export interface LoopOptions {
       | { kind: "compacted"; tokensBefore: number; replacedMessages: number; qualityDegraded: boolean }
       | { kind: "bounded"; omittedMessages: number },
   ) => void;
+  /** 运行日志：记录已完成的回合与工具结果，进程中断后据此续跑。 */
+  journal?: RunJournalRecorder;
+  /** 续跑状态；不传则从空上下文开始。 */
+  resume?: LoopResumeState;
 }
 
 /** 压缩后召回的合成消息标记：识别、去重与替换旧块都靠它。 */
@@ -162,6 +203,20 @@ interface StreamedResponse {
 
 function isAbort(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
+}
+
+/**
+ * 单次工具调用是否允许自动重试：工具本身声明可重试，且错误属于瞬时故障。
+ *
+ * 结构化 `ToolFailure` 按错误目录判定：`invalid_argument` / `permission_denied`
+ * 这类确定性失败再试多少次都一样；`rate_limited` / `unavailable` / `tool_exception`
+ * 才值得退避重试。中止与用户取消永远不重试。
+ */
+function toolRetryAllowed(tool: ToolImpl, err: unknown, signal: AbortSignal): boolean {
+  if ((tool.retry ?? "never") === "never") return false;
+  if (signal.aborted || isAbort(err)) return false;
+  if (err instanceof ToolFailure) return toolErrorIsRetriable(err.code);
+  return true;
 }
 
 function throwIfAborted(signal: AbortSignal): void {
@@ -262,7 +317,48 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   /** 上一次召回的签名（压缩摘要长度 + 用户问题），用来判断是不是新的一轮。 */
   let recallSignature = "";
 
-  for (let step = 0; step < options.maxSteps; step += 1) {
+  // 断点续跑：先把上次已完成的消息放回上下文，再逐个处理最后一批没结果的调用。
+  // 只读/幂等调用可以安全重跑；有副作用的调用绝不自动重跑，只给模型一个「结果未知」的结果行。
+  const resume = options.resume;
+  if (resume && resume.messages.length > 0) {
+    messages.push(...resume.messages);
+  }
+  if (resume) {
+    for (const call of resume.pendingCalls) {
+      throwIfAborted(options.signal);
+      const tool = options.tools.find((candidate) => candidate.schema.name === call.name);
+      const retryable = tool !== undefined && (tool.retry === "safe" || tool.retry === "idempotent");
+      if (retryable) {
+        options.onToolCall?.(call);
+        const outcome = await executeOne(
+          options,
+          messages,
+          call,
+          tool,
+          retryOptions,
+          guardrails,
+          Math.max(0, resume.steps - 1),
+        );
+        options.onToolResult?.(call, outcome.content, outcome.status);
+      } else {
+        const content =
+          `上次运行在工具 ${call.name} 执行途中中断，无法确认这次调用是否已经生效。` +
+          `为避免重复副作用，本轮没有自动重跑。请先检查实际结果（文件、任务状态、命令输出），` +
+          `确认需要时再重新发起；如果已生效，请基于现状继续。`;
+        messages.push({ role: "tool", toolCallId: call.id, content });
+        options.onToolResult?.(call, content, { ok: false, code: "unknown_after_restart" });
+        options.journal?.toolResult(
+          Math.max(0, resume.steps - 1),
+          call,
+          content,
+          { ok: false, code: "unknown_after_restart" },
+        );
+      }
+    }
+  }
+  const startStep = resume?.steps ?? 0;
+
+  for (let step = startStep; step < options.maxSteps; step += 1) {
     throwIfAborted(options.signal);
 
     // 步数预警：默认预算只有 24 步，剩最后几步时提醒模型优先交付，别被硬切在探索中间。
@@ -414,11 +510,17 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     // 纯正文才续写。截断处补的 assistant 行不带 tool_calls，配对约束因此不受影响。
     if (streamed.truncated) {
       if (calls.length > 0) {
-        if (visibleText) messages.push({ role: "assistant", content: visibleText });
+        if (visibleText) {
+          messages.push({ role: "assistant", content: visibleText });
+          options.journal?.assistant(step, visibleText, []);
+        }
         messages.push({ role: "user", content: TRUNCATED_TOOL_CALL_NOTICE });
         continue;
       }
-      if (visibleText) messages.push({ role: "assistant", content: visibleText });
+      if (visibleText) {
+        messages.push({ role: "assistant", content: visibleText });
+        options.journal?.assistant(step, visibleText, []);
+      }
       if (continuations >= MAX_OUTPUT_CONTINUATIONS) {
         return { text: text.trim(), steps: step + 1, cancelled: false, truncated: true };
       }
@@ -432,6 +534,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       content: visibleText,
       ...(calls.length > 0 ? { toolCalls: calls } : {}),
     });
+    options.journal?.assistant(step, visibleText, calls);
 
     if (calls.length === 0) {
       // 静默停止守卫（Hermes turn_finalizer）：停在裸工具行上没有正文，等于群里一次空回复。
@@ -468,7 +571,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       };
     }
 
-    const halt = await executeToolBatch(options, messages, calls, retryOptions, guardrails);
+    const halt = await executeToolBatch(options, messages, calls, retryOptions, guardrails, step);
     if (halt) {
       return { text: text.trim(), steps: step + 1, cancelled: false, error: halt, errorCode: "guardrail_halt" };
     }
@@ -610,14 +713,20 @@ async function executeToolBatch(
   calls: ToolCall[],
   retryOptions: RetryOptions,
   guardrails: ToolGuardrails,
+  step: number,
 ): Promise<string | undefined> {
   const batchVerdict = guardrails.beforeBatch(
     calls.map((call) => ({ name: call.name, args: call.args })),
   );
   if (batchVerdict.action !== "allow") {
     // 整批不执行，但每个 tool_call 仍要有结果行；拒绝理由逐条回填，护栏自己的拦截不计入失败。
+    const status: ToolResultStatus = {
+      ok: false,
+      code: batchVerdict.action === "halt" ? "guardrail_halt" : "guardrail_block",
+    };
     for (const call of calls) {
       messages.push({ role: "tool", toolCallId: call.id, content: batchVerdict.reason });
+      options.journal?.toolResult(step, call, batchVerdict.reason, status);
       guardrails.recordRefusal();
     }
     return batchVerdict.action === "halt" ? batchVerdict.reason : undefined;
@@ -643,18 +752,24 @@ async function executeToolBatch(
           const call = resolved[remaining]?.call;
           if (!call) continue;
           messages.push({ role: "tool", toolCallId: call.id, content: MISSING_TOOL_RESULT });
+          options.journal?.toolResult(step, call, MISSING_TOOL_RESULT, {
+            ok: false,
+            code: "tool_failed",
+          });
         }
         messages.push(...pending);
         break;
       }
       const entry = resolved[index]!;
       options.onToolCall?.(entry.call);
-      const outcome = await executeOne(options, messages, entry.call, entry.tool, retryOptions, guardrails);
+      const outcome = await executeOne(options, messages, entry.call, entry.tool, retryOptions, guardrails, step);
       if (outcome.halt) {
         for (let remaining = index + 1; remaining < resolved.length; remaining += 1) {
           const call = resolved[remaining]?.call;
           if (!call) continue;
-          messages.push({ role: "tool", toolCallId: call.id, content: `未执行：${outcome.halt}` });
+          const content = `未执行：${outcome.halt}`;
+          messages.push({ role: "tool", toolCallId: call.id, content });
+          options.journal?.toolResult(step, call, content, { ok: false, code: "guardrail_halt" });
         }
         return outcome.halt;
       }
@@ -667,7 +782,7 @@ async function executeToolBatch(
     options.onToolCall?.(entry.call);
   }
   const outcomes = await Promise.all(
-    resolved.map((entry) => executeOne(options, messages, entry.call, entry.tool, retryOptions, guardrails)),
+    resolved.map((entry) => executeOne(options, messages, entry.call, entry.tool, retryOptions, guardrails, step)),
   );
   for (let index = 0; index < resolved.length; index += 1) {
     const entry = resolved[index];
@@ -692,20 +807,25 @@ async function executeOne(
   tool: ToolImpl | undefined,
   retryOptions: RetryOptions,
   guardrails: ToolGuardrails,
+  step: number,
 ): Promise<CallOutcome> {
   const verdict = guardrails.beforeCall(call.name, call.args);
   if (verdict.action !== "allow") {
     if (verdict.action === "halt") {
       messages.push({ role: "tool", toolCallId: call.id, content: `未执行：${verdict.reason}` });
+      const status: ToolResultStatus = { ok: false, code: "guardrail_halt" };
+      options.journal?.toolResult(step, call, verdict.reason, status);
       return {
         content: verdict.reason,
-        status: { ok: false, code: "guardrail_halt" },
+        status,
         halt: verdict.reason,
       };
     }
     messages.push({ role: "tool", toolCallId: call.id, content: verdict.reason });
+    const status: ToolResultStatus = { ok: false, code: "guardrail_block" };
+    options.journal?.toolResult(step, call, verdict.reason, status);
     guardrails.recordRefusal();
-    return { content: verdict.reason, status: { ok: false, code: "guardrail_block" } };
+    return { content: verdict.reason, status };
   }
 
   let raw: string;
@@ -719,7 +839,25 @@ async function executeOne(
     guardrails.recordRefusal();
   } else {
     try {
-      raw = await retryAsync(() => tool.execute(call.args, options.signal), retryOptions);
+      // 全局重试配置只提供退避参数；是否重试由「工具声明 + 错误分类」决定。
+      const callRetryOptions: RetryOptions = {
+        ...retryOptions,
+        shouldRetry: (err, attempt) =>
+          (retryOptions.shouldRetry?.(err, attempt) ?? true) &&
+          toolRetryAllowed(tool, err, options.signal),
+        onRetry: (info) =>
+          options.onToolRetry?.({
+            callId: call.id,
+            name: call.name,
+            attempt: info.attempt,
+            delayMs: info.delayMs,
+            error: info.err instanceof Error ? info.err.message : String(info.err),
+          }),
+      };
+      raw = await retryAsync(
+        () => tool.execute(call.args, options.signal),
+        callRetryOptions,
+      );
       status = classifyToolResult(raw);
     } catch (err) {
       if (err instanceof ToolFailure) {
@@ -735,5 +873,6 @@ async function executeOne(
   const observed = guardrails.observe(call.name, call.args, transformed, { refused });
   const content = observed.note ? `${observed.content}\n\n${observed.note}` : observed.content;
   messages.push({ role: "tool", toolCallId: call.id, content });
+  options.journal?.toolResult(step, call, content, status);
   return { content, status, ...(observed.halt ? { halt: observed.halt } : {}) };
 }

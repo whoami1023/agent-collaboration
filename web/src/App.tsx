@@ -991,7 +991,11 @@ function RoomView({
         }
         return current;
       });
-    }, checkSession);
+    }, checkSession, () => {
+      // 服务端回放缓冲接不上：直接重拉当前房间与房间列表，别让界面停在半截状态。
+      void reloadSession();
+      void refreshRooms();
+    });
     return () => {
       alive = false;
       unsubscribe();
@@ -2938,6 +2942,7 @@ function RoomView({
             activity={activity}
             runs={runs}
             roomName={state?.room.name ?? ""}
+            roomId={state?.room.id ?? activeRoom()}
             onClose={() => setTraceOpen(false)}
           />
         </aside>

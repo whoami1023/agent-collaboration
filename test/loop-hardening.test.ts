@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { fillMissingToolResults, runAgentLoop, type ToolImpl } from "../src/agent/loop";
+import { ToolFailure } from "../src/agent/tool-errors";
 import type { LlmMessage } from "../src/provider/types";
 import { MockProvider, type MockHandler } from "../src/provider/mock";
 
@@ -200,6 +201,7 @@ describe("agent loop hardening", () => {
   it("工具抛错时按配置重试，最终返回失败信息", async () => {
     let attempts = 0;
     const flakyTool: ToolImpl = {
+      retry: "idempotent",
       schema: {
         name: "flaky",
         description: "会抛错",
@@ -223,6 +225,88 @@ describe("agent loop hardening", () => {
     expect(onToolResult).toHaveBeenCalledWith(
       expect.objectContaining({ name: "flaky" }),
       "成功",
+      expect.objectContaining({ ok: true }),
+    );
+  });
+
+  it("未声明可重试的工具失败后不重跑", async () => {
+    let attempts = 0;
+    const writeTool: ToolImpl = {
+      schema: {
+        name: "write_once",
+        description: "有副作用",
+        parameters: { type: "object", properties: {} },
+      },
+      execute: async () => {
+        attempts += 1;
+        throw new Error("写完才报错");
+      },
+    };
+    const handler: MockHandler = (request) => {
+      const steps = request.messages.filter((m) => m.role === "assistant").length;
+      if (steps === 0) return { toolCalls: [{ name: "write_once", args: {} }] };
+      return { text: "收到" };
+    };
+    const result = await run(handler, [writeTool]);
+    expect(result.text).toBe("收到");
+    expect(attempts).toBe(1);
+  });
+
+  it("声明可重试的工具遇到确定性错误不重试", async () => {
+    let attempts = 0;
+    const readTool: ToolImpl = {
+      retry: "safe",
+      schema: {
+        name: "read_safe",
+        description: "只读",
+        parameters: { type: "object", properties: {} },
+      },
+      execute: async () => {
+        attempts += 1;
+        throw new ToolFailure("invalid_argument", "path 不能为空");
+      },
+    };
+    const handler: MockHandler = (request) => {
+      const steps = request.messages.filter((m) => m.role === "assistant").length;
+      if (steps === 0) return { toolCalls: [{ name: "read_safe", args: {} }] };
+      return { text: "收到" };
+    };
+    const onToolRetry = vi.fn();
+    await run(handler, [readTool], { onToolRetry });
+    expect(attempts).toBe(1);
+    expect(onToolRetry).not.toHaveBeenCalled();
+  });
+
+  it("声明可重试的工具遇到瞬时错误会重试并记录次数", async () => {
+    let attempts = 0;
+    const readTool: ToolImpl = {
+      retry: "safe",
+      schema: {
+        name: "read_flaky",
+        description: "只读但暂时不可用",
+        parameters: { type: "object", properties: {} },
+      },
+      execute: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new ToolFailure("rate_limited", "上游限流");
+        return "读到了";
+      },
+    };
+    const handler: MockHandler = (request) => {
+      const steps = request.messages.filter((m) => m.role === "assistant").length;
+      if (steps === 0) return { toolCalls: [{ name: "read_flaky", args: {} }] };
+      return { text: "完成" };
+    };
+    const onToolRetry = vi.fn();
+    const onToolResult = vi.fn();
+    await run(handler, [readTool], { onToolRetry, onToolResult });
+    expect(attempts).toBe(2);
+    expect(onToolRetry).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "read_flaky", attempt: 1 }),
+    );
+    expect(onToolResult).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "read_flaky" }),
+      "读到了",
       expect.objectContaining({ ok: true }),
     );
   });

@@ -1,5 +1,6 @@
-import type { Member, RunScopeKind, TaskStatus } from "../core/types";
+import type { Member, RoomMessage, RunScopeKind, TaskStatus } from "../core/types";
 import type { RoomBus } from "../room/bus";
+import { decideWakes } from "../room/wake";
 import type { Workboard } from "../workboard/board";
 import type { SkillLibrary } from "../skills/library";
 import { selectSkillsForMember, isSkillSelected } from "../skills/selection";
@@ -101,6 +102,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
 
   // 成员只能由用户在左侧「新建成员」创建；运行中的智能体不再拥有创建子成员的通道。
   tools.push({
+    retry: "safe",
     schema: {
       name: "use_skill",
       description:
@@ -147,6 +149,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   });
 
   tools.push({
+    retry: "safe",
     schema: {
       name: "read_skill_file",
       description:
@@ -196,6 +199,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   });
 
   tools.push({
+    retry: "never",
     schema: {
       name: "task_create",
       description:
@@ -251,6 +255,120 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   });
 
   tools.push({
+    retry: "never",
+    schema: {
+      name: "task_dispatch",
+      description:
+        "把一件独立工作交给某个成员：一次调用同时创建任务卡、在群里发派发消息并唤醒对方。成员名必须是当前群成员；房间规则不允许的派发会被拒绝。",
+      parameters: {
+        type: "object",
+        properties: {
+          member: { type: "string", description: "负责人成员名（不带 @）" },
+          title: { type: "string", description: "任务标题" },
+          detail: {
+            type: "string",
+            description: "任务简报：背景、输入文件、约束与完成标准。成员看不到你的推理，这里要写全",
+          },
+          acceptance: {
+            type: "string",
+            description:
+              "可选：验收条款，一行一个可独立核对的事实，最多 300 字；写进任务卡后完成时会核验证据",
+          },
+          deps: { type: "array", items: { type: "string" }, description: "可选：依赖的任务 id" },
+        },
+        required: ["member", "title"],
+        additionalProperties: false,
+      },
+    },
+    execute: async (args) => {
+      const memberName = readString(args, "member");
+      const title = readString(args, "title");
+      if (!memberName) {
+        return toolFailureText("invalid_argument", "member 不能为空", {
+          next: "填负责人成员名（不带 @）后重试，或用 task_list 确认成员是否在册。",
+        });
+      }
+      if (!title) {
+        return toolFailureText("invalid_argument", "title 不能为空", {
+          next: "给任务卡一个一句话标题后重试。",
+        });
+      }
+      const target = deps.bus.findMemberByName(memberName);
+      if (!target) {
+        return toolFailureText("not_found", `群里没有成员 ${memberName}`, {
+          next: "从当前群成员里选一个已存在的负责人；不能创建新成员。",
+        });
+      }
+      if (target.id === member.id) {
+        return toolFailureText("invalid_argument", "不能把任务派给自己", {
+          next: "自己直接做，或派给另一个成员。",
+        });
+      }
+      if (target.status === "cancelled") {
+        return toolFailureText("not_found", `成员 @${target.name} 已停用，不能接任务`);
+      }
+      const acceptance = readString(args, "acceptance");
+      if (acceptance && acceptance.length > MAX_ACCEPTANCE_CHARS) {
+        return toolFailureText(
+          "invalid_argument",
+          `acceptance 最多 ${MAX_ACCEPTANCE_CHARS} 字；只保留能被逐条核对的验收客体，其余写进 detail`,
+          { next: "精简验收条款，把背景说明挪到 detail。" },
+        );
+      }
+      // 复用房间的唤醒规则：计划轮、成员越权互派等限制在这里一次性说清，避免「卡建了但没人被叫醒」。
+      const probe: RoomMessage = {
+        id: "dispatch_probe",
+        roomId: deps.bus.roomId,
+        seq: 0,
+        ts: Date.now(),
+        senderId: member.id,
+        senderName: member.name,
+        senderKind: "member",
+        kind: "chat",
+        text: "",
+        mentions: [target.id],
+        mentionsRaw: [target.name],
+        ...(deps.runScope ? { runScope: deps.runScope } : {}),
+      };
+      const { wakes, skipped } = decideWakes(probe, deps.bus.listMembers(), deps.bus.roomMode, {
+        routing: deps.bus.roomRouting,
+      });
+      if (!wakes.includes(target.id)) {
+        const reason = skipped.find((entry) => entry.memberId === target.id)?.reason ?? "当前房间规则不允许这次派发";
+        return toolFailureText("permission_denied", `不能派给 @${target.name}：${reason}`, {
+          next: "按房间规则的允许路径派活；被拒绝时任务卡与消息都不会创建。",
+        });
+      }
+      const detail = readString(args, "detail");
+      const task = deps.board.create({
+        title,
+        ...(detail ? { detail } : {}),
+        ...(acceptance ? { acceptance } : {}),
+        createdBy: member.id,
+        ownerId: target.id,
+        ...(readStringArray(args, "deps") ? { deps: readStringArray(args, "deps") } : {}),
+      });
+      const message = deps.bus.append({
+        senderId: member.id,
+        senderName: member.name,
+        senderKind: "member",
+        kind: "chat",
+        text: [
+          `@${target.name} 任务已派发：${title}`,
+          `任务卡：${task.id}`,
+          ...(detail ? [detail] : []),
+          ...(acceptance ? [`验收条款：${acceptance}`] : []),
+        ].join("\n"),
+        mentions: [target.id],
+        taskId: task.id,
+        ...(deps.runId ? { runId: deps.runId } : {}),
+      });
+      return `已派发任务 ${task.id} 给 @${target.name}（消息 ${message.id}），任务卡与派发消息都已落账，对方已被唤醒。`;
+    },
+  });
+
+  tools.push({
+    retry: "never",
     schema: {
       name: "task_update",
       description:
@@ -373,6 +491,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   });
 
   tools.push({
+    retry: "never",
     schema: {
       name: "task_attach_artifact",
       description: "把产出登记到任务卡的成果区（文件名、路径或摘要）。",
@@ -432,6 +551,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   });
 
   tools.push({
+    retry: "safe",
     schema: {
       name: "task_list",
       description:
@@ -482,6 +602,7 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   });
 
   tools.push({
+    retry: "safe",
     schema: {
       name: "room_history",
       description: "读取群聊最近的消息记录（当需要更早的上下文时使用）。",

@@ -17,6 +17,8 @@ import { SkillLibrary } from "../src/skills/library";
 import { WorkspaceFiles } from "../src/files/workspace-files";
 import { defaultSettings, type Settings } from "../src/core/settings";
 import { DEFAULT_LIMITS, type RoomMessage } from "../src/core/types";
+import { RunJournalStore } from "../src/agent/run-journal";
+import type { LlmMessage, ToolCall } from "../src/provider/types";
 
 const tempDirs: string[] = [];
 
@@ -190,6 +192,30 @@ describe("WorkQueue：状态机与持久化", () => {
     snapshot[0]!.state = "canceled";
     expect(queue.list().find((item) => item.id === snapshot[0]!.id)?.state).not.toBe("canceled");
   });
+
+  it("运行日志 id 只挂活跃行，随快照保留且可续跑", () => {
+    const queue = new WorkQueue("room_test");
+    const active = queue.enqueue({ memberId: "m_main", memberName: "主智能体", trigger: message() })!;
+    const done = queue.enqueue({
+      memberId: "m_main",
+      memberName: "主智能体",
+      trigger: message({ id: "msg_2", seq: 2 }),
+    })!;
+    queue.claim(done.id);
+    queue.complete(done.id, "已完成");
+
+    expect(queue.attachRun(active.id, "run_a")?.runId).toBe("run_a");
+    expect(queue.attachRun(active.id, "run_a")?.runId).toBe("run_a");
+    expect(queue.attachRun(done.id, "run_late")).toBeNull();
+    expect(queue.attachRun("work_missing", "run_x")).toBeNull();
+
+    const restored = new WorkQueue("room_test");
+    restored.hydrate(queue.snapshot());
+    expect(restored.get(active.id)?.runId).toBe("run_a");
+
+    // 续跑换新 id 时覆盖旧值，下一次中断按新日志找断点。
+    expect(queue.attachRun(active.id, "run_b")?.runId).toBe("run_b");
+  });
 });
 
 describe("编排器接入持久队列", () => {
@@ -331,6 +357,121 @@ describe("编排器接入持久队列", () => {
     await waitFor(() => queue.get(item.id)?.state === "done");
     expect(queue.get(item.id)?.attempts).toBe(2);
     expect(queue.get(item.id)?.outcome?.text).toBe("恢复完成");
+  });
+
+  it("重启续跑：已完成的调用不重跑，未确认的副作用调用明确提示", async () => {
+    const rig = await makeRig();
+    const journalDir = await mkdtemp(join(tmpdir(), "ac-workqueue-journal-"));
+    tempDirs.push(journalDir);
+    const journals = new RunJournalStore(journalDir);
+    const trigger = rig.bus.append({
+      senderId: "user",
+      senderName: "用户",
+      senderKind: "user",
+      kind: "chat",
+      text: "重启后继续",
+      depthTurn: 0,
+    });
+    const queue = new WorkQueue("room_test");
+    const item = queue.enqueue({ memberId: "m_main", memberName: "主智能体", trigger })!;
+
+    // 模拟上一进程：写完 a.txt 后、b.txt 的结果落盘前被杀。
+    const runId = "run_resume_e2e";
+    const doneCall: ToolCall = { id: "call_done", name: "file_write", args: { path: "a.txt" } };
+    const lostCall: ToolCall = { id: "call_lost", name: "file_write", args: { path: "b.txt" } };
+    const recorder = journals.start({
+      roomId: "room_test",
+      runId,
+      memberId: "m_main",
+      workItemId: item.id,
+      initialMessages: [{ role: "user", content: "重启后继续" }],
+    })!;
+    recorder.assistant(0, "", [doneCall]);
+    recorder.toolResult(0, doneCall, "已写入 a.txt", { ok: true });
+    recorder.assistant(1, "", [lostCall]);
+
+    queue.claim(item.id);
+    queue.attachRun(item.id, runId);
+    queue.recoverInterrupted();
+
+    const requests: LlmMessage[][] = [];
+    const orchestrator = new Orchestrator({
+      bus: rig.bus,
+      board: rig.board,
+      getSettings: () => rig.settings,
+      skills: rig.skills,
+      ownerId: "u_test",
+      files: rig.files,
+      workQueue: queue,
+      journals,
+      mockHandler: (request) => {
+        requests.push(request.messages);
+        return { text: "续跑完成" };
+      },
+    });
+    expect(orchestrator.resumeQueue()).toBe(1);
+    await waitFor(() => queue.get(item.id)?.state === "done");
+
+    // 续跑只多了一次模型调用；旧结果作为上下文送回，未确认调用被明确标注。
+    expect(requests).toHaveLength(1);
+    const contents = requests[0]!.map((entry) => `${entry.role}:${entry.content}`);
+    expect(contents).toContain("tool:已写入 a.txt");
+    expect(contents.some((entry) => entry.startsWith("tool:") && entry.includes("无法确认"))).toBe(true);
+    expect(queue.get(item.id)?.outcome?.text).toBe("续跑完成");
+    expect(journals.load(runId)?.done).toBe(true);
+  });
+
+  it("时间旅行：从检查点分叉只保留前缀历史，并接上新指令跑完", async () => {
+    const rig = await makeRig();
+    const journalDir = await mkdtemp(join(tmpdir(), "ac-workqueue-fork-"));
+    tempDirs.push(journalDir);
+    const journals = new RunJournalStore(journalDir);
+    const firstCall: ToolCall = { id: "call_1", name: "file_read", args: { path: "a.md" } };
+    const secondCall: ToolCall = { id: "call_2", name: "file_read", args: { path: "b.md" } };
+    const source = journals.start({
+      roomId: "room_test",
+      runId: "run_source",
+      memberId: "m_main",
+      initialMessages: [{ role: "user", content: "整理两份资料" }],
+    })!;
+    source.assistant(0, "", [firstCall]);
+    source.toolResult(0, firstCall, "第一份资料", { ok: true });
+    source.assistant(1, "", [secondCall]);
+    source.toolResult(1, secondCall, "第二份资料", { ok: true });
+    source.finish({ status: "ok", text: "整理完成", steps: 2 });
+
+    const queue = new WorkQueue("room_test");
+    const requests: LlmMessage[][] = [];
+    const orchestrator = new Orchestrator({
+      bus: rig.bus,
+      board: rig.board,
+      getSettings: () => rig.settings,
+      skills: rig.skills,
+      ownerId: "u_test",
+      files: rig.files,
+      workQueue: queue,
+      journals,
+      mockHandler: (request) => {
+        requests.push(request.messages);
+        return { text: "分支完成" };
+      },
+    });
+
+    const forked = orchestrator.forkFromCheckpoint("run_source", 1, "只用第一份资料重写");
+    expect(forked.runId).not.toBe("run_source");
+    await waitFor(() => queue.list().some((item) => item.state === "done"));
+
+    expect(requests).toHaveLength(1);
+    const sent = requests[0]!.map((message) => message.content).join("\n");
+    expect(sent).toContain("第一份资料");
+    expect(sent).toContain("只用第一份资料重写");
+    expect(sent).not.toContain("第二份资料");
+    expect(queue.list()[0]?.outcome?.text).toBe("分支完成");
+
+    // 新分支有自己的终局；源日志原样保留。
+    expect(journals.load(forked.runId)?.done).toBe(true);
+    expect(journals.load(forked.runId)?.steps).toBe(2);
+    expect(journals.load("run_source")?.terminal?.text).toBe("整理完成");
   });
 
   it("同一成员有多条待办时逐条恢复，后一条不会在前一条运行时被吞掉", async () => {

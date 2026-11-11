@@ -36,6 +36,7 @@ function messageOf(error: unknown): string {
 export function buildWebTools(options: WebToolOptions = {}): ToolImpl[] {
   return [
     {
+      retry: "safe",
       schema: {
         name: "web_search",
         description:
@@ -93,6 +94,7 @@ export function buildWebTools(options: WebToolOptions = {}): ToolImpl[] {
       },
     },
     {
+      retry: "safe",
       schema: {
         name: "web_fetch",
         description:

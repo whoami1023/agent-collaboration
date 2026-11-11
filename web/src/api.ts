@@ -911,6 +911,48 @@ export async function deleteArchive(id: string): Promise<string> {
   return body.removed;
 }
 
+/** 时间旅行：房间内可回看的运行日志与检查点。 */
+export interface RunJournalView {
+  runId: string;
+  memberId: string;
+  workItemId?: string;
+  createdAt: number;
+  updatedAt: number;
+  steps: number;
+  done: boolean;
+  status?: "ok" | "error" | "aborted";
+}
+
+export interface RunCheckpointView {
+  step: number;
+  text: string;
+  calls: string[];
+  toolResults: number;
+}
+
+export async function fetchRuns(roomId: string): Promise<RunJournalView[]> {
+  const body = await request<{ runs: RunJournalView[] }>(withRoom("/api/runs", roomId));
+  return body.runs;
+}
+
+export async function fetchRunCheckpoints(runId: string, roomId: string): Promise<RunCheckpointView[]> {
+  const body = await request<{ checkpoints: RunCheckpointView[] }>(
+    withRoom(`/api/runs/${encodeURIComponent(runId)}/checkpoints`, roomId),
+  );
+  return body.checkpoints;
+}
+
+export function forkRun(
+  runId: string,
+  input: { step: number; instruction: string },
+  roomId: string,
+): Promise<{ runId: string; messageId: string; roomId: string }> {
+  return request<{ runId: string; messageId: string; roomId: string }>(
+    withRoom(`/api/runs/${encodeURIComponent(runId)}/fork`, roomId),
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
 export async function cancelAllMembers(): Promise<number> {
   const body = await request<{ cancelled: number }>(withRoom("/api/members/cancel-all"), {
     method: "POST",
@@ -1299,6 +1341,8 @@ export async function setMemberModel(
 
 /** 一帧 SSE：事件本身 + 它来自哪间房。一个连接要喂作战室和「群聊区」里所有的群。 */
 export interface RoomFrame {
+  /** 服务端单调序号；重连时浏览器自动带 Last-Event-ID，服务端据此补发。 */
+  seq?: number;
   roomId: string;
   event: RoomEvent;
 }
@@ -1306,6 +1350,7 @@ export interface RoomFrame {
 export function subscribeEvents(
   onFrame: (frame: RoomFrame) => void,
   onError?: () => void,
+  onResync?: () => void,
 ): () => void {
   const source = new EventSource("/api/events");
   source.onmessage = (event) => {
@@ -1316,6 +1361,8 @@ export function subscribeEvents(
       // ignore malformed frames
     }
   };
+  // 断线太久（回放缓冲已滑出窗口）时服务端要求全量重拉，前端不能假装事件流还是连续的。
+  if (onResync) source.addEventListener("resync", () => onResync());
   if (onError) source.onerror = () => onError();
   return () => source.close();
 }

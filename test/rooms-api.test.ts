@@ -16,6 +16,7 @@ import { createApp } from "../src/server/app";
 
 let dir: string;
 let registry: WorkspaceRegistry;
+let auth: AuthService;
 let server: Server;
 let baseUrl: string;
 let cookie: string;
@@ -77,7 +78,7 @@ async function createPoolMember(name: string): Promise<Member> {
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "ac-roomsapi-"));
-  const auth = new AuthService(join(dir, "auth.json"));
+  auth = new AuthService(join(dir, "auth.json"));
   await auth.init();
   const skills = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
   await skills.init();
@@ -421,5 +422,79 @@ describe("群聊区 REST：账号隔离与 SSE", () => {
     expect(frames.some((frame) => frame.event?.type === "rooms-changed")).toBe(true);
 
     await reader.cancel();
+  });
+});
+
+describe("时间旅行 REST", () => {
+  it("列出运行、读取检查点，并从检查点分叉；非法输入在落任何状态前被拒", async () => {
+    const user = auth.listUsers()[0]!;
+    const workspace = await registry.get({ id: user.id, displayName: user.displayName });
+    const journals = workspace.room(MAIN_ROOM_ID).journals;
+    const recorder = journals.start({
+      roomId: MAIN_ROOM_ID,
+      runId: "run_api_source",
+      memberId: "m_main",
+      initialMessages: [{ role: "user", content: "原始任务" }],
+    })!;
+    const read: { id: string; name: string; args: Record<string, unknown> } = {
+      id: "call_api_1",
+      name: "file_read",
+      args: { path: "a.md" },
+    };
+    recorder.assistant(0, "", [read]);
+    recorder.toolResult(0, read, "资料一", { ok: true });
+    recorder.finish({ status: "ok", text: "完成", steps: 1 });
+
+    expect((await call("/api/runs")).status).toBe(401);
+    const runs = await call(`/api/runs${at(MAIN_ROOM_ID)}`, { auth: cookie });
+    expect(runs.status).toBe(200);
+    expect((runs.body["runs"] as Array<{ runId: string }>).map((run) => run.runId)).toContain(
+      "run_api_source",
+    );
+
+    const checkpoints = await call(`/api/runs/run_api_source/checkpoints${at(MAIN_ROOM_ID)}`, {
+      auth: cookie,
+    });
+    expect(checkpoints.status).toBe(200);
+    expect(
+      (checkpoints.body["checkpoints"] as Array<{ step: number }>).map((checkpoint) => checkpoint.step),
+    ).toEqual([0, 1]);
+    expect((await call(`/api/runs/run_missing/checkpoints${at(MAIN_ROOM_ID)}`, { auth: cookie })).status).toBe(
+      404,
+    );
+
+    const fork = await call(`/api/runs/run_api_source/fork${at(MAIN_ROOM_ID)}`, {
+      method: "POST",
+      auth: cookie,
+      body: { step: 1, instruction: "只用资料一重写" },
+    });
+    expect(fork.status).toBe(201);
+    expect(fork.body["runId"]).toMatch(/^run_/);
+    expect(fork.body["messageId"]).toMatch(/^msg_/);
+    const entry = workspace
+      .room(MAIN_ROOM_ID)
+      .bus.listMessages()
+      .find((message) => message.id === fork.body["messageId"]);
+    expect(entry?.text).toContain("只用资料一重写");
+    expect(journals.load(String(fork.body["runId"]))).not.toBeNull();
+
+    expect(
+      (
+        await call(`/api/runs/run_api_source/fork${at(MAIN_ROOM_ID)}`, {
+          method: "POST",
+          auth: cookie,
+          body: { step: -1, instruction: "坏的步数" },
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await call(`/api/runs/run_api_source/fork${at(MAIN_ROOM_ID)}`, {
+          method: "POST",
+          auth: cookie,
+          body: { step: 1, instruction: "   " },
+        })
+      ).status,
+    ).toBe(400);
   });
 });

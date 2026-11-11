@@ -14,6 +14,7 @@ export type ActivityKind =
   | "thinking"
   | "tool"
   | "tool-result"
+  | "span"
   | "final"
   | "error"
   | "aborted"
@@ -25,6 +26,7 @@ export const ACTIVITY_KINDS: readonly ActivityKind[] = [
   "thinking",
   "tool",
   "tool-result",
+  "span",
   "final",
   "error",
   "aborted",
@@ -279,7 +281,7 @@ export class ActivityStore {
     if (event.type === "tool") {
       let args = "";
       try {
-        args = clip(JSON.stringify(event.args), 220);
+        args = clip(JSON.stringify(event.args), 400);
       } catch {
         args = "";
       }
@@ -291,12 +293,23 @@ export class ActivityStore {
       };
     }
     if (event.type === "tool-result") {
+      const retried = event.retries && event.retries > 0 ? `（重试 ${event.retries} 次）` : "";
       return {
         ...base,
         kind: "tool-result",
-        title: `${event.name} ${event.ok ? "返回" : "报错"}`,
-        detail: clip(event.content),
+        title: `${event.name} ${event.ok ? "返回" : "报错"}${retried}`,
+        detail: clip(event.content, 400),
         ok: event.ok,
+      };
+    }
+    if (event.type === "span") {
+      const phase = event.phase === "start" ? "开始" : event.ok === false ? "失败" : "完成";
+      return {
+        ...base,
+        kind: "span",
+        title: `${event.name} ${phase}`,
+        ...(event.detail ? { detail: clip(event.detail) } : {}),
+        ...(event.phase === "end" ? { ok: event.ok !== false } : {}),
       };
     }
     if (event.type === "run-final") {

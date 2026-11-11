@@ -220,6 +220,8 @@ export function buildCronTools(deps: CronToolDeps): ToolImpl[] {
 
   return [
     {
+      // 创建/改期不是幂等的：异常后重跑会排出重复任务。
+      retry: "never",
       schema: {
         name: "cron",
         description:

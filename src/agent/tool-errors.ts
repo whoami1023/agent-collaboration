@@ -22,6 +22,7 @@ export const TOOL_ERROR_CATALOG = {
   tool_failed: { retriable: false, summary: "工具执行失败" },
   guardrail_block: { retriable: false, summary: "护栏拦截了这次调用" },
   guardrail_halt: { retriable: false, summary: "护栏中止了本轮运行" },
+  unknown_after_restart: { retriable: false, summary: "进程中断时该调用是否生效无法确认" },
 } as const;
 
 export type ToolErrorCode = keyof typeof TOOL_ERROR_CATALOG;

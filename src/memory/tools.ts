@@ -173,6 +173,7 @@ export function buildMemoryTools(
   const tools: ToolImpl[] = [];
 
   tools.push({
+    retry: "safe",
     schema: {
       name: "memory_search",
       description:
@@ -229,6 +230,7 @@ export function buildMemoryTools(
   });
 
   tools.push({
+    retry: "safe",
     schema: {
       name: "memory_get",
       description:
@@ -274,6 +276,8 @@ export function buildMemoryTools(
   });
 
   tools.push({
+    // 追加会在 MEMORY.md 里多写一条重复事实。
+    retry: "never",
     schema: {
       name: "memory_append",
       description:
@@ -337,6 +341,7 @@ export function buildMemoryTools(
   });
 
   tools.push({
+    retry: "never",
     schema: {
       name: "memory_retract",
       description:

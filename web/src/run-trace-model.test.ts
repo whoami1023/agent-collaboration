@@ -3,7 +3,9 @@ import type { Member } from "../../src/core/types";
 import type { ActivityEvent, RunningView } from "./activity-model";
 import {
   TRACE_ACCENTS,
+  buildToolRuns,
   buildTraceActors,
+  formatToolArgs,
   latestClause,
   traceAccentFor,
   traceLookFor,
@@ -78,7 +80,7 @@ describe("成员运行轨迹", () => {
     expect(actor?.mood).toBe("working");
     expect(actor?.thought).toBe("工具 · file_write");
     expect(actor?.startedAt).toBe(500);
-    expect(actor?.trail.map((item) => item.id)).toEqual(["old"]);
+    expect(actor?.milestones.map((item) => item.id)).toEqual(["old"]);
 
     const thinking = buildTraceActors(
       [main],
@@ -125,8 +127,56 @@ describe("成员运行轨迹", () => {
       }),
     );
     const [actor] = buildTraceActors([member("m_main")], activity, {}, 5);
-    expect(actor?.trail.map((item) => item.id)).toEqual(["e7", "e8", "e9", "e10", "e11"]);
+    expect(actor?.milestones.map((item) => item.id)).toEqual(["e1", "e3", "e5", "e7", "e9", "e11"]);
+    expect(actor?.toolRuns.map((run) => run.id)).toEqual(["e2", "e4", "e6", "e8", "e10"]);
     expect(actor?.counts).toEqual({ tool: 6, message: 5, error: 1 });
     expect(actor?.lastAt).toBe(11);
+  });
+});
+
+describe("工具轨迹", () => {
+  it("按工具名把调用与结果配对，命令行工具优先展示完整命令", () => {
+    const events: ActivityEvent[] = [
+      event({
+        id: "c1",
+        kind: "tool",
+        title: "调用 run_command",
+        detail: JSON.stringify({ command: "npm test", cwd: "files" }),
+        at: 1,
+      }),
+      event({ id: "r1", kind: "tool-result", title: "run_command 返回", detail: "12 passed", ok: true, at: 2 }),
+      event({
+        id: "c2",
+        kind: "tool",
+        title: "调用 file_write",
+        detail: JSON.stringify({ path: "report.md", append: true }),
+        at: 3,
+      }),
+      event({ id: "r2", kind: "tool-result", title: "file_write 报错", detail: "文件已存在", ok: false, at: 4 }),
+      event({ id: "r3", kind: "tool-result", title: "web_fetch 返回", detail: "孤立的返回", ok: true, at: 5 }),
+    ];
+    const runs = buildToolRuns(events);
+    expect(runs).toHaveLength(3);
+    expect(runs[0]).toMatchObject({
+      name: "run_command",
+      args: "$ npm test (cwd: files)",
+      ok: true,
+      result: "12 passed",
+    });
+    expect(runs[1]).toMatchObject({ name: "file_write", args: "report.md（追加）", ok: false });
+    expect(runs[2]).toMatchObject({ name: "web_fetch", args: "", ok: true, result: "孤立的返回" });
+  });
+
+  it("常见工具参数格式化成一眼能看懂的一行", () => {
+    expect(formatToolArgs("file_search", JSON.stringify({ query: "结论", path: "reports" }))).toBe(
+      "结论 @ reports",
+    );
+    expect(formatToolArgs("run_skill_script", JSON.stringify({ skill: "docx", args: ["a.md"] }))).toBe(
+      "▸ docx a.md",
+    );
+    expect(formatToolArgs("task_update", JSON.stringify({ task_id: "task_1", status: "done" }))).toBe(
+      "task_1 → done",
+    );
+    expect(formatToolArgs("unknown_tool", "not json")).toBe("not json");
   });
 });

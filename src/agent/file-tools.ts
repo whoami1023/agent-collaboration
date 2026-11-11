@@ -93,6 +93,7 @@ function fileFailure(err: unknown, action: "read" | "write"): string {
 export function buildFileTools(files: WorkspaceFiles, evidence?: EvidenceLedger): ToolImpl[] {
   return [
     {
+      retry: "safe",
       schema: {
         name: "file_list",
         description:
@@ -129,6 +130,7 @@ export function buildFileTools(files: WorkspaceFiles, evidence?: EvidenceLedger)
       },
     },
     {
+      retry: "safe",
       schema: {
         name: "file_read",
         description:
@@ -211,6 +213,7 @@ export function buildFileTools(files: WorkspaceFiles, evidence?: EvidenceLedger)
       },
     },
     {
+      retry: "safe",
       schema: {
         name: "file_search",
         description:
@@ -303,6 +306,8 @@ export function buildFileTools(files: WorkspaceFiles, evidence?: EvidenceLedger)
       },
     },
     {
+      // append 模式不是幂等的：异常后重跑会把同一段内容写两遍。
+      retry: "never",
       schema: {
         name: "file_write",
         description:

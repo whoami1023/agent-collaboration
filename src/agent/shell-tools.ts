@@ -307,6 +307,8 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
 
   return [
     {
+      // 命令可能有副作用，异常后重跑可能重复写文件、重复安装依赖。
+      retry: "never",
       schema: {
         name: "run_command",
         description:
@@ -380,6 +382,7 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
       },
     },
     {
+      retry: "never",
       schema: {
         name: "run_batch",
         description:
@@ -551,6 +554,7 @@ export function buildShellTools(deps: ShellToolDeps): ToolImpl[] {
       },
     },
     {
+      retry: "never",
       schema: {
         name: "run_skill_script",
         description:

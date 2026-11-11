@@ -33,6 +33,7 @@ const TOOL_CLASSES: Record<string, ToolClass> = {
   file_write: "mutating",
   memory_append: "mutating",
   task_create: "mutating",
+  task_dispatch: "mutating",
   task_update: "mutating",
   task_attach_artifact: "mutating",
   cron: "mutating",
