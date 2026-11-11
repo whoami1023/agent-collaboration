@@ -273,6 +273,69 @@ describe("WorkspaceRegistry", () => {
     expect(questions[0]?.questions).toHaveLength(2);
   });
 
+  it("执行轨迹随房间落盘，重载后消息与工具活动仍在，清会话后清空", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    const bus = alice.bus;
+    bus.append({
+      senderId: "user",
+      senderName: "用户",
+      senderKind: "user",
+      kind: "chat",
+      text: "做一次巡检",
+      depthTurn: 0,
+    });
+    bus.append({
+      senderId: "m_main",
+      senderName: "主智能体",
+      senderKind: "member",
+      kind: "announce",
+      text: "开始巡检",
+      depthTurn: 0,
+    });
+    bus.emit({
+      type: "run",
+      event: {
+        type: "reasoning",
+        runId: "run_x",
+        memberId: "m_main",
+        text: "先看目录结构，再决定巡检命令。",
+      },
+    });
+    bus.emit({
+      type: "run",
+      event: {
+        type: "tool",
+        runId: "run_x",
+        memberId: "m_main",
+        name: "run_command",
+        args: { command: "ls" },
+      },
+    });
+    bus.emit({
+      type: "run",
+      event: { type: "run-final", runId: "run_x", memberId: "m_main", text: "巡检完成" },
+    });
+    expect(alice.listActivity().some((event) => event.kind === "tool")).toBe(true);
+    await alice.close();
+
+    const skills2 = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await skills2.init();
+    const reloaded = new WorkspaceRegistry(dir, skills2);
+    registry = reloaded;
+    const restored = await reloaded.get({ id: "u_alice", displayName: "Alice" });
+    const activity = restored.listActivity();
+    expect(activity.some((event) => event.kind === "user")).toBe(true);
+    expect(activity.some((event) => event.kind === "message")).toBe(true);
+    expect(activity.some((event) => event.kind === "tool")).toBe(true);
+    expect(activity.some((event) => event.kind === "final")).toBe(true);
+    const thinking = activity.find((event) => event.kind === "thinking");
+    expect(thinking?.detail).toContain("目录结构");
+    expect(thinking?.runId).toBe("run_x");
+
+    await restored.clearRoomSession();
+    expect(restored.listActivity()).toHaveLength(0);
+  });
+
   it("首次加载即生成智能体档案文件，且不覆盖已有内容", async () => {
     const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
     const files = await alice.memory.listAgentFiles();

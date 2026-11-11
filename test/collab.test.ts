@@ -55,6 +55,23 @@ async function makeRig(
 }
 
 describe("group-chat collaboration", () => {
+  it("推理轨迹先于终局下发，终局后不再补发", async () => {
+    const handler: MockHandler = () => ({
+      reasoning: "先确认目标。再核对资料。最后给出结论。",
+      text: "完成",
+    });
+    const { bus, orchestrator } = await makeRig(handler);
+    const types: string[] = [];
+    bus.subscribe((event) => {
+      if (event.type === "run") types.push(event.event.type);
+    });
+    orchestrator.sendUserMessage("你好");
+    await waitFor(() => types.includes("run-final"));
+    const finalIndex = types.indexOf("run-final");
+    expect(types.slice(0, finalIndex)).toContain("reasoning");
+    expect(types.slice(finalIndex + 1)).not.toContain("reasoning");
+  });
+
   it("清空聊天记录后历史为空，seq 继续递增并广播 messages-cleared", () => {
     const bus = new RoomBus("room_test", "测试群");
     const events: string[] = [];

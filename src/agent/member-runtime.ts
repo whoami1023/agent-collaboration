@@ -166,6 +166,25 @@ export class MemberRuntime {
     // 交付闸门的证据台账：本轮真实写出/跑成的事实，续跑时从未完成的任务卡上重新装回。
     const evidence = new EvidenceLedger();
     evidence.seed(board.list());
+    /** 推理轨迹：只作为 run 事件展示与存档，绝不写回上下文。 */
+    let reasoningText = "";
+    let reasoningReported = 0;
+    let reasoningAt = 0;
+    const flushReasoning = (force = false): void => {
+      if (!reasoningText || reasoningText.length === reasoningReported) return;
+      const now = Date.now();
+      if (!force && reasoningText.length - reasoningReported < 600 && now - reasoningAt < 1200) {
+        return;
+      }
+      reasoningReported = reasoningText.length;
+      reasoningAt = now;
+      this.emit({
+        type: "reasoning",
+        runId,
+        memberId: this.member.id,
+        text: reasoningText.slice(0, 4_000),
+      });
+    };
 
     try {
       const taskTitles = new Map<string, string>();
@@ -370,6 +389,10 @@ export class MemberRuntime {
           }
         },
         onDelta: (text) => this.emit({ type: "delta", runId, memberId: this.member.id, text }),
+        onReasoningDelta: (delta) => {
+          reasoningText += delta;
+          flushReasoning();
+        },
         onToolCall: (call) => {
           usedTools.add(call.name);
           this.emit({ type: "tool", runId, memberId: this.member.id, name: call.name, args: call.args });
@@ -388,6 +411,9 @@ export class MemberRuntime {
           this.notice(`@${this.member.name} 的文本式工具调用已被修复执行：${toolNames.join("、")}`),
         pullPending: () => this.pending.splice(0, this.pending.length),
       });
+
+      // 推理轨迹先于终局事件收尾，执行轨迹里「思考」才会排在交付前面。
+      flushReasoning(true);
 
       // 运行期间成员被移除：不再以已移除成员的身份往群里发言。
       if (!bus.getMember(this.member.id)) {
@@ -523,6 +549,7 @@ export class MemberRuntime {
       this.notice(`@${this.member.name} 运行失败：${detail}`);
       this.setStatus("error");
     } finally {
+      flushReasoning(true);
       flushUsage();
       clearTimeout(timeout);
       this.controller = null;

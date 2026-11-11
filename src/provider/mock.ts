@@ -1,6 +1,8 @@
 import type { LlmEvent, LlmProvider, LlmRequest } from "./types";
 
 export interface MockTurn {
+  /** 推理模型的思考过程：只作为事件下发，不进入正文与上下文。 */
+  reasoning?: string;
   text?: string;
   toolCalls?: Array<{ name: string; args: Record<string, unknown> }>;
   /** 覆盖 done 事件的 stopReason：测截断续写时给 length / max_tokens。 */
@@ -31,6 +33,12 @@ export class MockProvider implements LlmProvider {
     if (request.signal?.aborted) throw abortError();
     const turn = await this.handler(request);
     this.callCounter += 1;
+    const reasoning = turn.reasoning ?? "";
+    for (let index = 0; index < reasoning.length; index += 6) {
+      if (request.signal?.aborted) throw abortError();
+      yield { type: "reasoning", delta: reasoning.slice(index, index + 6) };
+      await sleep(1);
+    }
     const text = turn.text ?? "";
     for (let index = 0; index < text.length; index += 6) {
       if (request.signal?.aborted) throw abortError();
@@ -116,6 +124,8 @@ export function demoHandler(): MockHandler {
       }
       if (steps === 0) {
         return {
+          reasoning:
+            "先拆解任务：确认要对比的框架范围与验收口径，建卡并把资料工作交给成员，最后汇总证据。",
           toolCalls: [
             {
               name: "task_create",
@@ -176,6 +186,8 @@ export function demoHandler(): MockHandler {
         }
       }
       return {
+        reasoning:
+          "对照任务卡的验收标准检查交付物：确认文件已落盘、证据完整，再把结论归纳成三段。",
         text:
           "**结论**：三种调度方式里，中心编排（orchestrator）+ 共享房间事件最稳；对等会话适合开放式讨论但不适合交付；纯事件总线弹性最好，调试成本最高。\n\n**证据**：对比了中心编排、对等会话、事件总线三类实现，均以「消息可回放 + 每次唤醒有记录」为验收标准。\n\n**未解决**：样本只覆盖 3 个框架，缺少长任务（>30 分钟）的压测数据。",
       };

@@ -39,6 +39,7 @@ export interface LlmRequest {
 }
 
 export type LlmEvent =
+  | { type: "reasoning"; delta: string }
   | { type: "text"; delta: string }
   | { type: "tool-calls"; calls: ToolCall[] }
   | { type: "usage"; usage: UsageTotals }

@@ -158,4 +158,32 @@ describe("agent loop", () => {
     expect(small.maxStepsReached).toBe(true);
     expect(turns.some((list) => list.some((c) => c.includes("步数预算只剩")))).toBe(false);
   });
+
+  it("推理增量通过回调逐段下发，不混入正文与工具结果", async () => {
+    const handler: MockHandler = (request) =>
+      request.tools.length > 0
+        ? {
+            reasoning: "先看环境，再决定调用哪个工具。",
+            text: "结论",
+            toolCalls: [{ name: "echo", args: { text: "hi" } }],
+          }
+        : { text: "完成" };
+    const deltas: string[] = [];
+    const texts: string[] = [];
+    const result = await runAgentLoop({
+      provider: new MockProvider(handler),
+      model: "mock",
+      system: "测试",
+      messages: [{ role: "user", content: "开始" }],
+      tools: [echoTool],
+      maxSteps: 1,
+      signal: new AbortController().signal,
+      onReasoningDelta: (delta) => deltas.push(delta),
+      onDelta: (delta) => texts.push(delta),
+    });
+    expect(deltas.join("")).toBe("先看环境，再决定调用哪个工具。");
+    expect(texts.join("")).toContain("结论");
+    expect(deltas.join("")).not.toContain("echo");
+    expect(result.text).toContain("完成");
+  });
 });

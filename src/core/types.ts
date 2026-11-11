@@ -1,6 +1,7 @@
 import type { CronJob, CronJobState, CronRunRecord } from "../cron/types";
 import type { LearningProposal, ReviewLog } from "../agent/learning/types";
 import type { QuestionItem } from "../room/questions";
+import type { ActivityEvent } from "../room/activity-log";
 
 export const USER_ID = "user";
 export const SYSTEM_ID = "system";
@@ -361,6 +362,7 @@ export interface SessionArchiveDetail extends SessionArchiveSummary {
 
 export type AgentEvent =
   | { type: "run-start"; runId: string; memberId: string }
+  | { type: "reasoning"; runId: string; memberId: string; text: string }
   | { type: "delta"; runId: string; memberId: string; text: string }
   | { type: "tool"; runId: string; memberId: string; name: string; args: Record<string, unknown> }
   | { type: "tool-result"; runId: string; memberId: string; name: string; content: string; ok: boolean; code?: string }
@@ -386,6 +388,7 @@ export type RoomEvent =
   | { type: "member-removed"; memberId: string }
   | { type: "task"; task: TaskCard }
   | { type: "question"; question: QuestionItem }
+  | { type: "activity"; event: ActivityEvent }
   | { type: "run"; event: AgentEvent }
   | { type: "model-usage"; usage: ModelUsageEvent }
   /** 一次后台复盘的产出：提案（可能为空）+ 流水，前端据此刷新「学习」面板。 */

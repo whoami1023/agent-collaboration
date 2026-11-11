@@ -28,6 +28,10 @@ interface OpenAiStreamChunk {
   choices?: Array<{
     delta?: {
       content?: string | null;
+      /** DeepSeek 等推理模型：思考过程单独下发，不属于正文。 */
+      reasoning_content?: string | null;
+      /** 部分 OpenAI 兼容实现用 reasoning 字段。 */
+      reasoning?: string | null;
       tool_calls?: OpenAiToolCallDelta[];
     };
     finish_reason?: string | null;
@@ -154,6 +158,10 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       if (parsedUsage && !isEmptyUsage(parsedUsage)) usage = parsedUsage;
       const choice = chunk.choices?.[0];
       if (!choice) continue;
+      const reasoning = choice.delta?.reasoning_content ?? choice.delta?.reasoning;
+      if (typeof reasoning === "string" && reasoning) {
+        yield { type: "reasoning", delta: reasoning };
+      }
       const content = choice.delta?.content;
       if (typeof content === "string" && content) yield { type: "text", delta: content };
       for (const delta of choice.delta?.tool_calls ?? []) {

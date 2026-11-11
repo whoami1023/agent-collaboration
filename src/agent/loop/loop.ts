@@ -75,6 +75,8 @@ export interface LoopOptions {
   ) => string | Promise<string>;
   /** 模型设置里合并出的请求参数（采样、请求头、超时、输出上限）。 */
   request?: LoopRequestOptions;
+  /** 推理模型的思考增量；只用于展示，不进入正文与上下文。 */
+  onReasoningDelta?: (delta: string) => void;
   /** 上游回流的 token 统计，每个模型调用一次（用于用量与成本记账）。 */
   onUsage?: (usage: UsageTotals) => void;
   onDelta?: (text: string) => void;
@@ -543,7 +545,9 @@ async function streamAgentResponse(
         ...(options.request?.maxTokens !== undefined ? { maxTokens: options.request.maxTokens } : {}),
         signal: streamController.signal,
       })) {
-        if (event.type === "text") {
+        if (event.type === "reasoning") {
+          options.onReasoningDelta?.(event.delta);
+        } else if (event.type === "text") {
           if (watch.feed(event.delta)) {
             repetitionStopped = true;
             streamController.abort(new Error("repetition detected"));

@@ -31,6 +31,7 @@ import {
   formatAnswerMessage,
   type QuestionItem,
 } from "../room/questions";
+import { ActivityStore, type ActivityEvent } from "../room/activity-log";
 import { ModelUsageStore } from "../model/usage-store";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
@@ -68,6 +69,8 @@ interface PersistedState {
   workQueue?: WorkItem[];
   /** 结构化提问：问题与逐题答案随房间保存，重启后仍能继续回答。 */
   questions?: QuestionItem[];
+  /** 执行轨迹：消息与工具活动随房间保存，刷新/重启后执行视图不丢。 */
+  activity?: ActivityEvent[];
 }
 
 /** v3 及更早的成员档案用 `providerId`，v4 统一为 `modelRef`（`provider/model` 或别名）。 */
@@ -113,6 +116,8 @@ export interface RoomInstance {
   workQueue: WorkQueue;
   /** 结构化提问：待答问题与答案，界面按 messageId 把卡片挂在提问消息下。 */
   questions: QuestionStore;
+  /** 执行轨迹：服务端统一记录，前端读快照与 SSE，不在本地推导工具活动。 */
+  activity: ActivityStore;
   /** 作战室落在 `state.json`，群聊落在 `rooms/<roomId>.json`。 */
   stateFile: string;
   saveTimer: NodeJS.Timeout | null;
@@ -370,6 +375,7 @@ export class Workspace {
     });
     workQueue.hydrate(persisted?.workQueue);
     // 上次进程结束前还在跑的义务回到 pending；待编排器建好后再决定续跑还是放弃。
+    const interrupted = workQueue.list().filter((item) => item.state === "in_progress");
     workQueue.recoverInterrupted();
     const questions = new QuestionStore(descriptor.id, {
       onChange: (question) => {
@@ -378,6 +384,25 @@ export class Workspace {
       },
     });
     questions.hydrate(persisted?.questions);
+    const activity = new ActivityStore(descriptor.id, {
+      onChange: (event) => {
+        this.scheduleSave(descriptor.id);
+        for (const listener of [...this.roomListeners]) listener(descriptor.id, { type: "activity", event });
+      },
+    });
+    activity.hydrate(persisted?.activity);
+    activity.seedMessages(
+      bus.listMessages(300),
+      new Map(bus.listMembers().map((member) => [member.id, member.name])),
+    );
+    // 中断的待办在执行轨迹里留一条标记：恢复后能看出「这里断过一次」。
+    for (const item of interrupted) {
+      activity.recordInterruption({
+        memberId: item.memberId,
+        memberName: bus.getMember(item.memberId)?.name ?? item.memberName,
+        triggerText: item.trigger.text,
+      });
+    }
     const orchestrator = new Orchestrator({
       bus,
       board,
@@ -403,10 +428,22 @@ export class Workspace {
       orchestrator,
       workQueue,
       questions,
+      activity,
       stateFile: this.stateFileFor(descriptor.id),
       saveTimer: null,
     };
     bus.subscribe((event) => {
+      // 执行轨迹由服务端统一生成：消息与 run 事件都写进活动日志，前端只消费结果。
+      if (event.type === "message") {
+        activity.recordMessage(event.message);
+      } else if (event.type === "run") {
+        activity.recordRunEvent(
+          event.event,
+          bus.getMember(event.event.memberId)?.name ?? "成员",
+        );
+      } else if (event.type === "messages-cleared") {
+        activity.clear();
+      }
       if (SAVE_TRIGGERS.includes(event.type)) this.scheduleSave(descriptor.id);
       if (DIRTY_TRIGGERS.includes(event.type)) this.memory.markDirty();
       for (const listener of [...this.roomListeners]) listener(descriptor.id, event);
@@ -459,6 +496,10 @@ export class Workspace {
 
   listQuestions(roomId?: string): QuestionItem[] {
     return this.room(roomId).questions.list();
+  }
+
+  listActivity(roomId?: string): ActivityEvent[] {
+    return this.room(roomId).activity.list();
   }
 
   /**
@@ -813,6 +854,12 @@ export class Workspace {
       mode: room.bus.roomMode,
     });
     room.board.hydrate(archive.tasks);
+    // 恢复的会话重新播种活动锚点；工具轨迹属于上一段会话，不跟着归档回来。
+    room.activity.clear();
+    room.activity.seedMessages(
+      room.bus.listMessages(300),
+      new Map(room.bus.listMembers().map((member) => [member.id, member.name])),
+    );
     this.memory.markDirty();
     room.bus.emit({ type: "session-restored", archive: summaryOf(archive) });
     await this.persistRoom(roomId);
@@ -908,6 +955,7 @@ export class Workspace {
       routing: snapshot.routing,
       workQueue: room.workQueue.snapshot(),
       questions: room.questions.snapshot(),
+      activity: room.activity.snapshot(),
     } satisfies PersistedState);
   }
 

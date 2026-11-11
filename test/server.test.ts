@@ -100,6 +100,7 @@ describe("多用户 API", () => {
     expect(queue.body["roomId"]).toBe("room_main");
     expect(Array.isArray(queue.body["items"])).toBe(true);
     expect(Array.isArray(state.body["questions"])).toBe(true);
+    expect(Array.isArray(state.body["activity"])).toBe(true);
     const badAnswer = await call("/api/questions/ask_missing/answer", {
       method: "POST",
       cookie,

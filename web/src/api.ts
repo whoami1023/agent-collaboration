@@ -23,6 +23,7 @@ import type {
 } from "../../src/cron/types";
 import type { ProviderApi } from "../../src/model/types";
 import type { QuestionItem } from "../../src/room/questions";
+import type { ActivityEvent } from "../../src/room/activity-log";
 import type { AdvisorSettings, CurationSettings } from "../../src/core/settings";
 import type {
   CurationLog,
@@ -101,6 +102,7 @@ export interface StateSnapshot {
   messages: RoomMessage[];
   tasks: TaskCard[];
   questions: QuestionItem[];
+  activity: ActivityEvent[];
   settings: MaskedSettings;
 }
 

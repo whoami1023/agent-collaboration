@@ -19,6 +19,7 @@ export type IconName =
   | "clock"
   | "chat"
   | "inspect"
+  | "route"
   | "search"
   | "refresh"
   | "import"
@@ -120,6 +121,14 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
       <path d="M14 8h5" />
       <circle cx="17.5" cy="16.5" r="3" />
       <path d="M19.8 18.8 22 21" />
+    </>
+  ),
+  route: (
+    <>
+      <path d="M6 18.5c0-4.6 3-5.9 6-7.6 2.4-1.4 4-2.6 4-4.9" />
+      <circle cx="6" cy="18.5" r="2" />
+      <circle cx="16" cy="4" r="2" />
+      <path d="M9.5 12.5h3.5M13 8.5h2" />
     </>
   ),
   search: (

@@ -126,11 +126,14 @@ import {
 import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdown/MarkdownText";
 import { CsvPreview, RichPreviewBody } from "./FilePreviews";
 import { readMentionQuery } from "./mention";
+import { ActivityPanel } from "./ActivityPanel";
+import { RunTracePanel } from "./RunTracePanel";
+import { appendActivity } from "./activity-model";
 
 type ThemeMode = "light" | "dark";
 type SettingsTab = "profile" | "model" | "limits" | "learning" | "curation" | "advisors" | "appearance";
-/** 右侧面板的三个视图：任务看板、文件工作区、归档区。 */
-type RightTab = "tasks" | "files" | "archives";
+/** 右侧面板的四个视图：任务看板、执行状态、文件工作区、归档区。 */
+type RightTab = "tasks" | "files" | "archives" | "activity";
 
 const THEME_KEY = "ac_theme";
 
@@ -157,7 +160,9 @@ function writePanes(next: PaneWidths): void {
 
 interface RunState {
   memberId: string;
+  startedAt: number;
   text: string;
+  reasoning: string;
   tools: string[];
 }
 
@@ -223,11 +228,12 @@ function proofLabel(kind: TaskEvidenceKind): string {
   return kind === "file" ? "文件" : kind === "command" ? "命令" : "成果";
 }
 
-/** 右侧面板三个视图的显示名与图标，标签栏、顶栏切换和收起按钮共用一份。 */
+/** 右侧面板各视图的显示名与图标，标签栏、顶栏切换和收起按钮共用一份。 */
 const RIGHT_TAB_META: Record<RightTab, { title: string; icon: IconName }> = {
   tasks: { title: "任务看板", icon: "columns" },
   files: { title: "文件工作区", icon: "folder" },
   archives: { title: "归档区", icon: "archive" },
+  activity: { title: "执行状态", icon: "inspect" },
 };
 
 /** 取人方式的展示顺序：主智能体是默认，放第一个。 */
@@ -566,6 +572,8 @@ function RoomView({
   /** 定时任务事件到达时自增：面板据此重新拉取定义与状态，不重挂载（编辑器状态保留）。 */
   const [cronTick, setCronTick] = useState(0);
   const [learningOpen, setLearningOpen] = useState(false);
+  /** 运行轨迹：把成员画成像素小人的执行现场，与其它工作区视图互斥。 */
+  const [traceOpen, setTraceOpen] = useState(false);
   /** 复盘事件到达时自增：学习面板据此重拉提案与流水。 */
   const [learningTick, setLearningTick] = useState(0);
   /** 待确认提案数：侧边栏角标，让用户知道「有东西等你确认」。 */
@@ -584,7 +592,9 @@ function RoomView({
   const [rightTab, setRightTab] = useState<RightTab>(() => {
     try {
       const stored = localStorage.getItem("ac_right_tab");
-      return stored === "files" || stored === "archives" ? stored : "tasks";
+      return stored === "files" || stored === "archives" || stored === "activity"
+        ? stored
+        : "tasks";
     } catch {
       return "tasks";
     }
@@ -944,9 +954,27 @@ function RoomView({
       setRuns((current) => {
         if (event.type !== "run") return current;
         const run = event.event;
-        const entry = current[run.memberId] ?? { memberId: run.memberId, text: "", tools: [] };
+        const entry = current[run.memberId] ?? {
+          memberId: run.memberId,
+          startedAt: Date.now(),
+          text: "",
+          reasoning: "",
+          tools: [],
+        };
         if (run.type === "run-start") {
-          return { ...current, [run.memberId]: { memberId: run.memberId, text: "", tools: [] } };
+          return {
+            ...current,
+            [run.memberId]: {
+              memberId: run.memberId,
+              startedAt: Date.now(),
+              text: "",
+              reasoning: "",
+              tools: [],
+            },
+          };
+        }
+        if (run.type === "reasoning") {
+          return { ...current, [run.memberId]: { ...entry, reasoning: run.text } };
         }
         if (run.type === "delta") {
           return { ...current, [run.memberId]: { ...entry, text: entry.text + run.text } };
@@ -977,6 +1005,8 @@ function RoomView({
   const members = state?.members ?? [];
   const tasks = state?.tasks ?? [];
   const questions = state?.questions ?? [];
+  /** 执行轨迹由服务端持久化：状态快照给历史，activity 事件给增量。 */
+  const activity = state?.activity ?? [];
   const openQuestions = questions.filter((question) => question.status === "open");
   const questionByMessageId = useMemo(
     () => new Map(questions.map((question) => [question.messageId, question])),
@@ -1002,15 +1032,17 @@ function RoomView({
     !templatesOpen &&
     !cronOpen &&
     !learningOpen &&
+    !traceOpen &&
     !newMemberOpen &&
     !selectedMember;
-  /** 技能库 / 群聊区 / 模板库 / 定时任务 / 学习 / 智能体文件 / 新建成员独占右侧整块区域：此时连聊天一起收起。 */
+  /** 技能库 / 群聊区 / 模板库 / 定时任务 / 学习 / 运行轨迹 / 智能体文件 / 新建成员独占右侧整块区域：此时连聊天一起收起。 */
   const takeover =
     skillsOpen ||
     roomsOpen ||
     templatesOpen ||
     cronOpen ||
     learningOpen ||
+    traceOpen ||
     newMemberOpen ||
     Boolean(selectedMember);
   const isGroupRoom = state?.room.kind === "group";
@@ -1785,6 +1817,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setTraceOpen(false);
     setRoomsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
@@ -1797,6 +1830,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setTraceOpen(false);
     setRoomsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
@@ -1808,6 +1842,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setTraceOpen(false);
     setRoomsOpen(false);
     setBoardOpen(true);
     setNavOpen(false);
@@ -1819,6 +1854,7 @@ function RoomView({
     setNewMemberOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setTraceOpen(false);
     setRoomsOpen(false);
     setSelectedMemberId(null);
     setBoardOpen(true);
@@ -1862,6 +1898,20 @@ function RoomView({
     setNavOpen(false);
   }
 
+  /** 运行轨迹：像素小人 + 成员轨迹带，与聊天和其它工作区视图互斥。 */
+  function openTrace() {
+    setTraceOpen(true);
+    setSkillsOpen(false);
+    setTemplatesOpen(false);
+    setCronOpen(false);
+    setLearningOpen(false);
+    setRoomsOpen(false);
+    setNewMemberOpen(false);
+    setSelectedMemberId(null);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
   /** 群聊区面板：列表或花名册，两个标签共用同一个右侧区域。 */
   function openRooms(tab: "list" | "members") {
     setRoomsTab(tab);
@@ -1870,6 +1920,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setTraceOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setBoardOpen(true);
@@ -1897,6 +1948,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setTraceOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setOpenArchiveId(null);
@@ -1914,6 +1966,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setTraceOpen(false);
     setRoomsOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
@@ -2104,6 +2157,18 @@ function RoomView({
               <span className="nav-label">学习</span>
               <span className="nav-hint">复盘产出 · 记忆 · 技能策展</span>
               {learningPending > 0 && <span className="nav-count">{learningPending}</span>}
+            </button>
+
+            <button
+              type="button"
+              className={`nav-item${traceOpen ? " active" : ""}`}
+              aria-pressed={traceOpen}
+              onClick={() => (traceOpen ? setTraceOpen(false) : openTrace())}
+            >
+              <Icon name="route" />
+              <span className="nav-label">运行轨迹</span>
+              <span className="nav-hint">卡通执行现场 · 工具 · 产出</span>
+              {runningCount > 0 && <span className="nav-count">{runningCount}</span>}
             </button>
 
             <button
@@ -2449,6 +2514,19 @@ function RoomView({
               <Icon name="template" />
               <span>模板库</span>
               <span className="chip">内置 · 个人</span>
+            </button>
+          ) : traceOpen ? (
+            <button
+              type="button"
+              className="btn ghost board-toggle"
+              aria-pressed
+              aria-controls="trace-panel"
+              title="关闭运行轨迹，回到聊天"
+              onClick={() => setTraceOpen(false)}
+            >
+              <Icon name="route" />
+              <span>运行轨迹</span>
+              <span className="chip">{runningCount > 0 ? `${runningCount} 运行中` : "成员"}</span>
             </button>
           ) : selectedMember ? (
             <button
@@ -2845,6 +2923,16 @@ function RoomView({
             onPendingChange={setLearningPending}
           />
         </aside>
+      ) : traceOpen ? (
+        <aside id="trace-panel" className="board-panel" aria-label="运行轨迹">
+          <RunTracePanel
+            members={members}
+            activity={activity}
+            runs={runs}
+            roomName={state?.room.name ?? ""}
+            onClose={() => setTraceOpen(false)}
+          />
+        </aside>
       ) : selectedMember ? (
         <aside id="agent-files-panel" className="board-panel" aria-label="智能体文件">
           <AgentFilesPanel
@@ -2893,7 +2981,7 @@ function RoomView({
       <aside
         id="side-panel"
         className="board-panel"
-        aria-label="任务、文件与归档"
+        aria-label="任务、执行、文件与归档"
         inert={!panelVisible}
       >
         <div className="board-sheet">
@@ -2920,6 +3008,17 @@ function RoomView({
                 <Icon name="folder" size={14} />
                 <span>文件</span>
                 <span className="chip">{workspaceFileCount ?? "·"}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={rightTab === "activity"}
+                className={`right-tab${rightTab === "activity" ? " active" : ""}`}
+                onClick={() => setRightTab("activity")}
+              >
+                <Icon name="inspect" size={14} />
+                <span>执行</span>
+                <span className="chip">{Object.keys(runs).length || "·"}</span>
               </button>
               <button
                 type="button"
@@ -3012,6 +3111,8 @@ function RoomView({
                 ))}
               </div>
             </>
+          ) : rightTab === "activity" ? (
+            <ActivityPanel members={members} activity={activity} runs={runs} onOpenTrace={openTrace} />
           ) : rightTab === "archives" ? (
             <ArchivePanel
               archives={archives}
@@ -4290,9 +4391,9 @@ function PaneResizer({
 function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnapshot | null {
   if (!current) return current;
   if (event.type === "messages-cleared") {
-    return current.messages.length === 0
+    return current.messages.length === 0 && current.activity.length === 0
       ? current
-      : { ...current, messages: [], questions: [] };
+      : { ...current, messages: [], questions: [], activity: [] };
   }
   if (event.type === "tasks-cleared") {
     return current.tasks.length === 0 ? current : { ...current, tasks: [] };
@@ -4324,6 +4425,9 @@ function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnaps
   }
   if (event.type === "question") {
     return { ...current, questions: upsert(current.questions, event.question) };
+  }
+  if (event.type === "activity") {
+    return { ...current, activity: appendActivity(current.activity, [event.event]) };
   }
   return current;
 }
