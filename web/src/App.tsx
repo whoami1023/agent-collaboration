@@ -125,6 +125,7 @@ import {
 } from "./api";
 import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdown/MarkdownText";
 import { CsvPreview, RichPreviewBody } from "./FilePreviews";
+import { readMentionQuery } from "./mention";
 
 type ThemeMode = "light" | "dark";
 type SettingsTab = "profile" | "model" | "limits" | "learning" | "curation" | "advisors" | "appearance";
@@ -527,6 +528,9 @@ function RoomView({
   const [draft, setDraft] = useState("");
   const [suggestIndex, setSuggestIndex] = useState(0);
   const [suggestDismissed, setSuggestDismissed] = useState(false);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [mentionDismissed, setMentionDismissed] = useState(false);
+  const [caret, setCaret] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [clearingChat, setClearingChat] = useState(false);
@@ -1486,6 +1490,41 @@ function RoomView({
   const slashActiveIndex =
     slashSuggestions.length > 0 ? Math.min(suggestIndex, slashSuggestions.length - 1) : 0;
   const slashActive = slashSuggestions[slashActiveIndex];
+
+  // @成员补全：只看光标前的片段；斜杠菜单打开时让位给命令。
+  const mentionMatch = readMentionQuery(draft, caret);
+  const mentionQuery = slashMenuOpen || mentionMatch === null ? null : mentionMatch.query;
+  const mentionSuggestions =
+    mentionQuery === null
+      ? []
+      : members
+          .filter(
+            (member) =>
+              member.name.toLowerCase().includes(mentionQuery.toLowerCase()) ||
+              member.id.toLowerCase().includes(mentionQuery.toLowerCase()),
+          )
+          .slice(0, 8);
+  const mentionMenuOpen =
+    !mentionDismissed && mentionQuery !== null && mentionSuggestions.length > 0;
+  const mentionActiveIndex =
+    mentionSuggestions.length > 0 ? Math.min(mentionIndex, mentionSuggestions.length - 1) : 0;
+  const mentionActive = mentionSuggestions[mentionActiveIndex];
+
+  function applyMention(memberName: string) {
+    const match = readMentionQuery(draft, caret);
+    if (!match) return;
+    const next = `${draft.slice(0, match.start)}@${memberName} ${draft.slice(caret)}`;
+    const nextCaret = match.start + memberName.length + 2;
+    setDraft(next);
+    setCaret(nextCaret);
+    setMentionDismissed(true);
+    setMentionIndex(0);
+    setError(null);
+    requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      composerRef.current?.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
 
   function applySlashCompletion(name: string) {
     setDraft(`/${name}`);
@@ -2557,16 +2596,30 @@ function RoomView({
                 ref={composerRef}
                 value={draft}
                 placeholder={`以 ${user.displayName} 的身份发消息… 用 @成员名 指派任务`}
-                aria-expanded={slashMenuOpen}
-                aria-controls={slashMenuOpen ? "slash-suggest-menu" : undefined}
+                aria-expanded={slashMenuOpen || mentionMenuOpen}
+                aria-controls={
+                  slashMenuOpen
+                    ? "slash-suggest-menu"
+                    : mentionMenuOpen
+                      ? "mention-suggest-menu"
+                      : undefined
+                }
                 aria-activedescendant={
-                  slashMenuOpen && slashActive ? `slash-suggest-${slashActive.name}` : undefined
+                  slashMenuOpen && slashActive
+                    ? `slash-suggest-${slashActive.name}`
+                    : mentionMenuOpen && mentionActive
+                      ? `mention-suggest-${mentionActive.id}`
+                      : undefined
                 }
                 onChange={(event) => {
                   setDraft(event.target.value);
+                  setCaret(event.target.selectionStart ?? event.target.value.length);
                   setSuggestDismissed(false);
                   setSuggestIndex(0);
+                  setMentionDismissed(false);
+                  setMentionIndex(0);
                 }}
+                onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? 0)}
                 onKeyDown={(event) => {
                   if (slashMenuOpen) {
                     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -2600,6 +2653,27 @@ function RoomView({
                       return;
                     }
                   }
+                  if (mentionMenuOpen) {
+                    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                      event.preventDefault();
+                      const delta = event.key === "ArrowDown" ? 1 : -1;
+                      setMentionIndex(
+                        (current) =>
+                          (current + delta + mentionSuggestions.length) % mentionSuggestions.length,
+                      );
+                      return;
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setMentionDismissed(true);
+                      return;
+                    }
+                    if ((event.key === "Tab" || event.key === "Enter") && !event.shiftKey) {
+                      event.preventDefault();
+                      if (mentionActive) applyMention(mentionActive.name);
+                      return;
+                    }
+                  }
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
                     void handleSend();
@@ -2626,6 +2700,43 @@ function RoomView({
                     </div>
                   ))}
                   <div className="slash-suggest-tip">↑↓ 选择 · Tab 补全 · Enter 执行</div>
+                </div>
+              )}
+              {mentionMenuOpen && (
+                <div
+                  className="mention-suggest"
+                  id="mention-suggest-menu"
+                  role="listbox"
+                  aria-label="成员建议"
+                >
+                  {mentionSuggestions.map((member, index) => (
+                    <button
+                      key={member.id}
+                      type="button"
+                      id={`mention-suggest-${member.id}`}
+                      role="option"
+                      aria-selected={index === mentionActiveIndex}
+                      className={`mention-suggest-item${
+                        index === mentionActiveIndex ? " active" : ""
+                      }`}
+                      onMouseEnter={() => setMentionIndex(index)}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => applyMention(member.name)}
+                    >
+                      <span className="mention-suggest-avatar">
+                        {member.role === "main" ? "主" : member.name.slice(0, 1)}
+                      </span>
+                      <span className="mention-suggest-name">@{member.name}</span>
+                      <span className="mention-suggest-role">
+                        {member.role === "main"
+                          ? "主智能体"
+                          : member.status === "running"
+                            ? "运行中"
+                            : "子成员"}
+                      </span>
+                    </button>
+                  ))}
+                  <div className="mention-suggest-tip">↑↓ 选择 · Tab/Enter 补全 · Esc 关闭</div>
                 </div>
               )}
               <button
