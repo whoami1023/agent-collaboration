@@ -69,12 +69,52 @@ describe("wake decisions", () => {
     expect(toMain.wakes).toEqual([main.id]);
   });
 
+  it("用户 @ 子成员时只唤醒被点的人，主智能体不再抢答", () => {
+    const decision = decideWakes(
+      message({ text: "@研究员 先说你的思路", mentions: [researcher.id] }),
+      [main, researcher],
+    );
+    expect(decision.wakes).toEqual([researcher.id]);
+  });
+
+  it("用户只 @ 主智能体时只唤醒主智能体", () => {
+    const decision = decideWakes(
+      message({ text: "@主智能体 你来处理", mentions: [main.id] }),
+      [main, researcher],
+    );
+    expect(decision.wakes).toEqual([main.id]);
+  });
+
+  it("用户同时 @ 子成员和主智能体时两者都唤醒", () => {
+    const decision = decideWakes(
+      message({ text: "@研究员 @主智能体 一起看看", mentions: [researcher.id, main.id] }),
+      [main, researcher],
+    );
+    expect(decision.wakes.sort()).toEqual([main.id, researcher.id].sort());
+  });
+
   it("子成员的报告会唤醒创建它的父级", () => {
     const decision = decideWakes(
       message({ senderId: researcher.id, senderName: researcher.name, senderKind: "member", kind: "announce" }),
       [main, researcher],
     );
     expect(decision.wakes).toEqual([main.id]);
+  });
+
+  it("用户显式只 @ 子成员的链路里，子成员汇报不再唤醒主智能体", () => {
+    const decision = decideWakes(
+      message({
+        senderId: researcher.id,
+        senderName: researcher.name,
+        senderKind: "member",
+        kind: "announce",
+        chainRootId: "msg_user",
+      }),
+      [main, researcher],
+      "delegate",
+      { skipParentWake: true },
+    );
+    expect(decision.wakes).toEqual([]);
   });
 
   it("自己 @ 自己不会触发运行", () => {
@@ -116,12 +156,12 @@ describe("free mode wake decisions", () => {
     expect(decision.wakes).toEqual([]);
   });
 
-  it("自由交流下用户消息仍唤醒主智能体与被 @ 成员", () => {
+  it("自由交流下用户 @ 子成员也只唤醒被点的人", () => {
     const decision = decideWakes(
       message({ text: "@研究员 先说说你的思路", mentions: [researcher.id] }),
       [main, researcher],
       "free",
     );
-    expect(decision.wakes).toEqual([researcher.id, main.id]);
+    expect(decision.wakes).toEqual([researcher.id]);
   });
 });

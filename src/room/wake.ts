@@ -24,6 +24,11 @@ export interface WakeRouting {
   picks?: readonly string[];
   /** 本轮（最近一条用户消息之后）还没开过口的成员 ID。 */
   unspoken?: readonly string[];
+  /**
+   * 用户这条消息只点名了非主成员：子成员汇报后不再自动唤醒主智能体。
+   * 只压制隐式父级回收，不挡成员在汇报里显式 @ 主智能体求助。
+   */
+  skipParentWake?: boolean;
 }
 
 export function decideWakes(
@@ -79,7 +84,14 @@ export function decideWakes(
 
   const candidates = routingCandidates(message, members);
 
-  if (message.senderKind === "user" && main && main.id !== message.senderId) {
+  // 显式 @ 优先：用户点了谁就只叫谁。主智能体兜底/分流只处理一条都没点名的用户消息，
+  // 否则 @ 子成员时主智能体会跟着抢答。
+  if (
+    message.senderKind === "user" &&
+    message.mentions.length === 0 &&
+    main &&
+    main.id !== message.senderId
+  ) {
     // 分流只对「一条都没点名的用户消息」生效：用户自己 @ 过人，就按用户的意思办。
     const picked = routingNeeded(message, routing, candidates)
       ? (wakeRouting.picks ?? []).filter((id) => candidates.some((member) => member.id === id))
@@ -121,7 +133,13 @@ export function decideWakes(
   }
 
   // 自由交流不逐条唤醒父级：由 Orchestrator 在讨论安静后统一收集，避免主智能体打断讨论。
-  if (mode === "delegate" && message.kind === "announce" && sender?.spawnedBy) {
+  // 用户显式只 @ 子成员时同理：这轮由被点的人负责，不再让主智能体补一条汇总。
+  if (
+    mode === "delegate" &&
+    message.kind === "announce" &&
+    sender?.spawnedBy &&
+    !wakeRouting.skipParentWake
+  ) {
     const parent = members.find((m) => m.id === sender.spawnedBy);
     if (parent && parent.status !== "cancelled") wakes.add(parent.id);
   }

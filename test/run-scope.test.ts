@@ -439,8 +439,8 @@ describe("唤醒闸门", () => {
       message({ text: "@研究员 先看这个", mentions: [researcher.id], runScope: "plan" }),
       [member(), researcher],
     );
-    // 用户的 @ 照常派活（主智能体也照常醒来），闸门只管智能体自己发出的消息。
-    expect(decision.wakes).toEqual([researcher.id, "m_main"]);
+    // 用户的 @ 照常派活，且显式 @ 优先：只叫被点的人，不起主智能体兜底。
+    expect(decision.wakes).toEqual([researcher.id]);
     expect(decision.skipped).toEqual([]);
   });
 

@@ -262,8 +262,8 @@ describe("唤醒规则里的分流分支", () => {
       routing: "auto",
       picks: [researcher.id],
     });
-    // 用户自己 @ 过人了：分流不参与，被点的人和兜底的主智能体一起接
-    expect(named.wakes).toEqual(["m_c", "m_main"]);
+    // 用户自己 @ 过人了：分流不参与，显式 @ 优先，只唤醒被点的人
+    expect(named.wakes).toEqual(["m_c"]);
   });
 
   it("everyone 同时唤醒在场成员与主智能体，一条消息最多 6 人", () => {
@@ -283,11 +283,11 @@ describe("唤醒规则里的分流分支", () => {
     expect(capped.wakes).toContain("m_main");
   });
 
-  it("everyone 下用户点了人，就只唤醒被点的那个和主智能体", () => {
+  it("everyone 下用户点了人，就只唤醒被点的那个", () => {
     const decision = decideWakes(message({ mentions: [writer.id] }), roster, "delegate", {
       routing: "everyone",
     });
-    expect(decision.wakes).toEqual(["m_b", "m_main"]);
+    expect(decision.wakes).toEqual(["m_b"]);
   });
 
   it("成员发言点了还没开口的同伴，会把那人拉进下一轮", () => {

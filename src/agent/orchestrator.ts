@@ -583,14 +583,31 @@ export class Orchestrator {
         routing,
         // 只有开了分流（或自由交流）才需要「谁还没开口」：同级互相接话的提质规则用它。
         unspoken: routing === "lead" && mode !== "free" ? undefined : this.unspokenMemberIds(members),
+        ...(this.suppressParentWake(message) ? { skipParentWake: true } : {}),
       });
       for (const memberId of wakes) this.wake(memberId, message);
     }
     // 自由交流：成员报告不逐条唤醒主智能体，等讨论安静后统一收集（OpenClaw collector 语义）。
     if (mode === "free" && message.kind === "announce" && message.senderKind === "member") {
       const sender = this.deps.bus.getMember(message.senderId);
-      if (sender?.role === "sub") this.scheduleCollector(message);
+      if (sender?.role === "sub" && !this.suppressParentWake(message)) {
+        this.scheduleCollector(message);
+      }
     }
+  }
+
+  /**
+   * 用户这条消息只点名了非主成员时，子成员汇报不再隐式回收给主智能体。
+   * 只压制自动汇总；成员在汇报里显式 @ 主智能体求助仍然有效。
+   */
+  private suppressParentWake(message: RoomMessage): boolean {
+    if (message.senderKind !== "member" || !message.chainRootId) return false;
+    const root = this.deps.bus
+      .listMessages()
+      .find((candidate) => candidate.id === message.chainRootId);
+    if (!root || root.senderKind !== "user" || root.mentions.length === 0) return false;
+    const main = this.deps.bus.listMembers().find((candidate) => candidate.role === "main");
+    return Boolean(main && !root.mentions.includes(main.id));
   }
 
   /** 本轮（最近一条用户消息之后）还没开过口的子成员：分流把「被点名但没发言」的人拉进下一轮。 */

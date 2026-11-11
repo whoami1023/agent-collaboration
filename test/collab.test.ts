@@ -211,16 +211,13 @@ describe("group-chat collaboration", () => {
     await waitFor(() => orchestrator.activeRuns === 0);
   });
 
-  it("用户新建的成员被 @ 后执行任务，报告唤醒主智能体汇总", async () => {
+  it("用户显式 @ 子成员时只有子成员回答，主智能体不抢答也不自动汇总", async () => {
+    let mainCalls = 0;
     const handler: MockHandler = (request) => {
       const system = request.messages[0]?.content ?? "";
-      const userText = request.messages
-        .filter((message) => message.role === "user")
-        .map((message) => message.content)
-        .join("\n");
       if (system.includes("里的主智能体")) {
-        if (userText.includes("交回了结果")) return { text: "综合结论：中心编排 + 事件总线更稳。" };
-        return { text: "已收到，等成员报告。" };
+        mainCalls += 1;
+        return { text: "主智能体不应该在这条消息里发言。" };
       }
       return { text: "调研结论：中心编排最稳。\n证据：对比了 3 个框架。" };
     };
@@ -239,14 +236,12 @@ describe("group-chat collaboration", () => {
     await waitFor(() =>
       bus.listMessages().some((message) => message.senderId === researcher.id && message.kind === "announce"),
     );
-    await waitFor(() =>
-      bus.listMessages().some((message) => message.senderId === "m_main" && message.text.includes("综合结论")),
-    );
+    await waitFor(() => orchestrator.activeRuns === 0);
 
-    expect(bus.listMembers().filter((member) => member.role === "sub")).toHaveLength(1);
+    expect(mainCalls).toBe(0);
+    expect(bus.listMessages().some((message) => message.senderId === "m_main")).toBe(false);
     const researcherMessages = bus.listMessages().filter((message) => message.senderId === researcher.id);
     expect(researcherMessages).toHaveLength(1);
-    await waitFor(() => orchestrator.activeRuns === 0);
   });
 
   it("新建成员按功能描述挑技能：只启用对口的几个，而不是整个技能库", async () => {
@@ -307,7 +302,8 @@ describe("group-chat collaboration", () => {
     expect(orchestrator.setRoomMode("free")).toBe("free");
     expect(bus.roomMode).toBe("free");
 
-    orchestrator.sendUserMessage("@研究员 讨论一下方案 A");
+    // 同时点名主智能体是为了验证自由交流的「安静后统一收集」；显式只 @ 子成员时不会收集。
+    orchestrator.sendUserMessage("@主智能体 @研究员 讨论一下方案 A");
     await waitFor(() =>
       bus.listMessages().some((message) => message.senderId === researcher.id && message.kind === "announce"),
     );
