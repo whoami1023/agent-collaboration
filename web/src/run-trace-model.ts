@@ -250,31 +250,39 @@ export function buildTraceActors(
   runs: Readonly<Record<string, RunningView>>,
   toolLimit = 8,
 ): TraceActor[] {
-  const actors = members.map((member) => {
-    const mine = activity.filter((event) => event.memberId === member.id);
-    const last = mine.at(-1);
-    const run = runs[member.id];
-    const { mood, thought } = moodAndThought(member, run, last);
-    return {
-      member,
-      look: traceLookFor(member),
-      accent: traceAccentFor(member),
-      mood,
-      ...(run ? { startedAt: run.startedAt } : {}),
-      thought,
-      toolRuns: buildToolRuns(mine, toolLimit),
-      milestones: mine
-        .filter((event) => event.kind !== "tool" && event.kind !== "tool-result")
-        .slice(-8),
-      counts: {
-        tool: mine.filter((event) => event.kind === "tool").length,
-        message: mine.filter((event) => event.kind === "message" || event.kind === "final").length,
-        error: mine.filter((event) => event.kind === "error").length,
-      },
-      lastAt: last?.at ?? 0,
-    };
-  });
+  const actors = members.map((member) => traceActorFor(member, activity, runs, toolLimit));
   return actors.sort(
     (a, b) => MOOD_RANK[a.mood] - MOOD_RANK[b.mood] || b.lastAt - a.lastAt,
   );
+}
+
+/** 单个成员的角色状态：成员页与运行轨迹共用，保证两处形象、颜色与状态文案一致。 */
+export function traceActorFor(
+  member: Member,
+  activity: readonly ActivityEvent[],
+  runs: Readonly<Record<string, RunningView>>,
+  toolLimit = 8,
+): TraceActor {
+  const mine = activity.filter((event) => event.memberId === member.id);
+  const last = mine.at(-1);
+  const run = runs[member.id];
+  const { mood, thought } = moodAndThought(member, run, last);
+  return {
+    member,
+    look: traceLookFor(member),
+    accent: traceAccentFor(member),
+    mood,
+    ...(run ? { startedAt: run.startedAt } : {}),
+    thought,
+    toolRuns: buildToolRuns(mine, toolLimit),
+    milestones: mine
+      .filter((event) => event.kind !== "tool" && event.kind !== "tool-result")
+      .slice(-8),
+    counts: {
+      tool: mine.filter((event) => event.kind === "tool").length,
+      message: mine.filter((event) => event.kind === "message" || event.kind === "final").length,
+      error: mine.filter((event) => event.kind === "error").length,
+    },
+    lastAt: last?.at ?? 0,
+  };
 }

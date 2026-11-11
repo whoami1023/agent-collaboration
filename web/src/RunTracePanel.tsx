@@ -285,12 +285,19 @@ export function RunTracePanel({
         <section className="trace-scene" aria-label="智能体运行现场">
           <div className="trace-scene-bar">
             <span>运行现场</span>
+            {actors.length > 4 ? (
+              <span className="trace-scene-scrollhint">可上下滑动</span>
+            ) : null}
             <span className="trace-scene-room">{roomName}</span>
           </div>
           {actors.length === 0 ? (
             <p className="trace-scene-empty">房间里还没有成员。</p>
           ) : (
-            <div className="trace-stage">
+            <div
+              className="trace-stage"
+              tabIndex={0}
+              aria-label="运行现场，可上下滑动查看全部成员"
+            >
               {actors.map((actor) => (
                 <ActorCard
                   key={actor.member.id}

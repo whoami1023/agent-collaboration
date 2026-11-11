@@ -949,6 +949,184 @@ body.pane-dragging * {
   pointer-events: auto;
 }
 
+/* 右侧成员列表：与侧边栏的内联名单分开，信息量更大、点击区域更清楚。 */
+.roster-body {
+  gap: 12px;
+}
+
+.roster-overview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.roster-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.roster-stat strong {
+  color: var(--text-strong);
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+}
+
+.roster-stat.live strong {
+  color: var(--accent);
+}
+
+.roster-stat.warn strong {
+  color: var(--danger);
+}
+
+.roster-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.roster-actions .activity-hint {
+  margin-left: auto;
+}
+
+.roster-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.roster-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  transition: border-color 0.18s var(--ease), box-shadow 0.18s var(--ease);
+}
+
+.roster-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  box-shadow: var(--shadow-sm);
+}
+
+.roster-figure {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: flex-end;
+  justify-content: center;
+  width: 54px;
+  min-height: 70px;
+}
+
+.roster-figure .status-dot {
+  right: 8px;
+  bottom: 2px;
+}
+
+.roster-figure:hover .trace-figure {
+  filter:
+    drop-shadow(0 0 4px color-mix(in srgb, var(--accent) 45%, transparent))
+    drop-shadow(0 5px 5px rgba(33, 30, 26, 0.1));
+}
+
+.roster-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  text-align: left;
+}
+
+.roster-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.roster-name {
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 14px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roster-state {
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.roster-state.working {
+  color: var(--accent);
+}
+
+.roster-state.thinking {
+  color: #8b6bb5;
+}
+
+.roster-state.done {
+  color: var(--ok);
+}
+
+.roster-state.error {
+  color: var(--danger);
+}
+
+.roster-state.cancelled {
+  color: var(--warn);
+}
+
+.roster-meta,
+.roster-tool,
+.roster-thought {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roster-thought {
+  color: var(--accent);
+}
+
+.roster-tool {
+  color: var(--text);
+}
+
+.roster-template {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.roster-card-actions {
+  display: flex;
+  flex: none;
+  align-self: center;
+  align-items: center;
+  gap: 4px;
+}
+
 @media (hover: none) {
   .member-remove {
     opacity: 1;
@@ -6219,13 +6397,30 @@ body.pane-dragging * {
   white-space: nowrap;
 }
 
+.trace-scene-scrollhint {
+  flex: none;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.trace-stage:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 48%, transparent);
+  outline-offset: -3px;
+}
+
 .trace-stage {
   position: relative;
   z-index: 1;
   display: flex;
   flex-wrap: wrap;
+  align-content: flex-start;
   justify-content: center;
   gap: 8px;
+  max-height: min(56vh, 620px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
   padding: 12px 10px 16px;
   background-image:
     repeating-linear-gradient(

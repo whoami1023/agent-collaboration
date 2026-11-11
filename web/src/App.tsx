@@ -129,6 +129,7 @@ import { readMentionQuery } from "./mention";
 import { ActivityPanel } from "./ActivityPanel";
 import { AuditPanel } from "./AuditPanel";
 import { RunTracePanel } from "./RunTracePanel";
+import { MembersPanel } from "./MembersPanel";
 import { appendActivity } from "./activity-model";
 
 type ThemeMode = "light" | "dark";
@@ -580,7 +581,7 @@ function RoomView({
   const [learningTick, setLearningTick] = useState(0);
   /** 待确认提案数：侧边栏角标，让用户知道「有东西等你确认」。 */
   const [learningPending, setLearningPending] = useState(0);
-  const [membersOpen, setMembersOpen] = useState(true);
+  const [membersOpen, setMembersOpen] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [boardOpen, setBoardOpen] = useState(() => {
@@ -1043,8 +1044,9 @@ function RoomView({
     !traceOpen &&
     !newMemberOpen &&
     !selectedMember;
-  /** 技能库 / 群聊区 / 模板库 / 定时任务 / 学习 / 运行轨迹 / 智能体文件 / 新建成员独占右侧整块区域：此时连聊天一起收起。 */
+  /** 成员 / 技能库 / 群聊区 / 模板库 / 定时任务 / 学习 / 运行轨迹 / 智能体文件 / 新建成员独占右侧整块区域：此时连聊天一起收起。 */
   const takeover =
+    membersOpen ||
     skillsOpen ||
     roomsOpen ||
     templatesOpen ||
@@ -1820,6 +1822,7 @@ function RoomView({
 
   function openAgentFiles(memberId: string) {
     setSelectedMemberId(memberId);
+    setMembersOpen(false);
     setNewMemberOpen(false);
     setSkillsOpen(false);
     setTemplatesOpen(false);
@@ -1834,6 +1837,7 @@ function RoomView({
   function openNewMember() {
     setNewMemberOpen(true);
     setSelectedMemberId(null);
+    setMembersOpen(false);
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
@@ -1844,8 +1848,24 @@ function RoomView({
     setNavOpen(false);
   }
 
+  /** 成员列表：右侧整块区域，侧边栏「成员」按钮与其它工作区视图互斥。 */
+  function openMembers() {
+    setMembersOpen(true);
+    setSelectedMemberId(null);
+    setSkillsOpen(false);
+    setTemplatesOpen(false);
+    setCronOpen(false);
+    setLearningOpen(false);
+    setTraceOpen(false);
+    setRoomsOpen(false);
+    setNewMemberOpen(false);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
   function openSkills() {
     setSkillsOpen(true);
+    setMembersOpen(false);
     setNewMemberOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
@@ -1859,6 +1879,7 @@ function RoomView({
   function openTemplates() {
     setTemplatesOpen(true);
     setSkillsOpen(false);
+    setMembersOpen(false);
     setNewMemberOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
@@ -1886,6 +1907,7 @@ function RoomView({
     setCronOpen(true);
     setSkillsOpen(false);
     setTemplatesOpen(false);
+    setMembersOpen(false);
     setNewMemberOpen(false);
     setRoomsOpen(false);
     setSelectedMemberId(null);
@@ -1899,6 +1921,7 @@ function RoomView({
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
+    setMembersOpen(false);
     setRoomsOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
@@ -1913,6 +1936,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setMembersOpen(false);
     setRoomsOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
@@ -1929,6 +1953,7 @@ function RoomView({
     setCronOpen(false);
     setLearningOpen(false);
     setTraceOpen(false);
+    setMembersOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setBoardOpen(true);
@@ -1952,6 +1977,7 @@ function RoomView({
       // storage can be unavailable in private mode
     }
     setRoomsOpen(false);
+    setMembersOpen(false);
     setSkillsOpen(false);
     setTemplatesOpen(false);
     setCronOpen(false);
@@ -1976,6 +2002,7 @@ function RoomView({
     setLearningOpen(false);
     setTraceOpen(false);
     setRoomsOpen(false);
+    setMembersOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
     setNavOpen(false);
@@ -2192,91 +2219,17 @@ function RoomView({
 
             <button
               type="button"
-              className="nav-item"
-              aria-expanded={membersOpen}
-              onClick={() => setMembersOpen((open) => !open)}
+              className={`nav-item${membersOpen ? " active" : ""}`}
+              aria-pressed={membersOpen}
+              title="在右侧查看成员列表与运行状态"
+              onClick={() => (membersOpen ? setMembersOpen(false) : openMembers())}
             >
               <Icon name="users" />
               <span className="nav-label">{isGroupRoom ? "群成员" : "成员"}</span>
+              <span className="nav-hint">列表 · 状态 · 智能体文件</span>
               <span className="nav-count">{members.length}</span>
-              <span className={`chevron${membersOpen ? " up" : ""}`}>
-                <Icon name="chevron" />
-              </span>
             </button>
           </nav>
-          {membersOpen && (
-            <ul className="member-list">
-            {isGroupRoom && (
-              <li className="member-invite-row">
-                <button
-                  type="button"
-                  className="btn ghost sm"
-                  onClick={() => openRooms("members")}
-                  title="从成员池拉人进这个群"
-                >
-                  <Icon name="plus" size={13} />
-                  拉成员进群
-                </button>
-              </li>
-            )}
-            {members.map((member) => (
-              <li key={member.id} className={`member-row${selectedMemberId === member.id ? " active" : ""}`}>
-                <span className="member-avatar">
-                  {initialOf(member.name)}
-                  <span className={`status-dot ${member.status}`} />
-                </span>
-                <button
-                  type="button"
-                  className="member-main"
-                  title="查看该智能体的记忆与相关文件"
-                  onClick={() => openAgentFiles(member.id)}
-                >
-                  <div className="member-line">
-                    <span className="member-name">@{member.name}</span>
-                    <span className={`role-pill ${member.role}`}>
-                      {member.role === "main" ? "主" : "成员"}
-                    </span>
-                  </div>
-                  <div className="member-meta">
-                    {member.status === "running"
-                      ? "运行中"
-                      : member.status === "error"
-                        ? "异常"
-                        : member.status === "cancelled"
-                          ? "已取消"
-                          : "空闲"}
-                    {runs[member.id]?.tools.length
-                      ? ` · ${runs[member.id]?.tools.at(-1)}`
-                      : ""}
-                    {member.templateTitle && (
-                      <span className="member-template" title={`来自模板「${member.templateTitle}」`}>
-                        · {member.templateTitle}
-                      </span>
-                    )}
-                  </div>
-                </button>
-                {member.status === "running" && (
-                  <button className="btn sm" onClick={() => void handleCancel(member.id)}>
-                    取消
-                  </button>
-                )}
-                {member.role === "sub" && (
-                  <button
-                    type="button"
-                    className="btn icon ghost danger member-remove"
-                    aria-label={`${isGroupRoom ? "移出群聊" : "移除成员"} @${member.name}`}
-                    title={isGroupRoom ? "移出群聊（成员池与其他群不受影响）" : "移除成员"}
-                    onClick={() =>
-                      void (isGroupRoom ? handleKickMember(member) : handleRemoveMember(member))
-                    }
-                  >
-                    <Icon name="trash" />
-                  </button>
-                )}
-              </li>
-            ))}
-            </ul>
-          )}
         </div>
 
         <div className="sidebar-foot" ref={accountRef}>
@@ -2944,6 +2897,23 @@ function RoomView({
             roomName={state?.room.name ?? ""}
             roomId={state?.room.id ?? activeRoom()}
             onClose={() => setTraceOpen(false)}
+          />
+        </aside>
+      ) : membersOpen ? (
+        <aside id="members-panel" className="board-panel" aria-label={isGroupRoom ? "群成员" : "成员"}>
+          <MembersPanel
+            members={members}
+            activity={activity}
+            runs={runs}
+            isGroupRoom={isGroupRoom}
+            onOpenMember={openAgentFiles}
+            onCancel={(memberId) => void handleCancel(memberId)}
+            onRemove={(member) =>
+              void (isGroupRoom ? handleKickMember(member) : handleRemoveMember(member))
+            }
+            onInvite={() => openRooms("members")}
+            onNewMember={openNewMember}
+            onClose={() => setMembersOpen(false)}
           />
         </aside>
       ) : selectedMember ? (

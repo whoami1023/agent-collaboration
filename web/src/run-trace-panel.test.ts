@@ -73,6 +73,8 @@ describe("运行轨迹面板", () => {
     expect(markup).toContain("file_write");
     expect(markup).toContain("交付完成");
     expect(markup).toContain("工具 1 · 发言 1");
+    expect(markup).toContain('tabindex="0"');
+    expect(markup).toContain("运行现场，可上下滑动查看全部成员");
   });
 
   it("空闲成员显示最近一次交付，空房间显示占位文案", () => {
