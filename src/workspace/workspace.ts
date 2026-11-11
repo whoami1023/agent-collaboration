@@ -32,6 +32,9 @@ import {
   type QuestionItem,
 } from "../room/questions";
 import { ActivityStore, type ActivityEvent } from "../room/activity-log";
+import { AuditStore } from "../agent/audit/store";
+import { AuditService } from "../agent/audit/service";
+import type { AuditRecord, AuditSnapshot } from "../agent/audit/types";
 import { ModelUsageStore } from "../model/usage-store";
 import { ensureAgentFiles } from "../memory/bootstrap-files";
 import { MemorySearchManager } from "../memory/manager";
@@ -71,6 +74,8 @@ interface PersistedState {
   questions?: QuestionItem[];
   /** 执行轨迹：消息与工具活动随房间保存，刷新/重启后执行视图不丢。 */
   activity?: ActivityEvent[];
+  /** 持续审计：结构化结论与每任务进度随房间保存，重启后不重复催办。 */
+  audits?: AuditSnapshot;
 }
 
 /** v3 及更早的成员档案用 `providerId`，v4 统一为 `modelRef`（`provider/model` 或别名）。 */
@@ -118,6 +123,9 @@ export interface RoomInstance {
   questions: QuestionStore;
   /** 执行轨迹：服务端统一记录，前端读快照与 SSE，不在本地推导工具活动。 */
   activity: ActivityStore;
+  /** 持续审计：任务验收的独立核对记录与每任务进度。 */
+  audits: AuditStore;
+  auditService: AuditService;
   /** 作战室落在 `state.json`，群聊落在 `rooms/<roomId>.json`。 */
   stateFile: string;
   saveTimer: NodeJS.Timeout | null;
@@ -421,6 +429,44 @@ export class Workspace {
       workQueue,
       questions,
     });
+    // 持续审计：运行收尾后核对任务验收；结论落盘并经 SSE 推给执行面板。
+    // 催办走编排器的系统消息 + 唤醒，升级只发系统提醒，不自动改任务状态。
+    const audits = new AuditStore(descriptor.id);
+    audits.hydrate(persisted?.audits);
+    const auditService = new AuditService({
+      roomId: descriptor.id,
+      store: audits,
+      board,
+      bus,
+      files: this.files,
+      getSettings: () => this.settingsRef.current,
+      getModelDeps: () => ({ settings: this.settingsRef.current, dataDir: this.dir }),
+      activityByMember: (memberId) =>
+        activity.list().filter((event) => event.memberId === memberId),
+      usage: this.usage,
+      requestNudge: (memberId, text, taskId) =>
+        orchestrator.requestAuditNudge(memberId, text, taskId),
+      requestEscalation: (record) => {
+        bus.append({
+          senderId: SYSTEM_ID,
+          senderName: "审计",
+          senderKind: "system",
+          kind: "system",
+          text: [
+            `【审计升级】任务「${record.taskTitle}」连续 ${record.interventionCount} 次审计没有进展，已停止自动催办，请人工确认。`,
+            record.fixHint ? `最后一条审计意见：${record.fixHint}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          depthTurn: 0,
+        });
+      },
+      onRecord: (record) => {
+        this.scheduleSave(descriptor.id);
+        bus.emit({ type: "audit", record });
+      },
+    });
+    orchestrator.setAudit(auditService);
     const instance: RoomInstance = {
       descriptor,
       bus,
@@ -429,6 +475,8 @@ export class Workspace {
       workQueue,
       questions,
       activity,
+      audits,
+      auditService,
       stateFile: this.stateFileFor(descriptor.id),
       saveTimer: null,
     };
@@ -443,6 +491,7 @@ export class Workspace {
         );
       } else if (event.type === "messages-cleared") {
         activity.clear();
+        audits.clear();
       }
       if (SAVE_TRIGGERS.includes(event.type)) this.scheduleSave(descriptor.id);
       if (DIRTY_TRIGGERS.includes(event.type)) this.memory.markDirty();
@@ -500,6 +549,10 @@ export class Workspace {
 
   listActivity(roomId?: string): ActivityEvent[] {
     return this.room(roomId).activity.list();
+  }
+
+  listAudits(roomId?: string): AuditRecord[] {
+    return this.room(roomId).audits.list();
   }
 
   /**
@@ -724,6 +777,7 @@ export class Workspace {
   async deleteRoom(roomId: string): Promise<{ removed: string }> {
     const room = this.room(roomId);
     if (room.descriptor.kind !== "group") throw new RoomError(400, "作战室不能删除");
+    room.auditService.close();
     room.orchestrator.stop();
     if (room.saveTimer) {
       clearTimeout(room.saveTimer);
@@ -856,6 +910,7 @@ export class Workspace {
     room.board.hydrate(archive.tasks);
     // 恢复的会话重新播种活动锚点；工具轨迹属于上一段会话，不跟着归档回来。
     room.activity.clear();
+    room.audits.clear();
     room.activity.seedMessages(
       room.bus.listMessages(300),
       new Map(room.bus.listMembers().map((member) => [member.id, member.name])),
@@ -956,6 +1011,7 @@ export class Workspace {
       workQueue: room.workQueue.snapshot(),
       questions: room.questions.snapshot(),
       activity: room.activity.snapshot(),
+      audits: room.audits.snapshot(),
     } satisfies PersistedState);
   }
 
@@ -964,6 +1020,7 @@ export class Workspace {
     this.closed = true;
     this.cronService?.stop();
     for (const room of this.rooms.values()) {
+      room.auditService.close();
       room.orchestrator.stop();
       if (room.saveTimer) {
         clearTimeout(room.saveTimer);

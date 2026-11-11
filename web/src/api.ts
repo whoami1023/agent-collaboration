@@ -24,6 +24,7 @@ import type {
 import type { ProviderApi } from "../../src/model/types";
 import type { QuestionItem } from "../../src/room/questions";
 import type { ActivityEvent } from "../../src/room/activity-log";
+import type { AuditRecord } from "../../src/agent/audit/types";
 import type { AdvisorSettings, CurationSettings } from "../../src/core/settings";
 import type {
   CurationLog,
@@ -103,6 +104,7 @@ export interface StateSnapshot {
   tasks: TaskCard[];
   questions: QuestionItem[];
   activity: ActivityEvent[];
+  audits: AuditRecord[];
   settings: MaskedSettings;
 }
 

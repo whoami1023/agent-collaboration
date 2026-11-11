@@ -127,13 +127,14 @@ import MarkdownText, { hasMarkdownStructure, visibleMessageText } from "./markdo
 import { CsvPreview, RichPreviewBody } from "./FilePreviews";
 import { readMentionQuery } from "./mention";
 import { ActivityPanel } from "./ActivityPanel";
+import { AuditPanel } from "./AuditPanel";
 import { RunTracePanel } from "./RunTracePanel";
 import { appendActivity } from "./activity-model";
 
 type ThemeMode = "light" | "dark";
 type SettingsTab = "profile" | "model" | "limits" | "learning" | "curation" | "advisors" | "appearance";
 /** 右侧面板的四个视图：任务看板、执行状态、文件工作区、归档区。 */
-type RightTab = "tasks" | "files" | "archives" | "activity";
+type RightTab = "tasks" | "files" | "archives" | "activity" | "audit";
 
 const THEME_KEY = "ac_theme";
 
@@ -234,6 +235,7 @@ const RIGHT_TAB_META: Record<RightTab, { title: string; icon: IconName }> = {
   files: { title: "文件工作区", icon: "folder" },
   archives: { title: "归档区", icon: "archive" },
   activity: { title: "执行状态", icon: "inspect" },
+  audit: { title: "任务审计", icon: "check" },
 };
 
 /** 取人方式的展示顺序：主智能体是默认，放第一个。 */
@@ -592,7 +594,7 @@ function RoomView({
   const [rightTab, setRightTab] = useState<RightTab>(() => {
     try {
       const stored = localStorage.getItem("ac_right_tab");
-      return stored === "files" || stored === "archives" || stored === "activity"
+      return stored === "files" || stored === "archives" || stored === "activity" || stored === "audit"
         ? stored
         : "tasks";
     } catch {
@@ -1007,6 +1009,8 @@ function RoomView({
   const questions = state?.questions ?? [];
   /** 执行轨迹由服务端持久化：状态快照给历史，activity 事件给增量。 */
   const activity = state?.activity ?? [];
+  /** 任务审计结论：快照给历史，audit 事件给增量。 */
+  const audits = state?.audits ?? [];
   const openQuestions = questions.filter((question) => question.status === "open");
   const questionByMessageId = useMemo(
     () => new Map(questions.map((question) => [question.messageId, question])),
@@ -2568,9 +2572,13 @@ function RoomView({
               <span className="chip">
                 {rightTab === "files"
                   ? (workspaceFileCount ?? "·")
-                  : rightTab === "archives"
-                    ? (archives?.length ?? "·")
-                    : tasks.length}
+                  : rightTab === "activity"
+                    ? (Object.keys(runs).length || "·")
+                    : rightTab === "audit"
+                      ? audits.length
+                      : rightTab === "archives"
+                        ? (archives?.length ?? "·")
+                        : tasks.length}
               </span>
             </button>
           )}
@@ -3029,6 +3037,19 @@ function RoomView({
               <button
                 type="button"
                 role="tab"
+                aria-selected={rightTab === "audit"}
+                aria-label={`审计 ${audits.length}`}
+                title={`任务审计 · ${audits.length} 条结论`}
+                className={`right-tab${rightTab === "audit" ? " active" : ""}`}
+                onClick={() => setRightTab("audit")}
+              >
+                <Icon name="check" size={14} />
+                <span>审计</span>
+                <span className="chip">{audits.length || "·"}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
                 aria-selected={rightTab === "archives"}
                 aria-label={`归档 ${archives?.length ?? "未知"}`}
                 title={`归档区 · ${archives?.length ?? "统计中"}`}
@@ -3120,7 +3141,9 @@ function RoomView({
               </div>
             </>
           ) : rightTab === "activity" ? (
-            <ActivityPanel members={members} activity={activity} runs={runs} onOpenTrace={openTrace} />
+            <ActivityPanel members={members} activity={activity} audits={audits} runs={runs} onOpenTrace={openTrace} />
+          ) : rightTab === "audit" ? (
+            <AuditPanel audits={audits} />
           ) : rightTab === "archives" ? (
             <ArchivePanel
               archives={archives}
@@ -4399,9 +4422,9 @@ function PaneResizer({
 function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnapshot | null {
   if (!current) return current;
   if (event.type === "messages-cleared") {
-    return current.messages.length === 0 && current.activity.length === 0
+    return current.messages.length === 0 && current.activity.length === 0 && current.audits.length === 0
       ? current
-      : { ...current, messages: [], questions: [], activity: [] };
+      : { ...current, messages: [], questions: [], activity: [], audits: [] };
   }
   if (event.type === "tasks-cleared") {
     return current.tasks.length === 0 ? current : { ...current, tasks: [] };
@@ -4436,6 +4459,10 @@ function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnaps
   }
   if (event.type === "activity") {
     return { ...current, activity: appendActivity(current.activity, [event.event]) };
+  }
+  if (event.type === "audit") {
+    const next = upsert(current.audits, event.record).sort((a, b) => a.at - b.at).slice(-80);
+    return { ...current, audits: next };
   }
   return current;
 }

@@ -6,7 +6,9 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import type { Member } from "../../src/core/types";
+import type { AuditRecord } from "../../src/agent/audit/types";
 import { ACTIVITY_META, summarizeExecution, type ActivityEvent, type RunningView } from "./activity-model";
+import { AuditCard } from "./AuditPanel";
 import { Icon } from "./icons";
 
 function clock(ts: number): string {
@@ -31,11 +33,13 @@ const STATUS_LABEL: Record<"running" | "idle" | "error" | "cancelled", string> =
 export function ActivityPanel({
   members,
   activity,
+  audits,
   runs,
   onOpenTrace,
 }: {
   members: Member[];
   activity: ActivityEvent[];
+  audits: AuditRecord[];
   runs: Record<string, RunningView>;
   /** 右侧执行面板里也能直接切到卡通运行现场，避免只认侧边栏入口。 */
   onOpenTrace?(): void;
@@ -141,6 +145,24 @@ export function ActivityPanel({
                 </button>
               );
             })}
+          </div>
+        )}
+      </section>
+
+      <section className="activity-audits" aria-label="任务审计">
+        <div className="activity-section-head">
+          <span>任务审计</span>
+          <span className="activity-hint">带验收条款的任务交付后自动核对</span>
+        </div>
+        {audits.length === 0 ? (
+          <div className="activity-empty">
+            暂无审计。任务写了验收条款后，成员每轮交付完都会核对证据。
+          </div>
+        ) : (
+          <div className="audit-cards">
+            {audits.slice(-6).reverse().map((audit) => (
+              <AuditCard key={audit.id} audit={audit} />
+            ))}
           </div>
         )}
       </section>

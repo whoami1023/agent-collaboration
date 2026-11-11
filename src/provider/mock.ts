@@ -118,6 +118,33 @@ export function demoHandler(): MockHandler {
     const userText = lastUserText(request);
     const steps = assistantSteps(request);
 
+    // 持续审计的模型调用：演示模型也返回严格 JSON，方便本地看完整链路。
+    if (system.includes("独立的任务审计员")) {
+      const hasFiles =
+        userText.includes("=== 文件：") &&
+        !userText.includes("（未提供正文）") &&
+        !userText.includes("（无成果文件）");
+      return {
+        text: JSON.stringify({
+          criteria: [
+            hasFiles
+              ? {
+                  criterion: "任务成果已经落盘",
+                  verdict: "pass",
+                  evidence: "成果文件摘录里给出了文件正文",
+                  fix_hint: "",
+                }
+              : {
+                  criterion: "任务成果已经落盘",
+                  verdict: "fail",
+                  evidence: "证据里没有成果文件",
+                  fix_hint: "先把成果写入文件工作区，再在群里说明证据",
+                },
+          ],
+        }),
+      };
+    }
+
     if (isMain) {
       if (userText.includes("交回了结果")) {
         return { text: "已收到成员报告，核对证据后给用户综合结论。" };

@@ -596,6 +596,7 @@ export function createApp(deps: AppDeps): express.Express {
       tasks: scope.room.board.list(),
       questions: scope.workspace.listQuestions(scope.room.descriptor.id),
       activity: scope.workspace.listActivity(scope.room.descriptor.id),
+      audits: scope.workspace.listAudits(scope.room.descriptor.id),
       settings: maskSettings(scope.workspace.getSettings()),
     });
   });

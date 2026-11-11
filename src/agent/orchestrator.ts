@@ -37,6 +37,7 @@ import { CRON_SENDER_ID } from "../cron/types";
 import type { CronTurnOutcome } from "../cron/types";
 import type { CronService } from "../cron/service";
 import type { MockHandler } from "../provider/mock";
+import type { AuditHost } from "./audit/types";
 import { resolveSpawnAdmission, countChildren } from "./spawn/spawn-plan";
 import { reserveChildAdmissionSlot } from "./spawn/child-admission";
 import { normalizeMemberName } from "./spawn/task-name";
@@ -116,6 +117,8 @@ export class Orchestrator {
   private readonly workQueue: WorkQueue;
   /** 已经排进运行槽的队列行：同一行不会被并发调度两次。 */
   private readonly scheduledWork = new Set<string>();
+  /** 持续审计：成员一轮交付后核对任务验收，由工作区在两边都建好后回灌。 */
+  private auditHost?: AuditHost;
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.workQueue = deps.workQueue ?? new WorkQueue(deps.bus.roomId);
@@ -164,6 +167,33 @@ export class Orchestrator {
   /** 工作区建好调度器之后回灌：成员工具通过它读写本账号的定时任务。 */
   setCron(cron: CronService): void {
     this.cronService = cron;
+  }
+
+  /** 工作区建好审计服务之后回灌：运行收尾时用它核对任务验收。 */
+  setAudit(host: AuditHost): void {
+    this.auditHost = host;
+  }
+
+  /**
+   * 审计催办：落一条系统消息并唤醒成员。系统消息不进执行轨迹、不触发自动派发，
+   * 只借 wake 走既有的队列/运行槽，因此不会绕过停止与取消闸门。
+   */
+  requestAuditNudge(memberId: string, text: string, taskId: string): boolean {
+    if (this.stopped) return false;
+    const member = this.deps.bus.getMember(memberId);
+    if (!member || member.status === "cancelled") return false;
+    const message = this.deps.bus.append({
+      senderId: SYSTEM_ID,
+      senderName: "审计",
+      senderKind: "system",
+      kind: "system",
+      text,
+      mentions: [memberId],
+      taskId,
+      depthTurn: 0,
+    });
+    this.wake(memberId, message);
+    return true;
   }
 
   /**
@@ -656,6 +686,7 @@ export class Orchestrator {
       return;
     }
     const observed: {
+      runId?: string;
       terminal?:
         | { status: "ok"; text: string }
         | { status: "error"; error: string }
@@ -664,6 +695,7 @@ export class Orchestrator {
     const unsubscribe = this.deps.bus.subscribe((event) => {
       if (event.type !== "run" || event.event.memberId !== memberId) return;
       const run = event.event;
+      observed.runId = run.runId;
       if (run.type === "run-final") observed.terminal = { status: "ok", text: run.text };
       else if (run.type === "run-error") observed.terminal = { status: "error", error: run.error };
       else if (run.type === "run-aborted") {
@@ -699,6 +731,14 @@ export class Orchestrator {
       this.workQueue.cancel(itemId, "会话已清除");
     } else {
       this.workQueue.cancel(itemId, "运行已取消");
+    }
+    // 只审「正常收尾」的一轮；中止/超时由续跑入口处理，不把半截工作当审计证据。
+    if (!this.stopped && terminal?.status === "ok") {
+      this.auditHost?.afterRun({
+        memberId,
+        ...(observed.runId ? { runId: observed.runId } : {}),
+        ...(trigger.taskId ? { taskId: trigger.taskId } : {}),
+      });
     }
     this.drainMemberWork(memberId);
   }

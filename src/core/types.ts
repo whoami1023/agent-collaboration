@@ -2,6 +2,7 @@ import type { CronJob, CronJobState, CronRunRecord } from "../cron/types";
 import type { LearningProposal, ReviewLog } from "../agent/learning/types";
 import type { QuestionItem } from "../room/questions";
 import type { ActivityEvent } from "../room/activity-log";
+import type { AuditRecord } from "../agent/audit/types";
 
 export const USER_ID = "user";
 export const SYSTEM_ID = "system";
@@ -389,6 +390,7 @@ export type RoomEvent =
   | { type: "task"; task: TaskCard }
   | { type: "question"; question: QuestionItem }
   | { type: "activity"; event: ActivityEvent }
+  | { type: "audit"; record: AuditRecord }
   | { type: "run"; event: AgentEvent }
   | { type: "model-usage"; usage: ModelUsageEvent }
   /** 一次后台复盘的产出：提案（可能为空）+ 流水，前端据此刷新「学习」面板。 */

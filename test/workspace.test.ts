@@ -336,6 +336,52 @@ describe("WorkspaceRegistry", () => {
     expect(restored.listActivity()).toHaveLength(0);
   });
 
+  it("审计记录与任务进度随房间落盘，清会话后一并清空", async () => {
+    const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
+    alice.room().audits.add({
+      id: "audit_1",
+      roomId: "room_main",
+      taskId: "task_1",
+      taskTitle: "写报告",
+      memberId: "m_main",
+      memberName: "主智能体",
+      at: 10,
+      verdict: "fail",
+      summary: { passed: 0, failed: 1, unsure: 0, total: 1 },
+      criteria: [
+        { id: 1, criterion: "报告存在", verdict: "fail", evidence: "未找到", fixHint: "补文件" },
+      ],
+      stateHash: "hash_1",
+      sources: { messages: 1, tools: 0, files: [] },
+      action: "nudge",
+      interventionCount: 1,
+      maxInterventions: 2,
+      taskSolved: false,
+      modelRef: "demo/mock",
+    });
+    alice.room().audits.setState("task_1", {
+      taskId: "task_1",
+      bestPassed: 0,
+      nudges: 1,
+      totalNudges: 1,
+      noProgress: 0,
+      lastHash: "hash_1",
+    });
+    await alice.close();
+
+    const skills2 = new SkillLibrary(join(dir, "skills.json"), { seedShared: false });
+    await skills2.init();
+    const reloaded = new WorkspaceRegistry(dir, skills2);
+    registry = reloaded;
+    const restored = await reloaded.get({ id: "u_alice", displayName: "Alice" });
+    expect(restored.listAudits()).toHaveLength(1);
+    expect(restored.room().audits.stateOf("task_1")).toMatchObject({ nudges: 1, bestPassed: 0 });
+
+    await restored.clearRoomSession();
+    expect(restored.listAudits()).toHaveLength(0);
+    expect(restored.room().audits.stateOf("task_1")).toBeUndefined();
+  });
+
   it("首次加载即生成智能体档案文件，且不覆盖已有内容", async () => {
     const alice = await registry.get({ id: "u_alice", displayName: "Alice" });
     const files = await alice.memory.listAgentFiles();

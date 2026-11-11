@@ -72,6 +72,18 @@ describe("group-chat collaboration", () => {
     expect(types.slice(finalIndex + 1)).not.toContain("reasoning");
   });
 
+  it("审计催办落一条系统消息并唤醒成员", async () => {
+    const handler: MockHandler = () => ({ text: "收到审计意见，继续补证据。" });
+    const { bus, orchestrator } = await makeRig(handler);
+    expect(orchestrator.requestAuditNudge("m_main", "【持续审计】还有 1 项未通过", "task_x")).toBe(true);
+    const nudge = bus.listMessages().at(-1);
+    expect(nudge?.senderKind).toBe("system");
+    expect(nudge?.taskId).toBe("task_x");
+    await waitFor(() => bus.listMessages().some((message) => message.senderKind === "member"));
+    expect(bus.listMessages().at(-1)?.text).toContain("继续补证据");
+    expect(orchestrator.requestAuditNudge("m_missing", "x", "task_x")).toBe(false);
+  });
+
   it("清空聊天记录后历史为空，seq 继续递增并广播 messages-cleared", () => {
     const bus = new RoomBus("room_test", "测试群");
     const events: string[] = [];
