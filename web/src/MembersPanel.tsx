@@ -45,6 +45,7 @@ export function MembersPanel({
   onClose(): void;
 }) {
   const running = members.filter((member) => member.status === "running").length;
+  const waiting = members.filter((member) => member.status === "waiting").length;
   const problems = members.filter(
     (member) => member.status === "error" || member.status === "cancelled",
   ).length;
@@ -76,6 +77,10 @@ export function MembersPanel({
           <span className={`roster-stat${running > 0 ? " live" : ""}`}>
             <strong>{running}</strong>
             <span>运行中</span>
+          </span>
+          <span className={`roster-stat${waiting > 0 ? " waiting" : ""}`}>
+            <strong>{waiting}</strong>
+            <span>等待回答</span>
           </span>
           <span className={`roster-stat${problems > 0 ? " warn" : ""}`}>
             <strong>{problems}</strong>
@@ -149,7 +154,7 @@ export function MembersPanel({
                     ) : null}
                   </button>
                   <div className="roster-card-actions">
-                    {member.status === "running" ? (
+                    {member.status === "running" || member.status === "waiting" ? (
                       <button type="button" className="btn sm" onClick={() => onCancel(member.id)}>
                         取消
                       </button>

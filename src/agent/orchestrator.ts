@@ -11,7 +11,7 @@ import {
   WorkQueue,
   type WorkItem,
 } from "../room/work-queue";
-import type { QuestionStore } from "../room/questions";
+import { formatAnswerMessage, type QuestionItem, type QuestionStore } from "../room/questions";
 import type { Workboard } from "../workboard/board";
 import { decideWakes } from "../room/wake";
 import {
@@ -274,6 +274,15 @@ export class Orchestrator {
         if (run.type === "run-final") {
           if (!wasRunning && !startedRuns.has(run.runId)) return;
           finish({ status: "ok", text: run.text, memberId });
+          return;
+        }
+        if (run.type === "run-suspended") {
+          finish({
+            status: "aborted",
+            text: "",
+            memberId,
+            error: "运行已暂停：成员提出了需要用户回答的问题",
+          });
           return;
         }
         if (run.type === "run-error") {
@@ -542,6 +551,8 @@ export class Orchestrator {
   private dispatch(message: RoomMessage): void {
     const limits = this.deps.getSettings().limits;
     if (message.seq <= this.stoppedThroughSeq) return;
+    // 回答消息已经由问答链路精确续跑到提问者那一轮，不再走普通派发。
+    if (message.resumeQuestionId) return;
     const chainId = message.chainRootId ?? message.id;
     // 用户消息开一条新的任务链；成员消息沿 chainRootId 继续同一份台账。
     if (message.senderKind === "user" && !message.chainRootId) {
@@ -750,6 +761,8 @@ export class Orchestrator {
     const member = this.deps.bus.getMember(memberId);
     if (!member || member.status === "cancelled") return;
     const chainId = trigger.chainRootId ?? trigger.id;
+    // 同一任务链在等用户回答：成员/系统触发的自动唤醒先停下；用户显式消息照常入队。
+    if (trigger.senderKind !== "user" && this.workQueue.isWaitingChain(chainId)) return;
     const stopped = this.turnBudget.stopReason(chainId);
     if (stopped) {
       this.notifyTurnBudget(chainId, stopped);
@@ -774,6 +787,8 @@ export class Orchestrator {
     if (!item) return;
     // 时间旅行：先挂上分支日志，再排运行；runWorkItem 会把它当作断点续跑。
     if (resumeRunId) this.workQueue.attachRun(item.id, resumeRunId);
+    // 成员有提问在等回答：新触发只入队，等答复恢复后再按顺序排。
+    if (this.workQueue.waitingForMember(memberId)) return;
     this.scheduleWorkItem(runtime, member.id, trigger, item.id);
   }
 
@@ -816,6 +831,7 @@ export class Orchestrator {
       runId?: string;
       terminal?:
         | { status: "ok"; text: string }
+        | { status: "suspended"; questionId: string; messageId: string }
         | { status: "error"; error: string }
         | { status: "aborted"; reason?: "timeout" | "cancelled" | "silent" | "removed" };
     } = {};
@@ -834,11 +850,18 @@ export class Orchestrator {
       const run = event.event;
       observed.runId = run.runId;
       if (run.type === "run-final") observed.terminal = { status: "ok", text: run.text };
-      else if (run.type === "run-error") observed.terminal = { status: "error", error: run.error };
+      else if (run.type === "run-suspended") {
+        observed.terminal = {
+          status: "suspended",
+          questionId: run.questionId,
+          messageId: run.messageId,
+        };
+      } else if (run.type === "run-error") observed.terminal = { status: "error", error: run.error };
       else if (run.type === "run-aborted") {
         observed.terminal = { status: "aborted", ...(run.reason ? { reason: run.reason } : {}) };
       }
-      if (observed.terminal) observeMission();
+      // 挂起不是交付：台账按「未收尾」看待，不把半截工作记成进展。
+      if (observed.terminal && observed.terminal.status !== "suspended") observeMission();
     });
     // 断点续跑：上次中断的运行日志还在且没有终局，就沿用它，把已完成的调用原样放回上下文。
     const prior = this.workQueue.get(itemId);
@@ -876,6 +899,10 @@ export class Orchestrator {
       }
     } else if (terminal.status === "ok") {
       this.workQueue.complete(itemId, terminal.text);
+    } else if (terminal.status === "suspended") {
+      // 挂起不是终局：义务行留在队列里等答案，恢复时用同一个 runId 沿日志续跑。
+      this.workQueue.waitForAnswer(itemId, terminal.questionId);
+      return;
     } else if (terminal.status === "error") {
       this.workQueue.fail(itemId, terminal.error);
     } else if (terminal.reason === "timeout") {
@@ -898,6 +925,77 @@ export class Orchestrator {
     this.drainMemberWork(memberId);
   }
 
+  /** 这条提问是否正把某个成员挂起：回答链路据此决定是否走精确续跑。 */
+  hasWaitingQuestion(questionId: string): boolean {
+    return this.workQueue.waitingForQuestion(questionId) !== undefined;
+  }
+
+  /**
+   * 用户答完一题：把挂起的义务行放回队列，并用回答消息沿同一份运行日志续跑。
+   * 返回 false 表示没有对应的挂起项（例如运行早已结束），调用方按普通唤醒处理。
+   */
+  resumeFromAnswer(question: QuestionItem, answer: RoomMessage): boolean {
+    if (this.stopped) return false;
+    const item = this.workQueue.waitingForQuestion(question.id);
+    if (!item) return false;
+    const member = this.deps.bus.getMember(item.memberId);
+    if (!member || member.status === "cancelled") {
+      this.workQueue.cancel(item.id, member ? "成员已取消" : "成员已不在册");
+      return false;
+    }
+    this.workQueue.resumeWaiting(item.id, answer);
+    const runtime = this.runtimeFor(member);
+    // 成员正在跑别的轮次：行留在 pending，由这一轮收尾后的 drainMemberWork 接着排。
+    if (!runtime.isRunning) this.scheduleWorkItem(runtime, member.id, answer, item.id);
+    return true;
+  }
+
+  /**
+   * 对账：把等待中的义务行与已落盘的问答状态对齐。
+   * 已回答 → 恢复原运行；已取消/记录缺失 → 结算取消；仍开放 → 继续等。
+   */
+  reconcileWaiting(): number {
+    if (this.stopped) return 0;
+    const questions = this.deps.questions;
+    if (!questions) return 0;
+    let resumed = 0;
+    for (const item of this.workQueue.listWaiting()) {
+      const question = item.questionId ? questions.get(item.questionId) : undefined;
+      if (!question) {
+        this.workQueue.cancel(item.id, "提问记录已不存在");
+        continue;
+      }
+      if (question.status === "canceled") {
+        this.workQueue.cancel(item.id, "提问已取消");
+        continue;
+      }
+      if (question.status !== "answered") continue;
+      const answer = this.answerMessageFor(question);
+      if (!answer) continue;
+      if (this.resumeFromAnswer(question, answer)) resumed += 1;
+    }
+    return resumed;
+  }
+
+  /** 回答回灌消息：优先复用已落盘的那条，缺失时补发一条，保证续跑拿到正确的触发上下文。 */
+  private answerMessageFor(question: QuestionItem): RoomMessage | null {
+    const bus = this.deps.bus;
+    const existing = bus.listMessages().find((message) => message.resumeQuestionId === question.id);
+    if (existing) return existing;
+    if (question.status !== "answered") return null;
+    return bus.append({
+      senderId: USER_ID,
+      senderName: "用户",
+      senderKind: "user",
+      kind: "chat",
+      text: formatAnswerMessage(question),
+      mentions: [question.askerId],
+      replyTo: question.messageId,
+      resumeQuestionId: question.id,
+      depthTurn: 0,
+    });
+  }
+
   /**
    * 启动恢复：把落盘的 pending 行重新排进运行槽位。
    * 超过恢复窗口、多次中断、成员不在册的一律明确结算，不静默丢。
@@ -905,11 +1003,15 @@ export class Orchestrator {
    */
   resumeQueue(): number {
     if (this.stopped) return 0;
+    // 先把等待中的行与问答状态对齐：重启前答完的接着跑，已取消/丢失的结算掉。
+    this.reconcileWaiting();
     const now = Date.now();
     let started = 0;
     const resumedMembers = new Set<string>();
     for (const item of this.workQueue.pending()) {
       if (resumedMembers.has(item.memberId)) continue;
+      // 成员仍在等回答：排队的行保持排队，答复恢复后再按顺序排。
+      if (this.workQueue.waitingForMember(item.memberId)) continue;
       const member = this.deps.bus.getMember(item.memberId);
       if (!member || member.status === "cancelled") {
         this.workQueue.cancel(item.id, member ? "成员已取消" : "成员已不在册");
@@ -935,6 +1037,8 @@ export class Orchestrator {
   /** 运行收尾后接着排同一成员的下一条待办；一次只开一条，避免 steer 吞掉后排的终局。 */
   private drainMemberWork(memberId: string): void {
     if (this.stopped) return;
+    // 成员正在等用户回答：后续排队项继续排队，答复恢复后再按顺序排。
+    if (this.workQueue.waitingForMember(memberId)) return;
     const runtime = this.runtimes.get(memberId);
     if (!runtime || runtime.isRunning) return;
     const next = this.workQueue

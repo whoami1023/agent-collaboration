@@ -225,6 +225,18 @@ function StateFx({ mood, accent }: { mood: TraceMood; accent: string }) {
       </>
     );
   }
+  if (mood === "waiting") {
+    // 头顶一个闪烁的问号：人停住了，等用户把答案给它。
+    return (
+      <g className="trace-wait-fx">
+        {px(15, 1, 4, 1, "#d99b2b", "trace-wait-a")}
+        {px(18, 2, 1, 1, "#d99b2b", "trace-wait-b")}
+        {px(17, 3, 1, 1, "#d99b2b", "trace-wait-c")}
+        {px(17, 4, 1, 1, "#d99b2b", "trace-wait-d")}
+        {px(17, 6, 1, 1, "#d99b2b", "trace-wait-e")}
+      </g>
+    );
+  }
   if (mood === "error") {
     return (
       <>

@@ -14,6 +14,7 @@ import {
 import { RoomBus } from "../src/room/bus";
 import { ensureMainMember } from "../src/agent/orchestrator";
 import { buildQuestionTools } from "../src/agent/question-tools";
+import { ToolSuspensionSignal } from "../src/agent/loop";
 import { SkillLibrary } from "../src/skills/library";
 import { WorkspaceRegistry } from "../src/workspace/workspace";
 import type { Member } from "../src/core/types";
@@ -207,12 +208,12 @@ describe("QuestionStore", () => {
 });
 
 describe("ask_user 工具与回答回灌", () => {
-  it("工具落一条 question 消息并把问题挂到消息 id 上", async () => {
+  it("工具落一条 question 消息并以挂起信号收束本轮", async () => {
     const bus = new RoomBus("room_test", "测试群");
     ensureMainMember(bus);
     const store = new QuestionStore("room_test");
     const tool = buildQuestionTools({ bus, member: member(), questions: store })[0]!;
-    const out = await tool.execute(
+    const pending = tool.execute(
       {
         title: "确认口径",
         questions: fields(),
@@ -221,7 +222,10 @@ describe("ask_user 工具与回答回灌", () => {
       },
       signal,
     );
-    expect(out).toContain("已向用户提出 2 个问题");
+    await expect(pending).rejects.toBeInstanceOf(ToolSuspensionSignal);
+    const signalPayload = await pending.catch((err: unknown) =>
+      err instanceof ToolSuspensionSignal ? err.suspension : null,
+    );
     const open = store.open();
     expect(open).toHaveLength(1);
     expect(open[0]?.urgency).toBe("urgent");
@@ -229,6 +233,11 @@ describe("ask_user 工具与回答回灌", () => {
     expect(message.kind).toBe("question");
     expect(message.text).toContain("【需要你回答】确认口径");
     expect(open[0]?.messageId).toBe(message.id);
+    expect(signalPayload).toMatchObject({
+      kind: "awaiting_user",
+      questionId: open[0]?.id,
+      messageId: message.id,
+    });
   });
 
   it("不合法的提问直接拒绝，不落消息", async () => {
@@ -286,6 +295,8 @@ describe("ask_user 工具与回答回灌", () => {
       "u_q",
     );
     expect(completed.question.status).toBe("answered");
+    expect(completed.resumed).toBe(false);
+    expect(completed.message?.resumeQuestionId).toBeUndefined();
     expect(completed.message?.senderKind).toBe("user");
     expect(completed.message?.mentions).toContain("m_main");
     expect(completed.message?.text).toContain("完整报告");

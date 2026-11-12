@@ -11,6 +11,7 @@ import type { RoomMessage } from "../core/types";
 export const WORK_ITEM_STATES = [
   "pending",
   "in_progress",
+  "waiting_user",
   "done",
   "failed",
   "canceled",
@@ -18,8 +19,11 @@ export const WORK_ITEM_STATES = [
 export type WorkItemState = (typeof WORK_ITEM_STATES)[number];
 export type WorkItemSource = "user" | "member" | "system";
 
-/** 活跃状态：还会被领取或取消；其余是终局。 */
-export const ACTIVE_WORK_STATES: readonly WorkItemState[] = ["pending", "in_progress"];
+/**
+ * 活跃状态：还会被领取、恢复或取消；其余是终局。
+ * `waiting_user` 也是活跃的（用户回答后恢复），但不可被领取。
+ */
+export const ACTIVE_WORK_STATES: readonly WorkItemState[] = ["pending", "in_progress", "waiting_user"];
 
 /** 容量与恢复窗口：终局行只留最近这些；超过窗口或多次中断的待办不再自动续跑。 */
 export const MAX_WORK_ITEMS = 200;
@@ -63,6 +67,8 @@ export interface WorkItem {
   recoveries: number;
   /** 本次义务最近一次运行的 runId：续跑时用它找到运行日志，不重跑已完成的调用。 */
   runId?: string;
+  /** 等待用户回答时挂起的问题 id；回答完成后清空。 */
+  questionId?: string;
   claimedAt?: number;
   finishedAt?: number;
   outcome?: WorkItemOutcome;
@@ -73,6 +79,7 @@ export interface WorkItem {
 export type WorkDerived =
   | "queued"
   | "working"
+  | "waiting"
   | "unclaimed-stalled"
   | "running-stalled"
   | "finished";
@@ -93,7 +100,7 @@ export interface WorkQueueOptions {
 }
 
 function isActive(state: WorkItemState): boolean {
-  return state === "pending" || state === "in_progress";
+  return state === "pending" || state === "in_progress" || state === "waiting_user";
 }
 
 function clip(text: string, max: number): string {
@@ -131,6 +138,7 @@ function normalizeTrigger(value: unknown, roomId: string): RoomMessage | null {
     ...(typeof raw["runScope"] === "string" ? { runScope: raw["runScope"] as RoomMessage["runScope"] } : {}),
     ...(typeof raw["depthTurn"] === "number" ? { depthTurn: raw["depthTurn"] } : {}),
     ...(typeof raw["chainRootId"] === "string" ? { chainRootId: raw["chainRootId"] } : {}),
+    ...(typeof raw["resumeQuestionId"] === "string" ? { resumeQuestionId: raw["resumeQuestionId"] } : {}),
   } as RoomMessage;
 }
 
@@ -254,6 +262,46 @@ export class WorkQueue {
     return item;
   }
 
+  /** 运行停在结构化提问上：工作项转入等待态，回答后回到 pending 并用同一个 runId 续跑。 */
+  waitForAnswer(id: string, questionId: string): WorkItem | null {
+    const item = this.get(id);
+    if (!item || item.state !== "in_progress") return null;
+    item.questionId = questionId;
+    this.transition(item, "waiting_user", item.memberId, "等待用户回答");
+    return item;
+  }
+
+  /** 收到回答：把等待项放回 pending，触发消息换成答案消息。 */
+  resumeWaiting(id: string, trigger: RoomMessage): WorkItem | null {
+    const item = this.get(id);
+    if (!item || item.state !== "waiting_user") return null;
+    item.trigger = { ...trigger, text: trigger.text.slice(0, MAX_TRIGGER_CHARS) };
+    delete item.questionId;
+    this.transition(item, "pending", "system", "收到回答，继续运行");
+    return item;
+  }
+
+  waitingForMember(memberId: string): boolean {
+    return this.items.some((item) => item.state === "waiting_user" && item.memberId === memberId);
+  }
+
+  waitingForQuestion(questionId: string): WorkItem | undefined {
+    return this.items.find((item) => item.state === "waiting_user" && item.questionId === questionId);
+  }
+
+  /** 同一任务链里有成员在等回答：自动唤醒先停下，用户显式消息不受影响。 */
+  isWaitingChain(chainRootId: string): boolean {
+    return this.items.some(
+      (item) =>
+        item.state === "waiting_user" &&
+        (item.trigger.chainRootId ?? item.trigger.id) === chainRootId,
+    );
+  }
+
+  listWaiting(): WorkItem[] {
+    return this.items.filter((item) => item.state === "waiting_user");
+  }
+
   complete(id: string, text: string): WorkItem | null {
     const item = this.get(id);
     if (!item || item.state !== "in_progress") return null;
@@ -327,10 +375,12 @@ export class WorkQueue {
   health(): WorkItemHealth[] {
     const at = this.now();
     return this.items.map((item) => {
-      const since = item.state === "pending" ? item.createdAt : (item.claimedAt ?? item.createdAt);
+      // pending 用 updatedAt：回答恢复会把等待项重新排队，它的排队时间应从恢复那一刻算。
+      const since = item.state === "pending" ? item.updatedAt : (item.claimedAt ?? item.createdAt);
       const ageMs = isActive(item.state) ? Math.max(0, at - since) : 0;
       let derived: WorkDerived;
       if (!isActive(item.state)) derived = "finished";
+      else if (item.state === "waiting_user") derived = "waiting";
       else if (item.state === "pending") {
         derived = ageMs > this.pendingStallMs ? "unclaimed-stalled" : "queued";
       } else {
@@ -404,6 +454,7 @@ export class WorkQueue {
       attempts: typeof raw["attempts"] === "number" ? Math.max(0, raw["attempts"]) : 0,
       recoveries: typeof raw["recoveries"] === "number" ? Math.max(0, raw["recoveries"]) : 0,
       ...(typeof raw["runId"] === "string" ? { runId: raw["runId"] } : {}),
+      ...(typeof raw["questionId"] === "string" ? { questionId: raw["questionId"] } : {}),
       ...(typeof raw["claimedAt"] === "number" ? { claimedAt: raw["claimedAt"] } : {}),
       ...(typeof raw["finishedAt"] === "number" ? { finishedAt: raw["finishedAt"] } : {}),
       ...(outcome ? { outcome } : {}),

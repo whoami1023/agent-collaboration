@@ -108,6 +108,8 @@ export class MemberRuntime {
   private controller: AbortController | null = null;
   private pending: LlmMessage[] = [];
   private running = false;
+  /** 本轮运行停在 ask_user 上：不要再排追加轮，等用户回答后续跑。 */
+  private suspended = false;
   /** 清空聊天记录引起的中止不写「已取消」系统消息，避免刚清空的会话又冒出一条。 */
   private silentAbort = false;
   /** 跨运行保留的字节压缩失败闩（OpenClaw transcriptByteCompactionLatch 的本项目等价物）。 */
@@ -148,11 +150,17 @@ export class MemberRuntime {
       return;
     }
     this.running = true;
+    this.suspended = false;
     try {
       let current = trigger;
       for (let round = 0; round < 3; round += 1) {
         // 运行日志只覆盖第一回合：后续回合是「运行中又收到消息」的追加轮，各自独立。
         await this.runOnce(current, round === 0 ? options : {});
+        if (this.suspended) {
+          // 等用户回答期间不再处理追加消息；它们留在队列里，回答后按顺序排。
+          this.pending = [];
+          break;
+        }
         if (this.pending.length === 0 || this.member.status === "cancelled") break;
         const drained = this.pending.splice(0, this.pending.length);
         current = {
@@ -179,6 +187,8 @@ export class MemberRuntime {
     this.controller = controller;
     /** 区分「跑满整轮超时」与「用户手动取消」：前者要给出可继续的恢复入口。 */
     let timedOut = false;
+    /** 本轮是被 ask_user 挂起的：不写终局、不关闭运行日志。 */
+    let suspendedHere = false;
     const timeout = setTimeout(() => {
       timedOut = true;
       controller.abort();
@@ -331,6 +341,13 @@ export class MemberRuntime {
       // 建议块作为**独立的一条用户消息**进本轮上下文，系统提示词一个字节都不动，前缀缓存照旧命中。
       const guidance = resume ? undefined : await this.collectAdvice(member, trigger, windowMessages, controller, runId);
       if (guidance) messages.push({ role: "user", content: guidance });
+      // 续跑的分支上下文来自运行日志；用户对挂起问题的回答不在日志里，必须在历史之后补进来。
+      const resumeFollowUp =
+        resume && trigger.resumeQuestionId
+          ? `${trigger.text}\n\n` +
+            "上面的内容是对你刚才提问的回答。请从被挂起的位置继续完成原来的任务，不要重复提问；" +
+            "如果回答要求调整计划，先说明调整，再继续执行。"
+          : undefined;
       const transport = resolveModelRuntime(
         member.modelRef,
         {
@@ -452,6 +469,7 @@ export class MemberRuntime {
               },
             }
           : {}),
+        ...(resumeFollowUp ? { resumeFollowUp } : {}),
         ...(runScope ? { toolUnavailable: (name: string) => scopeToolUnavailable(runScope, name) } : {}),
         maxSteps: limits.maxStepsPerRun,
         signal: controller.signal,
@@ -519,6 +537,25 @@ export class MemberRuntime {
 
       // 推理轨迹先于终局事件收尾，执行轨迹里「思考」才会排在交付前面。
       flushReasoning(true);
+
+      // 提问挂起：问题卡已经由工具发出，这里只收束运行，不发交付气泡、不关闭日志。
+      if (result.suspended) {
+        suspendedHere = true;
+        this.suspended = true;
+        journal?.pause({
+          questionId: result.suspended.questionId,
+          messageId: result.suspended.messageId,
+        });
+        this.emit({
+          type: "run-suspended",
+          runId,
+          memberId: this.member.id,
+          questionId: result.suspended.questionId,
+          messageId: result.suspended.messageId,
+        });
+        this.setStatus("waiting");
+        return;
+      }
 
       // 运行期间成员被移除：不再以已移除成员的身份往群里发言。
       if (!bus.getMember(this.member.id)) {
@@ -706,7 +743,8 @@ export class MemberRuntime {
       this.setStatus("error");
     } finally {
       // 任何未显式收尾的退出都按「中断」记账：日志保持可续跑，而不是伪装成成功。
-      finishJournal({ status: "aborted", reason: "interrupted" });
+      // 挂起是显式暂停，日志必须保持未完成，用户回答后才能沿同一份日志续跑。
+      if (!suspendedHere) finishJournal({ status: "aborted", reason: "interrupted" });
       flushReasoning(true);
       flushUsage();
       clearTimeout(timeout);

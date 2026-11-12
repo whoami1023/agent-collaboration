@@ -52,6 +52,43 @@ describe("RunJournalStore：记录与重建", () => {
     expect(loaded.terminal?.status).toBe("ok");
   });
 
+  it("挂起停留在等待用户回答：日志保持未完成，可长期保留并续跑", async () => {
+    const store = new RunJournalStore(join(await makeDir(), "journals"));
+    const recorder = store.start({
+      roomId: "room_test",
+      runId: "run_paused",
+      memberId: "m_main",
+      initialMessages: INITIAL,
+    })!;
+    const askCall = call("call_ask", "ask_user");
+    recorder.assistant(0, "", [askCall]);
+    recorder.toolResult(0, askCall, "本轮已挂起，等待用户回答", { ok: true });
+    recorder.pause({ questionId: "ask_1", messageId: "msg_1" });
+
+    const loaded = store.load("run_paused")!;
+    expect(loaded.done).toBe(false);
+    expect(loaded.paused).toEqual({ questionId: "ask_1", messageId: "msg_1" });
+    expect(loaded.pendingCalls).toEqual([]);
+    expect(loaded.messages.at(-1)?.content).toBe("本轮已挂起，等待用户回答");
+    expect(store.listRuns().find((run) => run.runId === "run_paused")?.paused).toBe(true);
+
+    // 回答后续跑同一份日志，最终可以正常收尾。
+    const resumed = store.start({
+      roomId: "room_test",
+      runId: "run_paused",
+      memberId: "m_main",
+      initialMessages: INITIAL,
+      resumeFrom: loaded,
+    })!;
+    expect(resumed.resumed).toBe(true);
+    resumed.assistant(1, "继续完成", []);
+    resumed.finish({ status: "ok", text: "继续完成", steps: 2 });
+    const final = store.load("run_paused")!;
+    expect(final.done).toBe(true);
+    expect(final.paused).toBeUndefined();
+    expect(final.messages.map((message) => message.role)).toEqual(["assistant", "tool", "assistant"]);
+  });
+
   it("中断在工具批次中间：只剩没有结果的调用，已完成的不再重跑", async () => {
     const store = new RunJournalStore(join(await makeDir(), "journals"));
     const recorder = store.start({

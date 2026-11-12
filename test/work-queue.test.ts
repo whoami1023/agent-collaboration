@@ -11,6 +11,7 @@ import {
   WorkQueue,
 } from "../src/room/work-queue";
 import { RoomBus } from "../src/room/bus";
+import { QuestionStore, formatAnswerMessage } from "../src/room/questions";
 import { Workboard } from "../src/workboard/board";
 import { Orchestrator, ensureMainMember } from "../src/agent/orchestrator";
 import { SkillLibrary } from "../src/skills/library";
@@ -191,6 +192,43 @@ describe("WorkQueue：状态机与持久化", () => {
     // 快照是副本：改它不影响队列本身。
     snapshot[0]!.state = "canceled";
     expect(queue.list().find((item) => item.id === snapshot[0]!.id)?.state).not.toBe("canceled");
+  });
+
+  it("等待用户回答：转入 waiting_user，不可领取；回答后换触发消息回到队列", () => {
+    const queue = new WorkQueue("room_test");
+    const item = queue.enqueue({ memberId: "m_main", memberName: "主智能体", trigger: message() })!;
+    queue.claim(item.id);
+    expect(queue.waitForAnswer(item.id, "ask_1")?.state).toBe("waiting_user");
+    expect(queue.get(item.id)?.questionId).toBe("ask_1");
+    expect(queue.claim(item.id)).toBeNull();
+    expect(queue.pending()).toHaveLength(0);
+    expect(queue.waitingForMember("m_main")).toBe(true);
+    expect(queue.waitingForMember("m_other")).toBe(false);
+    expect(queue.waitingForQuestion("ask_1")?.id).toBe(item.id);
+    expect(queue.isWaitingChain("msg_1")).toBe(true);
+    expect(queue.health().find((entry) => entry.id === item.id)?.derived).toBe("waiting");
+
+    const answer = message({ id: "msg_ans", seq: 2, text: "完整报告", mentions: ["m_main"] });
+    expect(queue.resumeWaiting(item.id, answer)?.state).toBe("pending");
+    expect(queue.get(item.id)?.questionId).toBeUndefined();
+    expect(queue.get(item.id)?.trigger.id).toBe("msg_ans");
+    expect(queue.waitingForMember("m_main")).toBe(false);
+    expect(queue.isWaitingChain("msg_1")).toBe(false);
+    expect(queue.claim(item.id)?.state).toBe("in_progress");
+  });
+
+  it("等待态随快照水合，重启后仍不可领取", () => {
+    const queue = new WorkQueue("room_test");
+    const item = queue.enqueue({ memberId: "m_main", memberName: "主智能体", trigger: message() })!;
+    queue.claim(item.id);
+    queue.waitForAnswer(item.id, "ask_1");
+
+    const restored = new WorkQueue("room_test");
+    restored.hydrate(queue.snapshot());
+    expect(restored.get(item.id)?.state).toBe("waiting_user");
+    expect(restored.get(item.id)?.questionId).toBe("ask_1");
+    expect(restored.listWaiting()).toHaveLength(1);
+    expect(restored.recoverInterrupted()).toBe(0);
   });
 
   it("运行日志 id 只挂活跃行，随快照保留且可续跑", () => {
@@ -511,6 +549,301 @@ describe("编排器接入持久队列", () => {
     await waitFor(() => queue.list().every((item) => item.state === "done"));
     expect(queue.list()).toHaveLength(2);
     expect(queue.list().every((item) => item.attempts === 1)).toBe(true);
+  });
+
+  const askQuestions = [
+    {
+      id: "scope",
+      question: "报告范围选哪个？",
+      options: [
+        { id: "brief", label: "只要摘要" },
+        { id: "full", label: "完整报告", recommended: true },
+      ],
+    },
+    {
+      id: "audience",
+      question: "主要读者是谁？",
+      options: [
+        { id: "exec", label: "管理层" },
+        { id: "team", label: "执行团队" },
+      ],
+    },
+  ];
+
+  it("提问挂起：义务行转 waiting_user，不发交付，也不再请求模型", async () => {
+    const rig = await makeRig();
+    const queue = new WorkQueue("room_test");
+    const questions = new QuestionStore("room_test");
+    let calls = 0;
+    const orchestrator = new Orchestrator({
+      bus: rig.bus,
+      board: rig.board,
+      getSettings: () => rig.settings,
+      skills: rig.skills,
+      ownerId: "u_test",
+      files: rig.files,
+      workQueue: queue,
+      questions,
+      mockHandler: () => {
+        calls += 1;
+        return calls === 1
+          ? {
+              text: "先确认口径",
+              toolCalls: [{ name: "ask_user", args: { title: "确认口径", questions: askQuestions } }],
+            }
+          : { text: "不该出现的收尾" };
+      },
+    });
+    const finals: string[] = [];
+    rig.bus.subscribe((event) => {
+      if (event.type === "run" && event.event.type === "run-final") finals.push(event.event.runId);
+    });
+    orchestrator.sendUserMessage("先确认口径再写报告");
+    await waitFor(() => queue.list().some((item) => item.state === "waiting_user"));
+
+    expect(calls).toBe(1);
+    expect(finals).toHaveLength(0);
+    const item = queue.list()[0]!;
+    expect(item.questionId).toBe(questions.open()[0]?.id);
+    expect(rig.bus.getMember("m_main")?.status).toBe("waiting");
+    expect(rig.bus.listMessages(20).some((message) => message.kind === "question")).toBe(true);
+  });
+
+  it("回答后沿同一份运行日志续跑，回答插在挂起位置之后", async () => {
+    const rig = await makeRig();
+    const journalDir = await mkdtemp(join(tmpdir(), "ac-workqueue-suspended-"));
+    tempDirs.push(journalDir);
+    const journals = new RunJournalStore(journalDir);
+    const queue = new WorkQueue("room_test");
+    const questions = new QuestionStore("room_test");
+    const requests: LlmMessage[][] = [];
+    let calls = 0;
+    const orchestrator = new Orchestrator({
+      bus: rig.bus,
+      board: rig.board,
+      getSettings: () => rig.settings,
+      skills: rig.skills,
+      ownerId: "u_test",
+      files: rig.files,
+      workQueue: queue,
+      questions,
+      journals,
+      mockHandler: (request) => {
+        requests.push(request.messages);
+        calls += 1;
+        return calls === 1
+          ? {
+              text: "先确认口径",
+              toolCalls: [{ name: "ask_user", args: { title: "确认口径", questions: askQuestions } }],
+            }
+          : { text: "按回答继续完成" };
+      },
+    });
+    orchestrator.sendUserMessage("先确认口径再写报告");
+    await waitFor(() => queue.list().some((item) => item.state === "waiting_user"));
+    const item = queue.list()[0]!;
+    const runId = item.runId;
+    expect(runId).toBeTruthy();
+
+    const question = questions.open()[0]!;
+    questions.answer(question.id, "scope", { optionId: "full" }, "u_test");
+    questions.answer(question.id, "audience", { text: "董事会" }, "u_test");
+    const answered = questions.get(question.id)!;
+    const answerMessage = rig.bus.append({
+      senderId: "user",
+      senderName: "用户",
+      senderKind: "user",
+      kind: "chat",
+      text: formatAnswerMessage(answered),
+      mentions: ["m_main"],
+      resumeQuestionId: answered.id,
+      depthTurn: 0,
+    });
+    expect(orchestrator.hasWaitingQuestion(answered.id)).toBe(true);
+    expect(orchestrator.resumeFromAnswer(answered, answerMessage)).toBe(true);
+    await waitFor(() => queue.get(item.id)?.state === "done");
+
+    expect(calls).toBe(2);
+    const resumed = requests[1]!.map((message) => `${message.role}:${message.content}`).join("\n");
+    expect(resumed).toContain("完整报告");
+    expect(resumed).toContain("董事会");
+    expect(resumed).toContain("上面的内容是对你刚才提问的回答");
+    const toolAt = resumed.indexOf("本轮已挂起");
+    const answerAt = resumed.indexOf("上面的内容是对你刚才提问的回答");
+    expect(toolAt).toBeGreaterThanOrEqual(0);
+    expect(answerAt).toBeGreaterThan(toolAt);
+
+    expect(queue.get(item.id)?.runId).toBe(runId);
+    expect(queue.get(item.id)?.questionId).toBeUndefined();
+    expect(queue.get(item.id)?.outcome?.text).toBe("按回答继续完成");
+    expect(journals.load(runId!)?.done).toBe(true);
+  });
+
+  it("等待期间同一成员的新触发只排队，回答后才按顺序跑", async () => {
+    const rig = await makeRig();
+    const queue = new WorkQueue("room_test");
+    const questions = new QuestionStore("room_test");
+    const requests: string[] = [];
+    let calls = 0;
+    const orchestrator = new Orchestrator({
+      bus: rig.bus,
+      board: rig.board,
+      getSettings: () => rig.settings,
+      skills: rig.skills,
+      ownerId: "u_test",
+      files: rig.files,
+      workQueue: queue,
+      questions,
+      mockHandler: (request) => {
+        calls += 1;
+        requests.push(request.messages.map((message) => message.content).join("\n"));
+        return calls === 1
+          ? {
+              text: "先确认口径",
+              toolCalls: [{ name: "ask_user", args: { title: "确认口径", questions: askQuestions } }],
+            }
+          : { text: "继续完成" };
+      },
+    });
+    orchestrator.sendUserMessage("先确认口径再写报告");
+    await waitFor(() => queue.list().some((item) => item.state === "waiting_user"));
+    const paused = queue.list()[0]!;
+
+    // 同一成员又来一条用户消息：只入队，不并发开跑。
+    orchestrator.sendUserMessage("顺便再检查一下格式");
+    await waitFor(() => queue.list().length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(calls).toBe(1);
+    expect(queue.pending().some((item) => item.memberId === "m_main")).toBe(true);
+
+    const question = questions.open()[0]!;
+    questions.answer(question.id, "scope", { optionId: "full" }, "u_test");
+    questions.answer(question.id, "audience", { text: "董事会" }, "u_test");
+    const answered = questions.get(question.id)!;
+    const answerMessage = rig.bus.append({
+      senderId: "user",
+      senderName: "用户",
+      senderKind: "user",
+      kind: "chat",
+      text: formatAnswerMessage(answered),
+      mentions: ["m_main"],
+      resumeQuestionId: answered.id,
+      depthTurn: 0,
+    });
+    orchestrator.resumeFromAnswer(answered, answerMessage);
+
+    await waitFor(() => queue.list().every((item) => ["done", "failed", "canceled"].includes(item.state)));
+    expect(queue.get(paused.id)?.state).toBe("done");
+    expect(calls).toBe(3);
+  });
+
+  it("重启对账：已取消的提问结算取消，仍开放的继续等待", async () => {
+    const rig = await makeRig();
+    const trigger = rig.bus.append({
+      senderId: "user",
+      senderName: "用户",
+      senderKind: "user",
+      kind: "chat",
+      text: "处理一件事",
+      depthTurn: 0,
+    });
+    const queue = new WorkQueue("room_test");
+    const questions = new QuestionStore("room_test");
+    const item = queue.enqueue({ memberId: "m_main", memberName: "主智能体", trigger })!;
+    queue.claim(item.id);
+    const question = questions.ask({
+      messageId: "msg_q",
+      askerId: "m_main",
+      askerName: "主智能体",
+      questions: askQuestions,
+    });
+    queue.waitForAnswer(item.id, question.id);
+    questions.cancel(question.id, "u_test", "不需要了");
+
+    const orchestrator = new Orchestrator({
+      bus: rig.bus,
+      board: rig.board,
+      getSettings: () => rig.settings,
+      skills: rig.skills,
+      ownerId: "u_test",
+      files: rig.files,
+      workQueue: queue,
+      questions,
+      mockHandler: () => ({ text: "不该运行" }),
+    });
+    expect(orchestrator.resumeQueue()).toBe(0);
+    expect(queue.get(item.id)?.state).toBe("canceled");
+    expect(queue.get(item.id)?.outcome?.error).toBe("提问已取消");
+  });
+
+  it("重启对账：答完但没来得及续跑的等待行会补发回答并接着跑", async () => {
+    const rig = await makeRig();
+    const journalDir = await mkdtemp(join(tmpdir(), "ac-workqueue-reconcile-"));
+    tempDirs.push(journalDir);
+    const journals = new RunJournalStore(journalDir);
+    const trigger = rig.bus.append({
+      senderId: "user",
+      senderName: "用户",
+      senderKind: "user",
+      kind: "chat",
+      text: "先确认口径再写报告",
+      depthTurn: 0,
+    });
+    const queue = new WorkQueue("room_test");
+    const questions = new QuestionStore("room_test");
+    const item = queue.enqueue({ memberId: "m_main", memberName: "主智能体", trigger })!;
+    queue.claim(item.id);
+    const runId = "run_reconcile_answered";
+    queue.attachRun(item.id, runId);
+    const question = questions.ask({
+      messageId: "msg_q",
+      askerId: "m_main",
+      askerName: "主智能体",
+      questions: askQuestions,
+    });
+    queue.waitForAnswer(item.id, question.id);
+    // 上一进程：提问工具已落卡并挂起，回答落账后进程在续跑前退出。
+    const recorder = journals.start({
+      roomId: "room_test",
+      runId,
+      memberId: "m_main",
+      workItemId: item.id,
+      initialMessages: [{ role: "user", content: "先确认口径再写报告" }],
+    })!;
+    const askCall: ToolCall = { id: "call_ask", name: "ask_user", args: {} };
+    recorder.assistant(0, "", [askCall]);
+    recorder.toolResult(0, askCall, "本轮已挂起，等待用户回答", { ok: true });
+    recorder.pause({ questionId: question.id, messageId: "msg_q" });
+    questions.answer(question.id, "scope", { optionId: "full" }, "u_test");
+    questions.answer(question.id, "audience", { text: "董事会" }, "u_test");
+
+    const requests: string[] = [];
+    const orchestrator = new Orchestrator({
+      bus: rig.bus,
+      board: rig.board,
+      getSettings: () => rig.settings,
+      skills: rig.skills,
+      ownerId: "u_test",
+      files: rig.files,
+      workQueue: queue,
+      questions,
+      journals,
+      mockHandler: (request) => {
+        requests.push(request.messages.map((message) => message.content).join("\n"));
+        return { text: "重启后继续完成" };
+      },
+    });
+    orchestrator.resumeQueue();
+    await waitFor(() => queue.get(item.id)?.state === "done");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toContain("董事会");
+    expect(requests[0]).toContain("上面的内容是对你刚才提问的回答");
+    expect(requests[0]).toContain("本轮已挂起");
+    const answerMessages = rig.bus
+      .listMessages(50)
+      .filter((message) => message.resumeQuestionId === question.id);
+    expect(answerMessages).toHaveLength(1);
+    expect(queue.get(item.id)?.runId).toBe(runId);
   });
 
   it("恢复闸门：超过窗口、多次中断、成员不在册都明确结算", () => {

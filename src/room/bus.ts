@@ -27,6 +27,8 @@ export interface AppendInput {
   chainRootId?: string;
   depthTurn?: number;
   resume?: ResumeHint;
+  /** 回答消息只用于续跑被挂起的提问：普通派发据此跳过它。 */
+  resumeQuestionId?: string;
   /** 派发时附带的上下文包；只给被派发的成员注入。 */
   handoff?: HandoffContext;
   /** 本轮运行姿态；见 RoomMessage.runScope。缺省按 normal 处理。 */
@@ -160,6 +162,7 @@ export class RoomBus {
       ...(input.chainRootId ? { chainRootId: input.chainRootId } : {}),
       ...(input.depthTurn !== undefined ? { depthTurn: input.depthTurn } : {}),
       ...(input.resume ? { resume: input.resume } : {}),
+      ...(input.resumeQuestionId ? { resumeQuestionId: input.resumeQuestionId } : {}),
       ...(input.handoff ? { handoff: input.handoff } : {}),
       ...(input.runScope ? { runScope: input.runScope } : {}),
     };

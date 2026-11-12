@@ -8,7 +8,7 @@ import type { Member } from "../../src/core/types";
 import type { ActivityEvent, RunningView } from "./activity-model";
 
 export type TraceLook = "planner" | "researcher" | "coder" | "writer" | "member";
-export type TraceMood = "idle" | "thinking" | "working" | "done" | "error" | "cancelled";
+export type TraceMood = "idle" | "thinking" | "working" | "done" | "error" | "cancelled" | "waiting";
 
 export const TRACE_MOOD_LABEL: Record<TraceMood, string> = {
   idle: "待命",
@@ -17,6 +17,7 @@ export const TRACE_MOOD_LABEL: Record<TraceMood, string> = {
   done: "已交付",
   error: "出错了",
   cancelled: "已取消",
+  waiting: "等你回答",
 };
 
 export interface ToolRun {
@@ -216,6 +217,8 @@ function moodAndThought(
   run: RunningView | undefined,
   last: ActivityEvent | undefined,
 ): { mood: TraceMood; thought: string } {
+  // 挂起等答案时运行已经让出：成员状态比残留的运行流更能说明当前在等什么。
+  if (member.status === "waiting") return { mood: "waiting", thought: "已暂停，等你回答后继续" };
   if (run) {
     if (run.text) return { mood: "working", thought: "正在组织交付…" };
     const tool = run.tools.at(-1);
@@ -237,10 +240,11 @@ function moodAndThought(
 const MOOD_RANK: Record<TraceMood, number> = {
   working: 0,
   thinking: 1,
-  error: 2,
-  cancelled: 3,
-  done: 4,
-  idle: 5,
+  waiting: 2,
+  error: 3,
+  cancelled: 4,
+  done: 5,
+  idle: 6,
 };
 
 /** 生成角色列表：运行中的排前面，其余按最近活动排序。 */

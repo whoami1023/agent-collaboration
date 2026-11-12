@@ -600,8 +600,8 @@ export class Workspace {
   }
 
   /**
-   * 用户回答一题；全部问题答完后，把结构化答案作为用户消息发回群里并 @ 提问者，
-   * 由现有唤醒链路让提问者继续——答复不依赖提问者还在不在跑。
+   * 用户回答一题；全部问题答完后，把结构化答案作为用户消息发回群里。
+   * 若提问者那一轮正挂起等答案，就沿同一份运行日志续跑；否则退回普通唤醒，等它下次被叫起时读到回答。
    */
   async answerQuestion(
     roomId: string,
@@ -609,13 +609,16 @@ export class Workspace {
     fieldId: string,
     payload: { optionId?: string; text?: string },
     by: string,
-  ): Promise<{ question: QuestionItem; message: RoomMessage | null }> {
+  ): Promise<{ question: QuestionItem; message: RoomMessage | null; resumed: boolean }> {
     const room = this.room(roomId);
     const result = room.questions.answer(questionId, fieldId, payload, by);
     if (result.status !== "recorded") throw new RoomError(409, result.reason);
     let message: RoomMessage | null = null;
+    let resumed = false;
     if (result.complete) {
       const asker = room.bus.getMember(result.item.askerId);
+      // 有挂起的运行并且提问者还在册：这条消息只用来续跑，不再走普通派发。
+      const resumable = Boolean(asker) && room.orchestrator.hasWaitingQuestion(result.item.id);
       message = room.bus.append({
         senderId: USER_ID,
         senderName: "用户",
@@ -624,8 +627,10 @@ export class Workspace {
         text: formatAnswerMessage(result.item),
         mentions: asker ? [asker.id] : [],
         replyTo: result.item.messageId,
+        ...(resumable ? { resumeQuestionId: result.item.id } : {}),
         depthTurn: 0,
       });
+      if (resumable) resumed = room.orchestrator.resumeFromAnswer(result.item, message);
       if (!asker) {
         room.bus.append({
           senderId: SYSTEM_ID,
@@ -637,7 +642,7 @@ export class Workspace {
       }
     }
     await this.persistRoom(roomId);
-    return { question: result.item, message };
+    return { question: result.item, message, resumed };
   }
 
   listRooms(): RoomInfo[] {

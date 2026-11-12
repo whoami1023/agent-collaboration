@@ -113,6 +113,23 @@ describe("运行轨迹面板", () => {
     expect(markup).toContain("运行现场，可上下滑动查看全部成员");
   });
 
+  it("等待回答时顶部与角色状态都标出挂起", () => {
+    const markup = renderToStaticMarkup(
+      createElement(RunTracePanel, {
+        members: [member({ status: "waiting" })],
+        activity: [],
+        runs: {},
+        roomName: "作战室",
+        roomId: "room_main",
+        onClose: () => undefined,
+      }),
+    );
+    expect(markup).toContain("1 个等你回答");
+    expect(markup).toContain("等你回答");
+    expect(markup).toContain('data-mood="waiting"');
+    expect(markup).toContain("trace-wait-fx");
+  });
+
   it("轨迹带默认只展示最近几条，避免把运行现场挤小", () => {
     const markup = renderToStaticMarkup(
       createElement(RunTracePanel, {

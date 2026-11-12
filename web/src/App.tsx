@@ -985,7 +985,12 @@ function RoomView({
         if (run.type === "tool") {
           return { ...current, [run.memberId]: { ...entry, tools: [...entry.tools, run.name] } };
         }
-        if (run.type === "run-final" || run.type === "run-error" || run.type === "run-aborted") {
+        if (
+          run.type === "run-final" ||
+          run.type === "run-error" ||
+          run.type === "run-aborted" ||
+          run.type === "run-suspended"
+        ) {
           const copy = { ...current };
           delete copy[run.memberId];
           return copy;
@@ -1020,6 +1025,27 @@ function RoomView({
   const questionByMessageId = useMemo(
     () => new Map(questions.map((question) => [question.messageId, question])),
     [questions],
+  );
+  /** 提问者正在等答案：卡片据此提示「运行已暂停」。 */
+  const pausedQuestionIds = useMemo(() => {
+    const waiting = new Set(
+      members.filter((member) => member.status === "waiting").map((member) => member.id),
+    );
+    return new Set(
+      questions
+        .filter((question) => question.status === "open" && waiting.has(question.askerId))
+        .map((question) => question.id),
+    );
+  }, [members, questions]);
+  /** 回答消息带有 resumeQuestionId：说明这题的答案已经接回原运行。 */
+  const resumedQuestionIds = useMemo(
+    () =>
+      new Set(
+        messages
+          .map((message) => message.resumeQuestionId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    [messages],
   );
   const roomMode = state?.room.mode ?? "delegate";
   const roomRouting = state?.room.routing ?? "lead";
@@ -1061,6 +1087,7 @@ function RoomView({
   const groupRooms = (rooms ?? []).filter((room) => room.kind === "group");
   const panelVisible = boardOpen || takeover;
   const runningCount = members.filter((member) => member.status === "running").length;
+  const waitingCount = members.filter((member) => member.status === "waiting").length;
   const workspaceFileCount =
     workspaceFiles?.filter((file) => file.kind === "file").length ?? null;
 
@@ -2487,7 +2514,13 @@ function RoomView({
             >
               <Icon name="route" />
               <span>运行轨迹</span>
-              <span className="chip">{runningCount > 0 ? `${runningCount} 运行中` : "成员"}</span>
+              <span className="chip">
+                {runningCount > 0
+                  ? `${runningCount} 运行中${waitingCount > 0 ? ` · ${waitingCount} 等待回答` : ""}`
+                  : waitingCount > 0
+                    ? `${waitingCount} 等待回答`
+                    : "成员"}
+              </span>
             </button>
           ) : selectedMember ? (
             <button
@@ -2599,16 +2632,21 @@ function RoomView({
                   </p>
                 </div>
               )}
-              {messages.map((message) => (
-                <MessageBubble
-                  key={message.id}
-                  message={message}
-                  question={questionByMessageId.get(message.id)}
-                  nameById={nameById}
-                  onResume={handleResume}
-                  onAnswer={handleAnswerQuestion}
-                />
-              ))}
+              {messages.map((message) => {
+                const question = questionByMessageId.get(message.id);
+                return (
+                  <MessageBubble
+                    key={message.id}
+                    message={message}
+                    question={question}
+                    questionPaused={question ? pausedQuestionIds.has(question.id) : false}
+                    questionResumed={question ? resumedQuestionIds.has(question.id) : false}
+                    nameById={nameById}
+                    onResume={handleResume}
+                    onAnswer={handleAnswerQuestion}
+                  />
+                );
+              })}
               {Object.values(runs).map((run) => {
                 const name = nameById.get(run.memberId) ?? "成员";
                 return (
@@ -2775,7 +2813,9 @@ function RoomView({
                           ? "主智能体"
                           : member.status === "running"
                             ? "运行中"
-                            : "子成员"}
+                            : member.status === "waiting"
+                              ? "等待回答"
+                              : "子成员"}
                       </span>
                     </button>
                   ))}
@@ -4445,12 +4485,16 @@ function applyEvent(current: StateSnapshot | null, event: RoomEvent): StateSnaps
 function MessageBubble({
   message,
   question,
+  questionPaused = false,
+  questionResumed = false,
   nameById,
   onResume,
   onAnswer,
 }: {
   message: RoomMessage;
   question?: QuestionItem;
+  questionPaused?: boolean;
+  questionResumed?: boolean;
   nameById: Map<string, string>;
   onResume: (memberName: string) => void;
   onAnswer: (
@@ -4530,7 +4574,9 @@ function MessageBubble({
       ) : (
         <div className="bubble-text">{message.text}</div>
       )}
-      {question && <QuestionCard question={question} onAnswer={onAnswer} />}
+      {question && (
+        <QuestionCard question={question} paused={questionPaused} resumed={questionResumed} onAnswer={onAnswer} />
+      )}
     </article>
   );
 }
@@ -4546,9 +4592,13 @@ function answerTextOf(question: QuestionItem, field: QuestionField): string | un
 
 function QuestionCard({
   question,
+  paused,
+  resumed,
   onAnswer,
 }: {
   question: QuestionItem;
+  paused: boolean;
+  resumed: boolean;
   onAnswer: (
     questionId: string,
     fieldId: string,
@@ -4559,7 +4609,7 @@ function QuestionCard({
   const [busy, setBusy] = useState<string | null>(null);
   const open = question.status === "open";
   return (
-    <section className={`question-card ${question.status}`}>
+    <section className={`question-card ${question.status}${paused ? " paused" : ""}`}>
       <header className="question-head">
         <strong>{question.title}</strong>
         <span className="chip accent">
@@ -4569,6 +4619,15 @@ function QuestionCard({
           <span className="chip">{question.urgency === "critical" ? "紧急" : "较急"}</span>
         )}
       </header>
+      {paused && (
+        <p className="question-pause">
+          <span className="question-pause-dot" />
+          已暂停运行，等你回答后会自动从原处继续（同一份运行日志，不会再从头重跑）。
+        </p>
+      )}
+      {resumed && (
+        <p className="question-resumed">答案已接回原运行，智能体接着往下做。</p>
+      )}
       {question.unblocks && <p className="question-unblocks">回答后可以继续：{question.unblocks}</p>}
       {question.questions.map((field, index) => {
         const chosen = question.answers[field.id]?.optionId;

@@ -44,6 +44,27 @@ import type { RunJournalRecorder } from "../run-journal";
  */
 export type ToolRetryMode = "safe" | "idempotent" | "never";
 
+/**
+ * 工具主动挂起本轮运行：工具已经完成自己的副作用（如提问落卡），
+ * 循环不再请求模型，运行等待外部事件（如用户回答）后再从日志续跑。
+ */
+export interface ToolSuspension {
+  kind: "awaiting_user";
+  questionId: string;
+  messageId: string;
+}
+
+/**
+ * 挂起信号：工具用异常把控制权交还给循环（工具本身已完成副作用，不是失败）。
+ * 用异常而不是改 `execute` 的返回类型，是为了让所有现有工具与调用点保持返回字符串。
+ */
+export class ToolSuspensionSignal extends Error {
+  constructor(readonly suspension: ToolSuspension) {
+    super("本轮已挂起，等待用户回答");
+    this.name = "ToolSuspensionSignal";
+  }
+}
+
 export interface ToolImpl {
   schema: ToolSchema;
   /** 必须独占执行（与同一批其它工具串行）的工具。 */
@@ -149,6 +170,11 @@ export interface LoopOptions {
   journal?: RunJournalRecorder;
   /** 续跑状态；不传则从空上下文开始。 */
   resume?: LoopResumeState;
+  /**
+   * 续跑时追加在历史之后的用户消息（如对挂起问题的回答）。
+   * 必须排在 resume.messages 之后，模型才会把它当成「最新进展」而不是初始指令。
+   */
+  resumeFollowUp?: string;
 }
 
 /** 压缩后召回的合成消息标记：识别、去重与替换旧块都靠它。 */
@@ -187,6 +213,8 @@ export interface LoopResult {
   maxStepsReached?: boolean;
   /** 输出撞到模型长度上限、续写预算已用尽：交付的文本可能不完整，必须如实标注。 */
   truncated?: boolean;
+  /** 工具（ask_user）要求等待用户回答：本轮立即收束，不再请求模型。 */
+  suspended?: ToolSuspension;
 }
 
 type StopReason = "stop" | "toolUse" | "error";
@@ -323,6 +351,9 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   if (resume && resume.messages.length > 0) {
     messages.push(...resume.messages);
   }
+  if (resume && options.resumeFollowUp) {
+    messages.push({ role: "user", content: options.resumeFollowUp });
+  }
   if (resume) {
     for (const call of resume.pendingCalls) {
       throwIfAborted(options.signal);
@@ -340,6 +371,14 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
           Math.max(0, resume.steps - 1),
         );
         options.onToolResult?.(call, outcome.content, outcome.status);
+        if (outcome.suspend) {
+          return {
+            text: text.trim(),
+            steps: Math.max(0, resume.steps),
+            cancelled: false,
+            suspended: outcome.suspend,
+          };
+        }
       } else {
         const content =
           `上次运行在工具 ${call.name} 执行途中中断，无法确认这次调用是否已经生效。` +
@@ -571,9 +610,23 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       };
     }
 
-    const halt = await executeToolBatch(options, messages, calls, retryOptions, guardrails, step);
-    if (halt) {
-      return { text: text.trim(), steps: step + 1, cancelled: false, error: halt, errorCode: "guardrail_halt" };
+    const outcome = await executeToolBatch(options, messages, calls, retryOptions, guardrails, step);
+    if (outcome.suspend) {
+      return {
+        text: text.trim(),
+        steps: step + 1,
+        cancelled: false,
+        suspended: outcome.suspend,
+      };
+    }
+    if (outcome.halt) {
+      return {
+        text: text.trim(),
+        steps: step + 1,
+        cancelled: false,
+        error: outcome.halt,
+        errorCode: "guardrail_halt",
+      };
     }
   }
 
@@ -707,6 +760,13 @@ async function streamAgentResponse(
   }
 }
 
+interface BatchOutcome {
+  halt?: string;
+  suspend?: ToolSuspension;
+}
+
+const SUSPENDED_TOOL_RESULT = "未执行：本轮已挂起，等待用户回答；收到回答后会从被挂起的位置继续。";
+
 async function executeToolBatch(
   options: LoopOptions,
   messages: LlmMessage[],
@@ -714,7 +774,7 @@ async function executeToolBatch(
   retryOptions: RetryOptions,
   guardrails: ToolGuardrails,
   step: number,
-): Promise<string | undefined> {
+): Promise<BatchOutcome> {
   const batchVerdict = guardrails.beforeBatch(
     calls.map((call) => ({ name: call.name, args: call.args })),
   );
@@ -729,7 +789,7 @@ async function executeToolBatch(
       options.journal?.toolResult(step, call, batchVerdict.reason, status);
       guardrails.recordRefusal();
     }
-    return batchVerdict.action === "halt" ? batchVerdict.reason : undefined;
+    return batchVerdict.action === "halt" ? { halt: batchVerdict.reason } : {};
   }
 
   const resolved = calls.map((call) => {
@@ -763,6 +823,16 @@ async function executeToolBatch(
       const entry = resolved[index]!;
       options.onToolCall?.(entry.call);
       const outcome = await executeOne(options, messages, entry.call, entry.tool, retryOptions, guardrails, step);
+      if (outcome.suspend) {
+        for (let remaining = index + 1; remaining < resolved.length; remaining += 1) {
+          const call = resolved[remaining]?.call;
+          if (!call) continue;
+          messages.push({ role: "tool", toolCallId: call.id, content: SUSPENDED_TOOL_RESULT });
+          options.journal?.toolResult(step, call, SUSPENDED_TOOL_RESULT, { ok: false, code: "tool_failed" });
+        }
+        options.onToolResult?.(entry.call, outcome.content, outcome.status);
+        return { suspend: outcome.suspend };
+      }
       if (outcome.halt) {
         for (let remaining = index + 1; remaining < resolved.length; remaining += 1) {
           const call = resolved[remaining]?.call;
@@ -771,11 +841,11 @@ async function executeToolBatch(
           messages.push({ role: "tool", toolCallId: call.id, content });
           options.journal?.toolResult(step, call, content, { ok: false, code: "guardrail_halt" });
         }
-        return outcome.halt;
+        return { halt: outcome.halt };
       }
       options.onToolResult?.(entry.call, outcome.content, outcome.status);
     }
-    return undefined;
+    return {};
   }
 
   for (const entry of resolved) {
@@ -791,13 +861,17 @@ async function executeToolBatch(
       options.onToolResult?.(entry.call, outcome.content, outcome.status);
     }
   }
-  return outcomes.find((outcome) => outcome.halt)?.halt;
+  const suspended = outcomes.find((outcome) => outcome.suspend)?.suspend;
+  if (suspended) return { suspend: suspended };
+  const halt = outcomes.find((outcome) => outcome.halt)?.halt;
+  return halt ? { halt } : {};
 }
 
 interface CallOutcome {
   content: string;
   status: ToolResultStatus;
   halt?: string;
+  suspend?: ToolSuspension;
 }
 
 async function executeOne(
@@ -829,6 +903,7 @@ async function executeOne(
   }
 
   let raw: string;
+  let suspension: ToolSuspension | undefined;
   let status: ToolResultStatus;
   let refused = false;
   if (!tool) {
@@ -860,7 +935,11 @@ async function executeOne(
       );
       status = classifyToolResult(raw);
     } catch (err) {
-      if (err instanceof ToolFailure) {
+      if (err instanceof ToolSuspensionSignal) {
+        suspension = err.suspension;
+        raw = err.message;
+        status = { ok: true };
+      } else if (err instanceof ToolFailure) {
         raw = toolErrorText(err);
         status = { ok: false, code: err.code };
       } else {
@@ -874,5 +953,10 @@ async function executeOne(
   const content = observed.note ? `${observed.content}\n\n${observed.note}` : observed.content;
   messages.push({ role: "tool", toolCallId: call.id, content });
   options.journal?.toolResult(step, call, content, status);
-  return { content, status, ...(observed.halt ? { halt: observed.halt } : {}) };
+  return {
+    content,
+    status,
+    ...(suspension ? { suspend: suspension } : {}),
+    ...(observed.halt ? { halt: observed.halt } : {}),
+  };
 }

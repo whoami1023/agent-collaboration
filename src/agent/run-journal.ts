@@ -27,6 +27,8 @@ const DEFAULT_SNAPSHOT_EVERY = 20;
 const DEFAULT_MAX_RUNS = 200;
 const DONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const STALE_RETENTION_MS = 24 * 60 * 60 * 1000;
+/** 等待用户回答的运行不算中断：按已完成日志的窗口保留，答复后还能从断点续跑。 */
+const PAUSED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 60_000;
 const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -86,6 +88,8 @@ interface JournalSnapshotFile {
   steps: number;
   done: boolean;
   terminal?: RunJournalTerminal;
+  /** 这一轮停在等待用户回答的位置；不是终局，可续跑。 */
+  paused?: { questionId: string; messageId: string; at: number };
 }
 
 export interface LoadedRunJournal {
@@ -101,6 +105,8 @@ export interface LoadedRunJournal {
   steps: number;
   done: boolean;
   terminal?: RunJournalTerminal;
+  /** 这一轮停在等待用户回答的位置；续跑时据此确认它还没结束。 */
+  paused?: { questionId: string; messageId: string };
   /** 最后一条日志的序号；续跑时从这里接着写。 */
   lastN: number;
   summary: { replayedSteps: number; replayedTools: number; pendingCalls: number };
@@ -125,6 +131,8 @@ export interface RunJournalSummary {
   steps: number;
   done: boolean;
   status?: RunJournalTerminal["status"];
+  /** 等待用户回答而挂起（done=false 但可长期保留）。 */
+  paused?: boolean;
 }
 
 export interface RunJournalCreateInput {
@@ -148,6 +156,8 @@ export interface RunJournalRecorder {
     status: ToolResultStatus,
     extra?: { retries?: number },
   ): void;
+  /** 记录「停在等待用户回答」：不写终局、不关闭日志，只把最新状态快照落盘。 */
+  pause(info: { questionId: string; messageId: string }): void;
   finish(result: RunJournalTerminal): void;
 }
 
@@ -391,6 +401,7 @@ export class RunJournalStore {
       steps: number;
       done: boolean;
       terminal?: RunJournalTerminal;
+      paused?: { questionId: string; messageId: string };
     } = {
       messages: safeMessages(snapshot["messages"]),
       pendingCalls: safeCalls(snapshot["pendingCalls"]),
@@ -402,6 +413,14 @@ export class RunJournalStore {
       const parsed = parseEntry({ ...terminalRaw, kind: "terminal", n: 0, at: 0 });
       if (parsed?.kind === "terminal") {
         applyEntry(state, parsed);
+      }
+    }
+
+    const pausedRaw = snapshot["paused"];
+    if (pausedRaw && typeof pausedRaw === "object") {
+      const paused = pausedRaw as Record<string, unknown>;
+      if (typeof paused["questionId"] === "string" && typeof paused["messageId"] === "string") {
+        state.paused = { questionId: paused["questionId"], messageId: paused["messageId"] };
       }
     }
 
@@ -423,6 +442,7 @@ export class RunJournalStore {
       steps: state.steps,
       done: state.done,
       ...(state.terminal ? { terminal: state.terminal } : {}),
+      ...(state.paused ? { paused: state.paused } : {}),
       lastN,
       summary: {
         replayedSteps: state.steps,
@@ -465,6 +485,7 @@ export class RunJournalStore {
         ...(terminal && (terminal["status"] === "ok" || terminal["status"] === "error" || terminal["status"] === "aborted")
           ? { status: terminal["status"] }
           : {}),
+        ...(data["paused"] && typeof data["paused"] === "object" ? { paused: true } : {}),
       });
     }
     runs.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -567,7 +588,11 @@ export class RunJournalStore {
     const tail = this.tailFile(input.runId);
     const snapshotPath = this.snapshotFile(input.runId);
 
-    const writeSnapshot = (done: boolean, terminal?: RunJournalTerminal): void => {
+    const writeSnapshot = (
+      done: boolean,
+      terminal?: RunJournalTerminal,
+      paused?: { questionId: string; messageId: string },
+    ): void => {
       const file: JournalSnapshotFile = {
         ...snapshot,
         updatedAt: this.now(),
@@ -577,6 +602,7 @@ export class RunJournalStore {
         steps: state.steps,
         done,
         ...(terminal ? { terminal } : {}),
+        ...(paused ? { paused: { ...paused, at: this.now() } } : {}),
       };
       this.writeJsonAtomic(snapshotPath, file);
       writeFileSync(tail, "");
@@ -622,6 +648,15 @@ export class RunJournalStore {
         state.pendingCalls = [...entry.calls];
         state.steps = Math.max(state.steps, step + 1);
         append(entry);
+      },
+      pause: (info) => {
+        if (state.done) return;
+        if (disabled) return;
+        try {
+          writeSnapshot(false, undefined, info);
+        } catch {
+          // 快照失败不影响挂起本身；尾部日志仍能在下次启动时重建。
+        }
       },
       toolResult: (step, call, content, status, extra) => {
         const entry: JournalToolEntry = {
@@ -675,7 +710,13 @@ export class RunJournalStore {
     } catch {
       return 0;
     }
-    const entries: { runId: string; file: string; updatedAt: number; done: boolean }[] = [];
+    const entries: {
+      runId: string;
+      file: string;
+      updatedAt: number;
+      done: boolean;
+      paused: boolean;
+    }[] = [];
     for (const name of files) {
       const file = join(this.dir, name);
       const raw = this.readJson(file);
@@ -686,11 +727,17 @@ export class RunJournalStore {
         file,
         updatedAt: typeof data["updatedAt"] === "number" ? data["updatedAt"] : 0,
         done: data["done"] === true,
+        paused: Boolean(data["paused"]),
       });
     }
     entries.sort((a, b) => b.updatedAt - a.updatedAt);
     entries.forEach((entry, index) => {
-      const stale = now - entry.updatedAt > (entry.done ? this.doneRetentionMs : STALE_RETENTION_MS);
+      const retention = entry.done
+        ? this.doneRetentionMs
+        : entry.paused
+          ? PAUSED_RETENTION_MS
+          : STALE_RETENTION_MS;
+      const stale = now - entry.updatedAt > retention;
       if (index < this.maxRuns && !stale) return;
       try {
         unlinkSync(entry.file);

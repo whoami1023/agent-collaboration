@@ -82,6 +82,15 @@ describe("成员右栏", () => {
     expect(markup).toContain("取消");
   });
 
+  it("等待回答的成员在概览与花名册里标出，并且可以取消", () => {
+    const markup = render({ members: [member({ status: "waiting" })] });
+    expect(markup).toContain("等待回答");
+    expect(markup).toContain("已暂停，等你回答后继续");
+    expect(markup).toContain("status-dot waiting");
+    expect(markup).toContain('data-mood="waiting"');
+    expect(markup).toContain("取消");
+  });
+
   it("群聊里提供拉成员进群入口；空房间给出占位", () => {
     expect(render({ isGroupRoom: true })).toContain("拉成员进群");
     expect(render({ isGroupRoom: true })).toContain("群成员");

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { runAgentLoop, type ToolImpl } from "../src/agent/loop";
+import { ToolSuspensionSignal, runAgentLoop, type ToolImpl } from "../src/agent/loop";
 import { MockProvider, type MockHandler } from "../src/provider/mock";
 
 const echoTool: ToolImpl = {
@@ -99,6 +99,94 @@ describe("agent loop", () => {
     expect(result.error).toBeUndefined();
     expect(result.maxStepsReached).toBe(true);
     expect(result.text).toContain("阶段发现 2");
+  });
+
+  it("工具挂起后不再请求模型，同批后续工具不执行", async () => {
+    let modelCalls = 0;
+    let echoCalls = 0;
+    const askTool: ToolImpl = {
+      schema: { name: "ask", description: "提问", parameters: { type: "object", properties: {} } },
+      executionMode: "sequential",
+      retry: "never",
+      execute: async () => {
+        throw new ToolSuspensionSignal({
+          kind: "awaiting_user",
+          questionId: "ask_1",
+          messageId: "msg_1",
+        });
+      },
+    };
+    const countingEcho: ToolImpl = {
+      ...echoTool,
+      execute: async (args) => {
+        echoCalls += 1;
+        return `echo:${String(args["text"] ?? "")}`;
+      },
+    };
+    const seen: string[] = [];
+    const handler: MockHandler = () => {
+      modelCalls += 1;
+      return {
+        text: "先说一句",
+        toolCalls: [
+          { name: "ask", args: {} },
+          { name: "echo", args: { text: "不该执行" } },
+        ],
+      };
+    };
+    const result = await runAgentLoop({
+      provider: new MockProvider(handler),
+      model: "mock",
+      system: "测试",
+      messages: [{ role: "user", content: "开始" }],
+      tools: [askTool, countingEcho],
+      maxSteps: 5,
+      signal: new AbortController().signal,
+      onToolResult: (call, content) => seen.push(`${call.name}:${content}`),
+    });
+    expect(modelCalls).toBe(1);
+    expect(result.cancelled).toBe(false);
+    expect(result.text).toBe("先说一句");
+    expect(result.suspended).toEqual({
+      kind: "awaiting_user",
+      questionId: "ask_1",
+      messageId: "msg_1",
+    });
+    expect(echoCalls).toBe(0);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("ask:");
+  });
+
+  it("续跑时把回答插在已完成历史之后", async () => {
+    const seen: string[][] = [];
+    const handler: MockHandler = (request) => {
+      seen.push(request.messages.map((message) => `${message.role}:${message.content}`));
+      return { text: "继续完成" };
+    };
+    const result = await runAgentLoop({
+      provider: new MockProvider(handler),
+      model: "mock",
+      system: "测试",
+      messages: [{ role: "user", content: "开始" }],
+      tools: [],
+      maxSteps: 3,
+      signal: new AbortController().signal,
+      resume: {
+        messages: [
+          { role: "assistant", content: "", toolCalls: [{ id: "c1", name: "ask", args: {} }] },
+          { role: "tool", toolCallId: "c1", content: "本轮已挂起，等待用户回答" },
+        ],
+        pendingCalls: [],
+        steps: 1,
+      },
+      resumeFollowUp: "用户回答：完整报告",
+    });
+    expect(result.text).toBe("继续完成");
+    const sent = seen[0]!;
+    expect(sent.at(-1)).toBe("user:用户回答：完整报告");
+    const historyAt = sent.indexOf("tool:本轮已挂起，等待用户回答");
+    expect(historyAt).toBeGreaterThanOrEqual(0);
+    expect(historyAt).toBeLessThan(sent.length - 1);
   });
 
   it("中止信号会终止运行", async () => {

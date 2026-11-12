@@ -118,6 +118,23 @@ describe("成员运行轨迹", () => {
     expect(cancelled?.mood).toBe("cancelled");
   });
 
+  it("等待回答的成员显示挂起状态，残留运行流不覆盖它", () => {
+    const waiting = member("m_main", { status: "waiting" });
+    const [actor] = buildTraceActors([waiting], [], {
+      m_main: { startedAt: 500, text: "", reasoning: "还在想下一步", tools: [] },
+    });
+    expect(actor?.mood).toBe("waiting");
+    expect(actor?.thought).toContain("等你回答");
+
+    // 挂起排在运行/思考之后，但比异常与空闲更靠前。
+    const actors = buildTraceActors(
+      [member("m_idle"), member("m_error", { status: "error" }), waiting],
+      [],
+      {},
+    );
+    expect(actors.map((item) => item.mood)).toEqual(["waiting", "error", "idle"]);
+  });
+
   it("轨迹带只保留该成员最近的事件并统计工具/发言/失败", () => {
     const activity: ActivityEvent[] = Array.from({ length: 12 }, (_, index) =>
       event({

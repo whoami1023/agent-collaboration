@@ -898,6 +898,11 @@ body.pane-dragging * {
   background: var(--warn);
 }
 
+.status-dot.waiting {
+  background: #d99b2b;
+  animation: pulse 2.4s ease-out infinite;
+}
+
 .member-main {
   flex: 1;
   min-width: 0;
@@ -980,6 +985,10 @@ body.pane-dragging * {
 
 .roster-stat.live strong {
   color: var(--accent);
+}
+
+.roster-stat.waiting strong {
+  color: #b07714;
 }
 
 .roster-stat.warn strong {
@@ -1094,6 +1103,10 @@ body.pane-dragging * {
 
 .roster-state.cancelled {
   color: var(--warn);
+}
+
+.roster-state.waiting {
+  color: #a5701a;
 }
 
 .roster-meta,
@@ -5919,6 +5932,35 @@ body.pane-dragging * {
   opacity: 0.7;
 }
 
+.question-card.paused {
+  border-color: color-mix(in srgb, #d99b2b 45%, var(--border-strong));
+  background: color-mix(in srgb, #d99b2b 5%, var(--panel));
+}
+
+.question-pause {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: #8a5f10;
+  font-size: var(--text-xs);
+}
+
+.question-pause-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #d99b2b;
+  animation: pulse 1.8s ease-out infinite;
+}
+
+.question-resumed {
+  margin: 0;
+  color: var(--ok);
+  font-size: var(--text-xs);
+}
+
 .question-head {
   display: flex;
   flex-wrap: wrap;
@@ -6530,6 +6572,30 @@ body.pane-dragging * {
   background: color-mix(in srgb, #4e9bd8 7%, var(--card));
 }
 
+.trace-actor.waiting .trace-bubble {
+  border-color: color-mix(in srgb, #d99b2b 45%, var(--border));
+  background: color-mix(in srgb, #d99b2b 7%, var(--card));
+}
+
+.trace-actor.waiting .trace-bubble::after {
+  border-color: color-mix(in srgb, #d99b2b 45%, var(--border));
+  background: color-mix(in srgb, #d99b2b 7%, var(--card));
+}
+
+.trace-wait-fx {
+  animation: trace-wait 1.6s ease-in-out infinite;
+}
+
+@keyframes trace-wait {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
 .trace-actor.error .trace-bubble {
   border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
   color: var(--danger);
@@ -6629,6 +6695,10 @@ body.pane-dragging * {
   color: #2f7fb8;
 }
 
+.trace-plate-state.waiting {
+  color: #a5701a;
+}
+
 .trace-plate-state.thinking {
   color: #7a63c9;
 }
@@ -6706,6 +6776,11 @@ body.pane-dragging * {
 .trace-lane-dot.thinking {
   background: #a78bfa;
   box-shadow: 0 0 0 3px color-mix(in srgb, #a78bfa 18%, transparent);
+}
+
+.trace-lane-dot.waiting {
+  background: #d99b2b;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #d99b2b 18%, transparent);
 }
 
 .trace-lane-dot.error {
@@ -6941,6 +7016,12 @@ body.pane-dragging * {
   border-color: color-mix(in srgb, var(--ok) 35%, transparent);
   background: var(--ok-subtle);
   color: var(--ok);
+}
+
+.trace-chip-waiting {
+  border-color: color-mix(in srgb, #d99b2b 35%, transparent);
+  background: color-mix(in srgb, #d99b2b 10%, var(--card));
+  color: #8a5f10;
 }
 
 @media (max-width: 700px) {

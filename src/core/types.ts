@@ -10,7 +10,7 @@ export const SYSTEM_ID = "system";
 export const DEFAULT_MODEL_REF = "default";
 
 export type MemberRole = "main" | "sub";
-export type MemberStatus = "idle" | "running" | "cancelled" | "error";
+export type MemberStatus = "idle" | "running" | "waiting" | "cancelled" | "error";
 export type ContextMode = "fork" | "isolated";
 export type ControlScope = "children" | "none";
 export type SenderKind = "user" | "member" | "system";
@@ -311,6 +311,11 @@ export interface RoomMessage {
   chainRootId?: string;
   depthTurn?: number;
   resume?: ResumeHint;
+  /**
+   * 这条消息是对结构化提问的回答，并已由问答链路直接续跑提问挂起的那一轮。
+   * 唤醒规则看到它就不再走普通派发，避免同一条回答把主智能体或提问者叫起来两次。
+   */
+  resumeQuestionId?: string;
   /** 派发时附带的上下文包；只有被派发的成员在运行时注入。 */
   handoff?: HandoffContext;
   /**
@@ -447,6 +452,14 @@ export type AgentEvent =
       detail?: string;
     }
   | { type: "run-final"; runId: string; memberId: string; text: string }
+  | {
+      /** 运行在等用户回答：运行日志保持可续跑，工作项转入 waiting_user。 */
+      type: "run-suspended";
+      runId: string;
+      memberId: string;
+      questionId: string;
+      messageId: string;
+    }
   | { type: "run-error"; runId: string; memberId: string; error: string }
   | {
       type: "run-aborted";

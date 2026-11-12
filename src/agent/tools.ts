@@ -62,7 +62,7 @@ export interface ToolDeps {
   chainRootId?: string;
   /** 当前消息在任务链里的接力轮数；派发消息继承并加一。 */
   depthTurn?: number;
-  /** 结构化提问：提出需要用户决定的问题，答案回来后由消息链路唤醒提问者。 */
+  /** 结构化提问：提出后本轮挂起，用户答完后从被挂起的那一轮继续。 */
   questions?: QuestionStore;
 }
 
@@ -692,9 +692,18 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   }
 
   // 联网检索与正文抓取：内置共享技能 web-search / web-fetch / web-browse 的执行底座。
-  // 结构化提问：真正需要用户决定的点做成卡片；答案回来会以用户消息唤醒提问者。
+  // 结构化提问：真正需要用户决定的点做成卡片；本轮立即挂起，答案回来后续跑同一轮。
   if (deps.questions) {
-    tools.push(...buildQuestionTools({ bus: deps.bus, member, questions: deps.questions }));
+    tools.push(
+      ...buildQuestionTools({
+        bus: deps.bus,
+        member,
+        questions: deps.questions,
+        ...(deps.runId ? { runId: deps.runId } : {}),
+        ...(deps.chainRootId ? { chainRootId: deps.chainRootId } : {}),
+        ...(deps.depthTurn !== undefined ? { depthTurn: deps.depthTurn } : {}),
+      }),
+    );
   }
 
   tools.push(...buildWebTools(deps.web));

@@ -290,6 +290,7 @@ export function RunTracePanel({
     [members, activity, runs],
   );
   const live = actors.filter((actor) => actor.mood === "working" || actor.mood === "thinking").length;
+  const waiting = actors.filter((actor) => actor.mood === "waiting").length;
   const focusedId = selectedId && actors.some((actor) => actor.member.id === selectedId)
     ? selectedId
     : null;
@@ -307,8 +308,14 @@ export function RunTracePanel({
       <div className="board-head">
         <span className="section-label">运行轨迹</span>
         <div className="board-head-actions">
-          <span className={`chip${live > 0 ? " trace-chip-live" : ""}`}>
-            {live > 0 ? `${live} 个运行中` : "空闲"}
+          <span
+            className={`chip${live > 0 ? " trace-chip-live" : ""}${waiting > 0 ? " trace-chip-waiting" : ""}`}
+          >
+            {live > 0
+              ? `${live} 个运行中${waiting > 0 ? ` · ${waiting} 个等你回答` : ""}`
+              : waiting > 0
+                ? `${waiting} 个等你回答`
+                : "空闲"}
           </span>
           <button
             type="button"
