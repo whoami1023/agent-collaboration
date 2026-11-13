@@ -40,6 +40,7 @@ import {
 } from "./layout";
 import SkillLibraryPanel from "./SkillLibrary";
 import TemplateLibraryPanel from "./TemplateLibrary";
+import KnowledgePanel, { type KnowledgePageDraft } from "./KnowledgePanel";
 import CronPanel from "./CronPanel";
 import LearningPanel from "./LearningPanel";
 import RoomsPanel from "./RoomsPanel";
@@ -73,6 +74,7 @@ import {
   fetchArchive,
   fetchArchives,
   fetchBootstrap,
+  fetchKnowledgeBases,
   fetchLearning,
   fetchMe,
   fetchMemberFileContent,
@@ -575,6 +577,14 @@ function RoomView({
   /** 定时任务事件到达时自增：面板据此重新拉取定义与状态，不重挂载（编辑器状态保留）。 */
   const [cronTick, setCronTick] = useState(0);
   const [learningOpen, setLearningOpen] = useState(false);
+  /** 知识库：账号级资料库面板，与其它工作区视图互斥。 */
+  const [knowledgeOpen, setKnowledgeOpen] = useState(false);
+  /** 知识库事件到达时自增：面板据此重拉库清单与快照。 */
+  const [knowledgeTick, setKnowledgeTick] = useState(0);
+  /** 正在整理的来源数：侧边栏角标。 */
+  const [knowledgePending, setKnowledgePending] = useState(0);
+  /** 「存为知识页」带进知识库面板的草稿（用后即清）。 */
+  const [knowledgeDraft, setKnowledgeDraft] = useState<KnowledgePageDraft | null>(null);
   /** 运行轨迹：把成员画成像素小人的执行现场，与其它工作区视图互斥。 */
   const [traceOpen, setTraceOpen] = useState(false);
   /** 复盘事件到达时自增：学习面板据此重拉提案与流水。 */
@@ -859,6 +869,19 @@ function RoomView({
     void refreshLearningPending();
   }, [refreshLearningPending]);
 
+  const refreshKnowledgePending = useCallback(async () => {
+    try {
+      const bases = await fetchKnowledgeBases();
+      setKnowledgePending(bases.reduce((sum, base) => sum + base.pendingCount, 0));
+    } catch {
+      // 角标只是提示，拉不到就保留上一次的数字。
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshKnowledgePending();
+  }, [refreshKnowledgePending, knowledgeTick]);
+
   /** 群聊区改动了房间（新建/改名/删群/拉人/移人）：列表与当前视图一起刷新。 */
   const syncRoomView = useCallback(async () => {
     await refreshRooms();
@@ -927,6 +950,10 @@ function RoomView({
       if (event.type === "learning") {
         setLearningTick((tick) => tick + 1);
         void refreshLearningPending();
+      }
+      // 知识库同样是账号级的：不看房间，直接让面板与角标跟上摄入进度。
+      if (event.type === "knowledge") {
+        setKnowledgeTick((tick) => tick + 1);
       }
       // 消息、任务卡、成员进出会改变群聊卡片上的统计；其余事件（运行增量等）不重拉列表。
       const affectsRoomStats =
@@ -1067,6 +1094,7 @@ function RoomView({
     !templatesOpen &&
     !cronOpen &&
     !learningOpen &&
+    !knowledgeOpen &&
     !traceOpen &&
     !newMemberOpen &&
     !selectedMember;
@@ -1078,6 +1106,7 @@ function RoomView({
     templatesOpen ||
     cronOpen ||
     learningOpen ||
+    knowledgeOpen ||
     traceOpen ||
     newMemberOpen ||
     Boolean(selectedMember);
@@ -1855,6 +1884,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setKnowledgeOpen(false);
     setTraceOpen(false);
     setRoomsOpen(false);
     setBoardOpen(true);
@@ -1869,6 +1899,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setKnowledgeOpen(false);
     setTraceOpen(false);
     setRoomsOpen(false);
     setBoardOpen(true);
@@ -1883,6 +1914,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setKnowledgeOpen(false);
     setTraceOpen(false);
     setRoomsOpen(false);
     setNewMemberOpen(false);
@@ -1897,6 +1929,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setKnowledgeOpen(false);
     setTraceOpen(false);
     setRoomsOpen(false);
     setBoardOpen(true);
@@ -1910,6 +1943,7 @@ function RoomView({
     setNewMemberOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setKnowledgeOpen(false);
     setTraceOpen(false);
     setRoomsOpen(false);
     setSelectedMemberId(null);
@@ -1956,6 +1990,40 @@ function RoomView({
     setNavOpen(false);
   }
 
+  /** 知识库面板：多库 wiki、来源整理队列与体检，账号级视图。 */
+  function openKnowledge() {
+    setKnowledgeOpen(true);
+    setSkillsOpen(false);
+    setTemplatesOpen(false);
+    setCronOpen(false);
+    setLearningOpen(false);
+    setTraceOpen(false);
+    setMembersOpen(false);
+    setRoomsOpen(false);
+    setNewMemberOpen(false);
+    setSelectedMemberId(null);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
+  /** 把成员的一条回答带进知识库：面板打开后直接进入新建页面草稿。 */
+  function handleSaveToKnowledge(message: RoomMessage): void {
+    const text = (visibleMessageText(message.text) || message.text).trim();
+    if (!text) return;
+    const firstLine =
+      text
+        .split(/\r?\n/)
+        .map((line) => line.replace(/^#+\s*/, "").replace(/\*\*/g, "").trim())
+        .find((line) => line.length > 0) ?? "问答整理";
+    setKnowledgeDraft({
+      title: firstLine.slice(0, 40),
+      content: text,
+      nonce: Date.now(),
+    });
+    setChatNotice("已把这条回答放进知识库的新建页面，确认标题与路径后保存。");
+    openKnowledge();
+  }
+
   /** 运行轨迹：像素小人 + 成员轨迹带，与聊天和其它工作区视图互斥。 */
   function openTrace() {
     setTraceOpen(true);
@@ -1963,6 +2031,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setKnowledgeOpen(false);
     setMembersOpen(false);
     setRoomsOpen(false);
     setNewMemberOpen(false);
@@ -1979,6 +2048,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setKnowledgeOpen(false);
     setTraceOpen(false);
     setMembersOpen(false);
     setNewMemberOpen(false);
@@ -2009,6 +2079,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setKnowledgeOpen(false);
     setTraceOpen(false);
     setNewMemberOpen(false);
     setSelectedMemberId(null);
@@ -2027,6 +2098,7 @@ function RoomView({
     setTemplatesOpen(false);
     setCronOpen(false);
     setLearningOpen(false);
+    setKnowledgeOpen(false);
     setTraceOpen(false);
     setRoomsOpen(false);
     setMembersOpen(false);
@@ -2196,6 +2268,18 @@ function RoomView({
               <Icon name="template" />
               <span className="nav-label">模板库</span>
               <span className="nav-hint">引用模板生成成员</span>
+            </button>
+
+            <button
+              type="button"
+              className={`nav-item${knowledgeOpen ? " active" : ""}`}
+              aria-pressed={knowledgeOpen}
+              onClick={() => (knowledgeOpen ? setKnowledgeOpen(false) : openKnowledge())}
+            >
+              <Icon name="book" />
+              <span className="nav-label">知识库</span>
+              <span className="nav-hint">资料整理 · wiki · 检索</span>
+              {knowledgePending > 0 && <span className="nav-count">{knowledgePending}</span>}
             </button>
 
             <button
@@ -2644,6 +2728,7 @@ function RoomView({
                     nameById={nameById}
                     onResume={handleResume}
                     onAnswer={handleAnswerQuestion}
+                    onSaveKnowledge={handleSaveToKnowledge}
                   />
                 );
               })}
@@ -2913,6 +2998,17 @@ function RoomView({
                 `已按模板「${template.title}」创建 @${member.name}，在群里 @${member.name} 就能派活。`,
               );
             }}
+          />
+        </aside>
+      ) : knowledgeOpen ? (
+        <aside id="knowledge-panel" className="board-panel" aria-label="知识库">
+          <KnowledgePanel
+            onClose={() => setKnowledgeOpen(false)}
+            refreshToken={knowledgeTick}
+            modelChoices={modelChoices}
+            onPendingChange={setKnowledgePending}
+            draft={knowledgeDraft}
+            onDraftUsed={() => setKnowledgeDraft(null)}
           />
         </aside>
       ) : cronOpen ? (
@@ -4490,6 +4586,7 @@ function MessageBubble({
   nameById,
   onResume,
   onAnswer,
+  onSaveKnowledge,
 }: {
   message: RoomMessage;
   question?: QuestionItem;
@@ -4502,6 +4599,7 @@ function MessageBubble({
     fieldId: string,
     payload: { optionId?: string; text?: string },
   ) => Promise<void>;
+  onSaveKnowledge?: (message: RoomMessage) => void;
 }) {
   const [source, setSource] = useState(false);
   if (message.senderKind === "system") {
@@ -4556,6 +4654,17 @@ function MessageBubble({
             onClick={() => setSource((current) => !current)}
           >
             {source ? "预览" : "原文"}
+          </button>
+        )}
+        {!isUser && renderPreview && onSaveKnowledge && (
+          <button
+            type="button"
+            className="chip bubble-save"
+            title="把这条回答放进知识库的新建页面，确认后保存"
+            onClick={() => onSaveKnowledge(message)}
+          >
+            <Icon name="book" size={12} />
+            存为知识页
           </button>
         )}
         <span className="time">{clock(message.ts)}</span>

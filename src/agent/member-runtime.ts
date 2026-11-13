@@ -37,6 +37,7 @@ import { isPassText } from "../room/routing";
 import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts";
 import type { LoadedRunJournal, RunJournalRecorder, RunJournalStore } from "./run-journal";
 import type { MissionStore } from "./mission-ledger";
+import type { KnowledgeService } from "../knowledge/service";
 
 export interface MemberUsageRecord {
   ref: string;
@@ -76,6 +77,8 @@ export interface RuntimeDeps {
   journals?: RunJournalStore;
   /** 任务台账：主智能体每轮读取本用户任务的进展、停滞与重规划要求。 */
   missions?: MissionStore;
+  /** 知识库：既往整理过的资料，工具检索 + 提示词里给一份目录摘录。 */
+  knowledge?: KnowledgeService;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -263,6 +266,7 @@ export class MemberRuntime {
         ...(this.deps.files ? { files: this.deps.files } : {}),
         ...(this.deps.skillUsage ? { skillUsage: this.deps.skillUsage } : {}),
         ...(this.deps.toolOutputs ? { toolOutputs: this.deps.toolOutputs } : {}),
+        ...(this.deps.knowledge ? { knowledge: this.deps.knowledge } : {}),
         ...(this.deps.questions ? { questions: this.deps.questions } : {}),
         runId,
         chainRootId: trigger.chainRootId ?? trigger.id,
@@ -275,6 +279,8 @@ export class MemberRuntime {
         await this.deps.memory.syncTeamFile().catch(() => undefined);
         teamFile = await this.deps.memory.readTeamFile();
       }
+      // 知识库目录摘录：只在有实际内容时注入；读失败不阻断本轮。
+      const knowledge = await this.deps.knowledge?.summary().catch(() => undefined);
       const system = buildSystemPrompt({
         roomName: bus.roomName,
         member,
@@ -289,6 +295,7 @@ export class MemberRuntime {
           scope: skill.scope,
         })),
         ...(teamFile ? { teamFile } : {}),
+        ...(knowledge ? { knowledge } : {}),
         availableTools: new Set(tools.map((tool) => tool.schema.name)),
         nowMs: Date.now(),
       });

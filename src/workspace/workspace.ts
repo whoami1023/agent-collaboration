@@ -43,6 +43,7 @@ import { ToolOutputStore } from "../agent/content/offload";
 import { RunJournalStore } from "../agent/run-journal";
 import { MissionStore, type MissionSnapshot } from "../agent/mission-ledger";
 import { WorkspaceFiles } from "../files/workspace-files";
+import { KnowledgeService } from "../knowledge/service";
 import { RoomBus } from "../room/bus";
 import {
   MAIN_ROOM_ID,
@@ -204,6 +205,8 @@ export class Workspace {
     readonly recallLedger: RecallLedger,
     /** 工具输出存档：大结果落盘后按成员隔离地检索与分页读取。 */
     readonly toolOutputs: ToolOutputStore,
+    /** 知识库：多库 wiki、来源摄入队列与检索，账号级共享给所有房间的成员。 */
+    readonly knowledge: KnowledgeService,
   ) {}
 
   static async load(
@@ -263,9 +266,26 @@ export class Workspace {
     // 工具输出存档：大结果不整份进上下文，完整内容留在本账号工作区里。
     const toolOutputs = new ToolOutputStore(join(dir, "tool-outputs"));
 
+    // 知识库：参考资料与既往整理的 wiki 层，账号级共享；摄入在后台串行跑，
+    // 事件走作战室总线（一个 SSE 连接会收到所有房间的帧，前端只看 event.type）。
+    let workspaceRef: Workspace | undefined;
+    const knowledge = new KnowledgeService({
+      dir,
+      getSettings: () => settingsRef.current,
+      getModelDeps: () => ({ settings: settingsRef.current, dataDir: dir }),
+      usage,
+      files,
+      onEvent: (event) => {
+        workspaceRef?.mainRoom().bus.emit({ type: "knowledge", event });
+      },
+      onUsageRecord: (record) => {
+        workspaceRef?.mainRoom().bus.emit({ type: "model-usage", usage: record });
+      },
+    });
+    await knowledge.load();
+
     // 学习层（P1）：成员一轮交付后的后台复盘。产出先落进本账号的 learning.json，
     // 事件按复盘所在的房间广播，前端「学习」面板据此刷新。
-    let workspaceRef: Workspace | undefined;
     const learning = new LearningService({
       store: new LearningStore(join(dir, "learning.json")),
       getSettings: () => settingsRef.current,
@@ -319,6 +339,7 @@ export class Workspace {
       curation,
       recallLedger,
       toolOutputs,
+      knowledge,
     );
     workspaceRef = workspace;
     workspace.groupBuses = groupBuses;
@@ -365,6 +386,8 @@ export class Workspace {
     await cron.start();
     // 落盘的待办在服务重新打开时接着跑；超出恢复窗口或多次中断的会被明确结算。
     for (const room of workspace.rooms.values()) room.orchestrator.resumeQueue();
+    // 上次中断的知识摄入放回队列后，接着在后台逐条整理。
+    knowledge.start();
     return workspace;
   }
 
@@ -460,6 +483,7 @@ export class Workspace {
       skillUsage: this.curation.recordUsage,
       recallLedger: this.recallLedger,
       toolOutputs: this.toolOutputs,
+      knowledge: this.knowledge,
       workQueue,
       questions,
       journals,
@@ -1106,6 +1130,8 @@ export class Workspace {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    // 知识摄入会写文件：先中止并等它把队列项放回去，再统一收尾。
+    await this.knowledge.close().catch(() => undefined);
     this.cronService?.stop();
     for (const room of this.rooms.values()) {
       room.auditService.close();

@@ -32,13 +32,18 @@ export async function readJson<T>(file: string, fallback: T): Promise<T> {
   }
 }
 
+// 同一毫秒内对同一目标文件的两次写入若共用临时文件，两个句柄会互相截断/覆盖，
+// 落盘后可能变成「完整 JSON + 残尾」。用进程内递增序号保证临时文件唯一。
+let atomicWriteSeq = 0;
+
 // Windows: rename onto a busy target raises EPERM/EBUSY. Retry with backoff and
 // never unlink the previous file first — a missing file between delete and rename
 // lets concurrent readers seed fresh state.
 export async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   const text = JSON.stringify(value, null, 2);
-  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  atomicWriteSeq += 1;
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${atomicWriteSeq}`;
   for (let attempt = 0; attempt < 6; attempt += 1) {
     try {
       await writeFile(tmp, text, "utf8");

@@ -3,6 +3,7 @@ import type { LearningProposal, ReviewLog } from "../agent/learning/types";
 import type { QuestionItem } from "../room/questions";
 import type { ActivityEvent } from "../room/activity-log";
 import type { AuditRecord } from "../agent/audit/types";
+import type { KnowledgeEvent } from "../knowledge/types";
 
 export const USER_ID = "user";
 export const SYSTEM_ID = "system";
@@ -487,6 +488,8 @@ export type RoomEvent =
   | { type: "model-usage"; usage: ModelUsageEvent }
   /** 一次后台复盘的产出：提案（可能为空）+ 流水，前端据此刷新「学习」面板。 */
   | { type: "learning"; proposals: readonly LearningProposal[]; log: ReviewLog }
+  /** 知识库变更：建库、来源摄入进度、页面编辑；面板据此刷新快照。 */
+  | { type: "knowledge"; event: KnowledgeEvent }
   | { type: "cron-job"; job: CronJob; state: CronJobState }
   | { type: "cron-job-removed"; jobId: string }
   | { type: "cron-run"; run: CronRunRecord }

@@ -91,6 +91,8 @@ export interface PromptContext {
    * 花名册只有名字与状态，「谁适合做这件事」靠这段判断；只注入主智能体的提示词。
    */
   teamFile?: string;
+  /** 知识库目录摘录（库名、规模与索引要点）；只在库里有内容时注入。 */
+  knowledge?: string;
   /** 本轮实际注册的工具名；记忆指引只描述可用工具（对应 OpenClaw availableTools）。 */
   availableTools?: Set<string>;
   /** 注入「当前时间」用的时钟；测试可传固定值，缺省取本轮启动时刻。 */
@@ -159,6 +161,14 @@ const ASK_SECTION = `结构化提问
 - 提出后本轮先收尾：不要重复提问，也不要在收到回答前按猜测继续；用户答完后你会被重新唤醒，答案会以消息形式回到群里。
 - 只问真正阻塞下一步的点，别把整份需求拆成一串问题。`;
 
+/**
+ * 知识库：只在挂了 knowledge_search 时说明。目录摘录在易变层，
+ * 这里只放跨轮不变的使用规则，便于命中前缀缓存。
+ */
+const KNOWLEDGE_SECTION = `知识库
+- 工作区左侧「知识库」里有用户整理过的资料：knowledge_search 按关键词检索页面，knowledge_read 读全文，knowledge_list 看某个库的页面清单。
+- 有既往整理结果时先查知识库，再做网络检索或重新分析；引用以页面正文为准，页面过时或有冲突就写明，不要假装它是当前结论。`;
+
 const CRON_SECTION = `定时任务
 - 用户提到「每天/每周/半小时后/到点再做…」这类延时或周期性要求，用 cron 工具建任务；绝不要在 run_command 里 sleep 或反复轮询来假装定时器。
 - 任务到点会把指令投进群并唤醒对应成员无人值守执行，最终回复就是交付物；一次运行只交一份结果，重复靠调度而不是靠你追问。
@@ -206,6 +216,8 @@ export function buildSystemPrompt(context: PromptContext): string {
     context.availableTools?.has("output_search") === true ? OUTPUT_SECTION : "";
   const askSection = context.availableTools?.has("ask_user") === true ? ASK_SECTION : "";
   const cronSection = context.availableTools?.has("cron") === true ? CRON_SECTION : "";
+  const knowledgeSection =
+    context.availableTools?.has("knowledge_search") === true ? KNOWLEDGE_SECTION : "";
   // 闸门只作用在任务卡上：没挂 task_update 的运行（计划轮、纯聊天）不该看到这段规则。
   const acceptanceSection = context.availableTools?.has("task_update") === true ? ACCEPTANCE_SECTION : "";
   // 对齐 Hermes 的 stable → context → volatile 三层：花名册、任务标题、能力档案与技能索引
@@ -222,6 +234,7 @@ export function buildSystemPrompt(context: PromptContext): string {
     acceptanceSection,
     askSection,
     cronSection,
+    knowledgeSection,
     formatDynamicContext(context),
   ]
     .filter((section) => section.length > 0)
@@ -250,6 +263,9 @@ function formatDynamicContext(context: PromptContext): string {
     "可用技能（任务与描述匹配时，先调用 use_skill 读取完整说明，再按其中步骤执行）：",
     formatSkills(context.skills),
   );
+  if (context.knowledge) {
+    parts.push("", "知识库目录（先检索再读全文，不要凭记忆复述页面内容）：", context.knowledge);
+  }
   return parts.join("\n");
 }
 

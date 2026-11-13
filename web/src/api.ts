@@ -40,10 +40,40 @@ import type {
   ReviewLog,
   SkillProposal,
 } from "../../src/agent/learning/types";
+import type {
+  KnowledgeBaseMeta,
+  KnowledgeGraph,
+  KnowledgeGraphNode,
+  KnowledgeLintReport,
+  KnowledgeLinkProposal,
+  KnowledgePage,
+  KnowledgeQueueItem,
+  KnowledgeReview,
+  KnowledgeSearchHit,
+  KnowledgeSearchMode,
+  KnowledgeSearchResult,
+  KnowledgeSnapshot,
+  KnowledgeSource,
+} from "../../src/knowledge/types";
 
 export type { LearningProposal, LearningSettings, MemoryProposal, ReviewLog, SkillProposal };
 export type { AdvisorSettings, CurationSettings };
 export type { CurationLog, CurationProposal, SkillLifecycle, SkillLifecycleState, SkillUsageRecord };
+export type {
+  KnowledgeBaseMeta,
+  KnowledgeGraph,
+  KnowledgeGraphNode,
+  KnowledgeLintReport,
+  KnowledgeLinkProposal,
+  KnowledgePage,
+  KnowledgeQueueItem,
+  KnowledgeReview,
+  KnowledgeSearchHit,
+  KnowledgeSearchMode,
+  KnowledgeSearchResult,
+  KnowledgeSnapshot,
+  KnowledgeSource,
+};
 
 export type { RoomInfo, RoomKind, RoomMode, RoomRoutingMode };
 
@@ -1365,4 +1395,226 @@ export function subscribeEvents(
   if (onResync) source.addEventListener("resync", () => onResync());
   if (onError) source.onerror = () => onError();
   return () => source.close();
+}
+
+// ---- 知识库（LLM Wiki 式资料库） ----
+
+export interface KnowledgeBaseInput {
+  name: string;
+  description?: string;
+  purpose?: string;
+  schema?: string;
+  modelRef?: string;
+  embeddingRef?: string;
+}
+
+export async function fetchKnowledgeBases(): Promise<KnowledgeBaseMeta[]> {
+  const body = await request<{ bases: KnowledgeBaseMeta[] }>("/api/knowledge");
+  return body.bases;
+}
+
+export async function createKnowledgeBase(input: KnowledgeBaseInput): Promise<KnowledgeBaseMeta> {
+  const body = await request<{ base: KnowledgeBaseMeta }>("/api/knowledge", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return body.base;
+}
+
+export async function updateKnowledgeBase(
+  id: string,
+  patch: Partial<KnowledgeBaseInput>,
+): Promise<KnowledgeBaseMeta> {
+  const body = await request<{ base: KnowledgeBaseMeta }>(`/api/knowledge/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+  return body.base;
+}
+
+export async function deleteKnowledgeBase(id: string): Promise<void> {
+  await request<{ removed: string }>(`/api/knowledge/${id}`, { method: "DELETE" });
+}
+
+export async function fetchKnowledgeSnapshot(id: string): Promise<KnowledgeSnapshot> {
+  const body = await request<{ snapshot: KnowledgeSnapshot }>(`/api/knowledge/${id}`);
+  return body.snapshot;
+}
+
+export async function addKnowledgeSource(
+  id: string,
+  input: { title?: string; content?: string; filePath?: string },
+): Promise<{ source: KnowledgeSource; queueItem: KnowledgeQueueItem }> {
+  return request(`/api/knowledge/${id}/sources`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function removeKnowledgeSource(id: string, sourceId: string): Promise<void> {
+  await request<{ removed: string }>(`/api/knowledge/${id}/sources/${sourceId}`, {
+    method: "DELETE",
+  });
+}
+
+export async function retryKnowledgeQueue(
+  id: string,
+  itemId?: string,
+): Promise<KnowledgeQueueItem[]> {
+  const body = await request<{ queue: KnowledgeQueueItem[] }>(`/api/knowledge/${id}/queue/retry`, {
+    method: "POST",
+    body: JSON.stringify(itemId ? { itemId } : {}),
+  });
+  return body.queue;
+}
+
+export async function cancelKnowledgeQueue(
+  id: string,
+  itemId?: string,
+): Promise<KnowledgeQueueItem[]> {
+  const body = await request<{ queue: KnowledgeQueueItem[] }>(`/api/knowledge/${id}/queue/cancel`, {
+    method: "POST",
+    body: JSON.stringify(itemId ? { itemId } : {}),
+  });
+  return body.queue;
+}
+
+export async function fetchKnowledgePage(
+  id: string,
+  path: string,
+): Promise<{ page: KnowledgePage; raw: string }> {
+  return request(`/api/knowledge/${id}/page?path=${encodeURIComponent(path)}`);
+}
+
+export async function saveKnowledgePage(
+  id: string,
+  path: string,
+  content: string,
+): Promise<KnowledgePage> {
+  const body = await request<{ page: KnowledgePage }>(`/api/knowledge/${id}/page`, {
+    method: "PUT",
+    body: JSON.stringify({ path, content }),
+  });
+  return body.page;
+}
+
+export async function deleteKnowledgePage(id: string, path: string): Promise<void> {
+  await request<{ removed: string }>(
+    `/api/knowledge/${id}/page?path=${encodeURIComponent(path)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function reindexKnowledge(id: string): Promise<KnowledgeSnapshot> {
+  const body = await request<{ snapshot: KnowledgeSnapshot }>(`/api/knowledge/${id}/reindex`, {
+    method: "POST",
+  });
+  return body.snapshot;
+}
+
+export async function fetchKnowledgeLint(id: string): Promise<KnowledgeLintReport> {
+  const body = await request<{ report: KnowledgeLintReport }>(`/api/knowledge/${id}/lint`);
+  return body.report;
+}
+
+export async function fetchKnowledgeGraph(id: string): Promise<KnowledgeGraph> {
+  const body = await request<{ graph: KnowledgeGraph }>(`/api/knowledge/${id}/graph`);
+  return body.graph;
+}
+
+export async function searchKnowledge(
+  query: string,
+  kbId?: string,
+): Promise<KnowledgeSearchResult> {
+  const params = new URLSearchParams({ q: query });
+  if (kbId) params.set("kbId", kbId);
+  return request<KnowledgeSearchResult>(`/api/knowledge/search?${params.toString()}`);
+}
+
+export async function enrichKnowledge(
+  id: string,
+  input: { apply?: boolean; maxLinks?: number } = {},
+): Promise<{ proposals: KnowledgeLinkProposal[]; applied: number }> {
+  return request(`/api/knowledge/${id}/enrich`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function fetchKnowledgeReviews(id: string): Promise<KnowledgeReview[]> {
+  const body = await request<{ reviews: KnowledgeReview[] }>(`/api/knowledge/${id}/reviews`);
+  return body.reviews;
+}
+
+export async function resolveKnowledgeReview(
+  id: string,
+  reviewId: string,
+  action: "create-page" | "research" | "skip",
+): Promise<KnowledgeReview> {
+  const body = await request<{ review: KnowledgeReview }>(
+    `/api/knowledge/${id}/reviews/${reviewId}/resolve`,
+    { method: "POST", body: JSON.stringify({ action }) },
+  );
+  return body.review;
+}
+
+export async function researchKnowledge(
+  id: string,
+  input: { topic: string; queries?: string[] },
+): Promise<{
+  source: KnowledgeSource;
+  queueItem: KnowledgeQueueItem;
+  queries: string[];
+  documents: number;
+  warning?: string;
+}> {
+  return request(`/api/knowledge/${id}/research`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function importKnowledgeFolder(
+  id: string,
+  input: { path: string; maxFiles?: number },
+): Promise<{
+  added: KnowledgeSource[];
+  skipped: Array<{ path: string; reason: string }>;
+  unsupported: Array<{ path: string; reason: string }>;
+}> {
+  return request(`/api/knowledge/${id}/sources/folder`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function knowledgeExportUrl(id: string): string {
+  return `/api/knowledge/${id}/export`;
+}
+
+export async function importKnowledgeBundle(file: File): Promise<KnowledgeBaseMeta> {
+  const response = await fetch("/api/knowledge/import", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/zip" },
+    body: file,
+  });
+  const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok) {
+    throw new ApiError(
+      typeof body["error"] === "string" ? body["error"] : `导入失败 ${response.status}`,
+      response.status,
+    );
+  }
+  return body["base"] as KnowledgeBaseMeta;
+}
+
+export async function rescanKnowledgeSources(
+  id: string,
+): Promise<{ added: number; updated: number; removed: number }> {
+  const body = await request<{ result: { added: number; updated: number; removed: number } }>(
+    `/api/knowledge/${id}/rescan`,
+    { method: "POST" },
+  );
+  return body.result;
 }

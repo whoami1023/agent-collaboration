@@ -87,7 +87,16 @@ beforeEach(async () => {
 afterEach(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   await registry.closeAll();
-  await rm(dir, { recursive: true, force: true });
+  // Windows 上目录刚关闭时偶发 ENOTEMPTY/EBUSY，短暂退避后重试。
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if (attempt >= 4) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
 });
 
 describe("多用户 API", () => {

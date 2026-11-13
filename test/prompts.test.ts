@@ -245,3 +245,27 @@ describe("时间感知", () => {
     expect(formatRoomWindow([message])).toContain("11-09 15:30");
   });
 });
+
+describe("知识库提示词", () => {
+  it("挂了 knowledge_search 时注入使用规则，目录摘录放在易变层", () => {
+    const prompt = buildSystemPrompt(
+      context({
+        availableTools: new Set(["knowledge_search", "knowledge_read", "knowledge_list"]),
+        knowledge: "- 「协同框架」（ID kb_0123456789ab）：2 页 / 1 份来源",
+        nowMs: Date.UTC(2026, 10, 10, 2, 5),
+      }),
+    );
+    expect(prompt).toContain("有既往整理结果时先查知识库");
+    expect(prompt).toContain("knowledge_search");
+    expect(prompt).toContain("协同框架");
+    const directory = prompt.indexOf("知识库目录");
+    expect(directory).toBeGreaterThan(prompt.indexOf("当前群况"));
+    expect(directory).toBeGreaterThan(prompt.indexOf("可用技能"));
+  });
+
+  it("没有知识工具时不出现知识库规则", () => {
+    const prompt = buildSystemPrompt(context({ availableTools: new Set(["file_read"]) }));
+    expect(prompt).not.toContain("有既往整理结果时先查知识库");
+    expect(prompt).not.toContain("知识库目录");
+  });
+});

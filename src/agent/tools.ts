@@ -25,6 +25,8 @@ import type { ToolOutputStore } from "./content/offload";
 import { buildOutputTools } from "./content/output-tools";
 import type { QuestionStore } from "../room/questions";
 import { buildQuestionTools } from "./question-tools";
+import { buildKnowledgeTools } from "./knowledge-tools";
+import type { KnowledgeService } from "../knowledge/service";
 
 export interface ToolDeps {
   bus: RoomBus;
@@ -64,6 +66,8 @@ export interface ToolDeps {
   depthTurn?: number;
   /** 结构化提问：提出后本轮挂起，用户答完后从被挂起的那一轮继续。 */
   questions?: QuestionStore;
+  /** 知识库：检索与读取既往整理过的页面。 */
+  knowledge?: KnowledgeService;
 }
 
 const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done", "failed"];
@@ -717,6 +721,11 @@ export function buildTools(member: Member, deps: ToolDeps): ToolImpl[] {
   const cron = deps.getCron?.();
   if (cron) {
     tools.push(...buildCronTools({ cron, bus: deps.bus, member, ownerId: deps.userId }));
+  }
+
+  // 知识库：账号级资料库，有库时即可检索；写入只走面板与后台摄入，不给模型开放。
+  if (deps.knowledge) {
+    tools.push(...buildKnowledgeTools(deps.knowledge));
   }
 
   return applyRunScope(tools, deps.runScope);

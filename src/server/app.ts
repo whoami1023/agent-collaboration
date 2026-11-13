@@ -46,6 +46,7 @@ import { RoomError, roomIdFromQuery } from "../room/registry";
 import { ROOM_ROUTING_MODES, isRoomRoutingMode } from "../core/types";
 import type { RoomFrame, RoomInstance, Workspace, WorkspaceRegistry } from "../workspace/workspace";
 import type { RoomInfo } from "../core/types";
+import { KnowledgeError } from "../knowledge/types";
 
 export interface AppDeps {
   auth: AuthService;
@@ -142,6 +143,13 @@ export function createApp(deps: AppDeps): express.Express {
   const skillWriteBody = express.json({ limit: "12mb" });
   // 文件工作区上传走原始字节，单文件上限与 WorkspaceFiles 保持一致。
   const fileUploadBody = express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES });
+  // 知识库导入允许直接粘贴 2 MB 内的材料（与 KNOWLEDGE_LIMITS.maxSourceBytes 对齐）；
+  // 整库 ZIP 走原始字节上传，上限 50 MB。
+  const knowledgeSourceBody = express.json({ limit: "3mb" });
+  const knowledgeBundleBody = express.raw({
+    type: ["application/zip", "application/octet-stream"],
+    limit: "50mb",
+  });
   app.use((req, res, next) => {
     const path = req.path;
     if (path === "/api/files" && req.method === "POST") {
@@ -152,6 +160,12 @@ export function createApp(deps: AppDeps): express.Express {
       (req.method === "POST" || req.method === "PATCH")
     ) {
       return skillWriteBody(req, res, next);
+    }
+    if (/^\/api\/knowledge\/[^/]+\/sources$/.test(path) && req.method === "POST") {
+      return knowledgeSourceBody(req, res, next);
+    }
+    if (path === "/api/knowledge/import" && req.method === "POST") {
+      return knowledgeBundleBody(req, res, next);
     }
     return jsonBody(req, res, next);
   });
@@ -583,6 +597,311 @@ export function createApp(deps: AppDeps): express.Express {
       res.status(201).json({ member, template });
     } catch (err) {
       res.status(400).json({ error: errorMessage(err) });
+    }
+  });
+
+  // 知识库：账号级资料库。左侧「知识库」面板通过这组接口建库、导入材料、
+  // 查看整理队列与页面；智能体侧另有 knowledge_search / read / list 三个工具。
+  const knowledgeFailure = (res: Response, err: unknown): void => {
+    res
+      .status(err instanceof KnowledgeError ? err.status : 400)
+      .json({ error: errorMessage(err) });
+  };
+
+  const knowledgeBaseId = (req: Request): string => String(req.params["id"] ?? "");
+
+  app.get("/api/knowledge", async (_req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    res.json({ bases: await workspace.knowledge.listBases() });
+  });
+
+  // 整库导出/导入：ZIP 内含 meta、purpose/schema、raw/、wiki/ 与队列/审核快照。
+  app.get("/api/knowledge/:id/export", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      const bundle = await workspace.knowledge.exportBundle(knowledgeBaseId(req));
+      res.setHeader("content-type", "application/zip");
+      res.setHeader("content-disposition", contentDisposition(bundle.filename, false));
+      res.send(bundle.data);
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.post("/api/knowledge/import", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const raw = req.body;
+    if (!Buffer.isBuffer(raw) || raw.length === 0) {
+      res.status(400).json({ error: "请上传知识库 ZIP 压缩包" });
+      return;
+    }
+    try {
+      const base = await workspace.knowledge.importBundle(raw, {
+        name: typeof req.query["name"] === "string" ? req.query["name"] : undefined,
+      });
+      res.status(201).json({ base });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  // 跨库检索供面板搜索框用；路由必须排在 `/:id` 之前。
+  app.get("/api/knowledge/search", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const kbId = queryField(req, "kbId") || undefined;
+    try {
+      const result = await workspace.knowledge.searchDetailed(queryField(req, "q"), kbId);
+      res.json(result);
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.post("/api/knowledge", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    try {
+      const base = await workspace.knowledge.createBase({
+        name: body["name"],
+        description: body["description"],
+        purpose: body["purpose"],
+        schema: body["schema"],
+        modelRef: body["modelRef"],
+        embeddingRef: body["embeddingRef"],
+      });
+      res.status(201).json({ base });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.get("/api/knowledge/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json({ snapshot: await workspace.knowledge.snapshot(knowledgeBaseId(req)) });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.patch("/api/knowledge/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    try {
+      const base = await workspace.knowledge.updateBase(knowledgeBaseId(req), {
+        ...(body["name"] !== undefined ? { name: body["name"] } : {}),
+        ...(body["description"] !== undefined ? { description: body["description"] } : {}),
+        ...(body["purpose"] !== undefined ? { purpose: body["purpose"] } : {}),
+        ...(body["schema"] !== undefined ? { schema: body["schema"] } : {}),
+        ...(body["modelRef"] !== undefined ? { modelRef: body["modelRef"] } : {}),
+        ...(body["embeddingRef"] !== undefined ? { embeddingRef: body["embeddingRef"] } : {}),
+      });
+      res.json({ base });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.delete("/api/knowledge/:id", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      await workspace.knowledge.deleteBase(knowledgeBaseId(req));
+      res.json({ removed: knowledgeBaseId(req) });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.post("/api/knowledge/:id/sources", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    try {
+      const result = await workspace.knowledge.addSource(knowledgeBaseId(req), {
+        title: body["title"],
+        content: body["content"],
+        filePath: body["filePath"],
+      });
+      res.status(202).json(result);
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  // 文件夹导入：递归提取文件工作区里的 Markdown/TXT/CSV/JSON/HTML/DOCX/XLSX。
+  app.post("/api/knowledge/:id/sources/folder", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    try {
+      const result = await workspace.knowledge.importFolder(knowledgeBaseId(req), {
+        dir: body["path"],
+        maxFiles: body["maxFiles"],
+      });
+      res.status(202).json(result);
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.delete("/api/knowledge/:id/sources/:sourceId", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      await workspace.knowledge.removeSource(
+        knowledgeBaseId(req),
+        String(req.params["sourceId"] ?? ""),
+      );
+      res.json({ removed: String(req.params["sourceId"] ?? "") });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  for (const action of ["retry", "cancel"] as const) {
+    app.post(`/api/knowledge/:id/queue/${action}`, async (req: Request, res: Response) => {
+      const workspace = await workspaceFor(res);
+      const itemId = stringField(bodyOf(req), "itemId") || undefined;
+      try {
+        const queue =
+          action === "retry"
+            ? await workspace.knowledge.retryQueue(knowledgeBaseId(req), itemId)
+            : await workspace.knowledge.cancelQueue(knowledgeBaseId(req), itemId);
+        res.json({ queue });
+      } catch (err) {
+        knowledgeFailure(res, err);
+      }
+    });
+  }
+
+  app.get("/api/knowledge/:id/page", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      const page = await workspace.knowledge.readPageForEdit(
+        knowledgeBaseId(req),
+        queryField(req, "path"),
+      );
+      res.json(page);
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.put("/api/knowledge/:id/page", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    try {
+      const page = await workspace.knowledge.writePage(
+        knowledgeBaseId(req),
+        stringField(body, "path"),
+        stringField(body, "content"),
+      );
+      res.json({ page });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.delete("/api/knowledge/:id/page", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      await workspace.knowledge.deletePage(knowledgeBaseId(req), queryField(req, "path"));
+      res.json({ removed: queryField(req, "path") });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.post("/api/knowledge/:id/reindex", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json({ snapshot: await workspace.knowledge.reindex(knowledgeBaseId(req)) });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  // 重新扫描 raw/sources：外部新增/修改/删除会被同步到来源与队列。
+  app.post("/api/knowledge/:id/rescan", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json({ result: await workspace.knowledge.rescanSources(knowledgeBaseId(req)) });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  // 链接补全：默认只返回提案；apply=true 才写入页面正文。
+  app.post("/api/knowledge/:id/enrich", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    try {
+      const result = await workspace.knowledge.enrichLinks(knowledgeBaseId(req), {
+        apply: body["apply"] === true,
+        ...(typeof body["maxLinks"] === "number" ? { maxLinks: body["maxLinks"] } : {}),
+      });
+      res.json(result);
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  // 异步审核：列表与处理（建页 / 研究 / 跳过）。
+  app.get("/api/knowledge/:id/reviews", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json({ reviews: await workspace.knowledge.listReviews(knowledgeBaseId(req)) });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.post("/api/knowledge/:id/reviews/:reviewId/resolve", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const action = stringField(bodyOf(req), "action");
+    if (action !== "create-page" && action !== "research" && action !== "skip") {
+      res.status(400).json({ error: "action 只能是 create-page、research 或 skip" });
+      return;
+    }
+    try {
+      const review = await workspace.knowledge.resolveReview(
+        knowledgeBaseId(req),
+        String(req.params["reviewId"] ?? ""),
+        action,
+      );
+      res.json({ review });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  // 深度研究：生成检索词 → 联网检索/抓取 → 组成来源材料并进入摄入队列。
+  app.post("/api/knowledge/:id/research", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    const body = bodyOf(req);
+    try {
+      const result = await workspace.knowledge.research(knowledgeBaseId(req), {
+        topic: body["topic"],
+        queries: body["queries"],
+      });
+      res.status(202).json(result);
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.get("/api/knowledge/:id/lint", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json({ report: await workspace.knowledge.lint(knowledgeBaseId(req)) });
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
+  app.get("/api/knowledge/:id/graph", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json({ graph: await workspace.knowledge.graph(knowledgeBaseId(req)) });
+    } catch (err) {
+      knowledgeFailure(res, err);
     }
   });
 

@@ -28,6 +28,7 @@ import type { MemberProfileHints } from "../memory/bootstrap-files";
 import type { MemorySearchManager } from "../memory/manager";
 import type { RecallLedger } from "../memory/recall-ledger";
 import type { WorkspaceFiles } from "../files/workspace-files";
+import type { KnowledgeService } from "../knowledge/service";
 import type { ToolOutputStore } from "./content/offload";
 import type { RunJournalStore } from "./run-journal";
 import type { MissionStore } from "./mission-ledger";
@@ -75,6 +76,8 @@ export interface OrchestratorDeps {
   journals?: RunJournalStore;
   /** 任务台账：按用户任务链统计任务卡进展与停滞，注入主智能体。 */
   missions?: MissionStore;
+  /** 知识库：检索既有整理成果；账号级服务由工作区注入。 */
+  knowledge?: KnowledgeService;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -1113,6 +1116,7 @@ export class Orchestrator {
         ...(deps.skillUsage ? { skillUsage: deps.skillUsage } : {}),
         ...(deps.recallLedger ? { recallLedger: deps.recallLedger } : {}),
         ...(deps.toolOutputs ? { toolOutputs: deps.toolOutputs } : {}),
+        ...(deps.knowledge ? { knowledge: deps.knowledge } : {}),
         ...(deps.questions ? { questions: deps.questions } : {}),
         ...(deps.journals ? { journals: deps.journals } : {}),
         ...(deps.missions ? { missions: deps.missions } : {}),
