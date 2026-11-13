@@ -10,6 +10,7 @@ import type {
   KnowledgeSearchMode,
   KnowledgeSnapshot,
   KnowledgeSource,
+  WorkspaceFileEntry,
 } from "./api";
 import {
   addKnowledgeSource,
@@ -24,6 +25,7 @@ import {
   fetchKnowledgePage,
   fetchKnowledgeSnapshot,
   fetchKnowledgeSourceRaw,
+  fetchWorkspaceFiles,
   importKnowledgeBundle,
   importKnowledgeFolder,
   knowledgeExportUrl,
@@ -225,6 +227,138 @@ function groupPages(pages: KnowledgeSnapshot["pages"]): Array<{
   })).filter((group) => group.pages.length > 0);
 }
 
+/** 文件工作区路径输入：聚焦时读清单，输入时按包含关系给出可选路径。 */
+function WorkspacePathSuggest({
+  label,
+  mode,
+  value,
+  placeholder,
+  entries,
+  loading,
+  error,
+  onChange,
+  onRequestLoad,
+}: {
+  label: string;
+  mode: "file" | "dir";
+  value: string;
+  placeholder: string;
+  entries: WorkspaceFileEntry[] | null;
+  loading: boolean;
+  error: string | null;
+  onChange(value: string): void;
+  onRequestLoad(): void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const matches = useMemo(() => {
+    const wanted = mode === "dir" ? "dir" : "file";
+    const query = value.trim().toLowerCase();
+    const scored: Array<{ entry: WorkspaceFileEntry; score: number }> = [];
+    for (const entry of entries ?? []) {
+      if (entry.kind !== wanted) continue;
+      const path = entry.path.replace(/\\/g, "/");
+      const index = query ? path.toLowerCase().indexOf(query) : 0;
+      if (query && index < 0) continue;
+      scored.push({ entry, score: index });
+    }
+    scored.sort((a, b) => {
+      if (a.score !== b.score) return a.score - b.score;
+      if (!query && mode === "file" && a.entry.updatedAt !== b.entry.updatedAt) {
+        return b.entry.updatedAt - a.entry.updatedAt;
+      }
+      return a.entry.path.localeCompare(b.entry.path);
+    });
+    return scored.slice(0, 8).map((item) => item.entry);
+  }, [entries, mode, value]);
+
+  useEffect(() => {
+    setActive(0);
+  }, [value, open]);
+
+  function choose(path: string): void {
+    onChange(path);
+    setOpen(false);
+  }
+
+  return (
+    <label className="field path-suggest-field">
+      <span>{label}</span>
+      <div className="path-suggest-wrap">
+        <input
+          value={value}
+          placeholder={placeholder}
+          role="combobox"
+          aria-expanded={open}
+          aria-autocomplete="list"
+          onChange={(event) => {
+            onChange(event.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => {
+            onRequestLoad();
+            setOpen(true);
+          }}
+          onBlur={() => setOpen(false)}
+          onKeyDown={(event) => {
+            if (!open) return;
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              setActive((index) => Math.min(index + 1, matches.length - 1));
+            } else if (event.key === "ArrowUp") {
+              event.preventDefault();
+              setActive((index) => Math.max(index - 1, 0));
+            } else if (event.key === "Enter" && matches[active]) {
+              event.preventDefault();
+              choose(matches[active]!.path);
+            } else if (event.key === "Escape") {
+              setOpen(false);
+            }
+          }}
+        />
+        {open && (
+          <ul className="path-suggest" role="listbox">
+            {loading && <li className="path-suggest-empty">正在读取文件工作区…</li>}
+            {!loading && error && <li className="path-suggest-empty">{error}</li>}
+            {!loading && !error && matches.length === 0 && (
+              <li className="path-suggest-empty">
+                {entries === null
+                  ? "正在等待文件工作区清单"
+                  : `没有匹配的${mode === "dir" ? "目录" : "文件"}`}
+              </li>
+            )}
+            {!loading &&
+              !error &&
+              matches.map((entry, index) => (
+                <li key={entry.path}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={index === active}
+                    className={`path-suggest-item${index === active ? " active" : ""}`}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      choose(entry.path);
+                    }}
+                    onMouseEnter={() => setActive(index)}
+                  >
+                    <Icon name={entry.kind === "dir" ? "folder" : "file"} size={13} />
+                    <span className="path-suggest-path">{entry.path}</span>
+                    <span className="path-suggest-meta">
+                      {entry.kind === "dir"
+                        ? "目录"
+                        : `${Math.max(1, Math.round(entry.sizeBytes / 1024))} KB`}
+                    </span>
+                  </button>
+                </li>
+              ))}
+          </ul>
+        )}
+      </div>
+    </label>
+  );
+}
+
 export default function KnowledgePanel({
   onClose,
   refreshToken,
@@ -252,6 +386,9 @@ export default function KnowledgePanel({
     filePath: string;
   } | null>(null);
   const [folderForm, setFolderForm] = useState<{ path: string } | null>(null);
+  const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceFileEntry[] | null>(null);
+  const [workspaceEntriesLoading, setWorkspaceEntriesLoading] = useState(false);
+  const [workspaceEntriesError, setWorkspaceEntriesError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<KnowledgeSearchHit[] | null>(null);
   const [searchMode, setSearchMode] = useState<KnowledgeSearchMode | null>(null);
@@ -293,6 +430,20 @@ export default function KnowledgePanel({
       setError(messageOf(err));
     }
   }, []);
+
+  const loadWorkspaceEntries = useCallback(async () => {
+    if (workspaceEntriesLoading || workspaceEntries) return;
+    setWorkspaceEntriesLoading(true);
+    setWorkspaceEntriesError(null);
+    try {
+      const listing = await fetchWorkspaceFiles();
+      setWorkspaceEntries(listing.files);
+    } catch (err) {
+      setWorkspaceEntriesError(messageOf(err));
+    } finally {
+      setWorkspaceEntriesLoading(false);
+    }
+  }, [workspaceEntries, workspaceEntriesLoading]);
 
   useEffect(() => {
     void reloadBases();
@@ -1444,16 +1595,17 @@ export default function KnowledgePanel({
 
                     {folderForm && (
                       <div className="knowledge-source-form">
-                        <label className="field">
-                          <span>
-                            文件工作区里的目录（留空导入根目录；支持 MD/TXT/CSV/JSON/HTML/DOCX/XLSX/PDF，单次最多 20 个、单文件 2 MB）
-                          </span>
-                          <input
-                            value={folderForm.path}
-                            onChange={(event) => setFolderForm({ path: event.target.value })}
-                            placeholder="如 papers/energy"
-                          />
-                        </label>
+                        <WorkspacePathSuggest
+                          label="文件工作区里的目录（留空导入根目录；支持 MD/TXT/CSV/JSON/HTML/DOCX/XLSX/PDF，单次最多 20 个、单文件 2 MB）"
+                          mode="dir"
+                          value={folderForm.path}
+                          placeholder="如 papers/energy"
+                          entries={workspaceEntries}
+                          loading={workspaceEntriesLoading}
+                          error={workspaceEntriesError}
+                          onChange={(path) => setFolderForm({ path })}
+                          onRequestLoad={() => void loadWorkspaceEntries()}
+                        />
                         <div className="knowledge-editor-actions">
                           <button
                             type="button"
@@ -1481,16 +1633,17 @@ export default function KnowledgePanel({
                             placeholder="如：2026 年行业报告"
                           />
                         </label>
-                        <label className="field">
-                          <span>或从文件工作区导入（相对路径，如 reports/report.md）</span>
-                          <input
-                            value={sourceForm.filePath}
-                            onChange={(event) =>
-                              setSourceForm({ ...sourceForm, filePath: event.target.value })
-                            }
-                            placeholder="reports/report.md"
-                          />
-                        </label>
+                        <WorkspacePathSuggest
+                          label="或从文件工作区导入（相对路径，如 reports/report.md）"
+                          mode="file"
+                          value={sourceForm.filePath}
+                          placeholder="reports/report.md"
+                          entries={workspaceEntries}
+                          loading={workspaceEntriesLoading}
+                          error={workspaceEntriesError}
+                          onChange={(filePath) => setSourceForm({ ...sourceForm, filePath })}
+                          onRequestLoad={() => void loadWorkspaceEntries()}
+                        />
                         <label className="field">
                           <span>或直接粘贴文本（≤ 2 MB；与上面的文件二选一）</span>
                           <textarea

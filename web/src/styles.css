@@ -7568,6 +7568,73 @@ body.pane-dragging * {
   background: var(--panel);
 }
 
+.knowledge-sheet .path-suggest-field {
+  position: relative;
+}
+
+.knowledge-sheet .path-suggest-wrap {
+  position: relative;
+}
+
+.knowledge-sheet .path-suggest {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-md);
+}
+
+.knowledge-sheet .path-suggest-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.knowledge-sheet .path-suggest-item:hover,
+.knowledge-sheet .path-suggest-item.active {
+  background: var(--bg);
+}
+
+.knowledge-sheet .path-suggest-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+}
+
+.knowledge-sheet .path-suggest-meta {
+  flex: none;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.knowledge-sheet .path-suggest-empty {
+  padding: 8px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
 .knowledge-sheet .knowledge-editor {
   display: flex;
   flex-direction: column;
