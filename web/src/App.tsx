@@ -116,6 +116,7 @@ import {
   type AgentFileEntry,
   type LearningSettings,
   type MaskedSettings,
+  type KnowledgeBaseMeta,
   type MemberSkillsView,
   type MemberTemplateDraft,
   type RoomFrame,
@@ -585,6 +586,11 @@ function RoomView({
   const [knowledgePending, setKnowledgePending] = useState(0);
   /** 「存为知识页」带进知识库面板的草稿（用后即清）。 */
   const [knowledgeDraft, setKnowledgeDraft] = useState<KnowledgePageDraft | null>(null);
+  /** 「存为知识页」选中消息后等待用户挑库：多条消息共用一个弹层状态。 */
+  const [knowledgeSave, setKnowledgeSave] = useState<{
+    message: RoomMessage;
+    bases: KnowledgeBaseMeta[];
+  } | null>(null);
   /** 运行轨迹：把成员画成像素小人的执行现场，与其它工作区视图互斥。 */
   const [traceOpen, setTraceOpen] = useState(false);
   /** 复盘事件到达时自增：学习面板据此重拉提案与流水。 */
@@ -1962,21 +1968,58 @@ function RoomView({
     openPanel("knowledge");
   }
 
-  /** 把成员的一条回答带进知识库：面板打开后直接进入新建页面草稿。 */
-  function handleSaveToKnowledge(message: RoomMessage): void {
+  function draftFromMessage(message: RoomMessage): KnowledgePageDraft | null {
     const text = (visibleMessageText(message.text) || message.text).trim();
-    if (!text) return;
+    if (!text) return null;
     const firstLine =
       text
         .split(/\r?\n/)
         .map((line) => line.replace(/^#+\s*/, "").replace(/\*\*/g, "").trim())
         .find((line) => line.length > 0) ?? "问答整理";
-    setKnowledgeDraft({
+    return {
       title: firstLine.slice(0, 40),
       content: text,
       nonce: Date.now(),
-    });
-    setChatNotice("已把这条回答放进知识库的新建页面，确认标题与路径后保存。");
+    };
+  }
+
+  /** 「存为知识页」：先确认目标库；只有一个库时直接进入新建页面。 */
+  function handleSaveToKnowledge(message: RoomMessage): void {
+    void beginSaveToKnowledge(message);
+  }
+
+  async function beginSaveToKnowledge(message: RoomMessage): Promise<void> {
+    if (!draftFromMessage(message)) return;
+    setError(null);
+    if (knowledgeSave?.message.id === message.id) {
+      setKnowledgeSave(null);
+      setChatNotice(null);
+      return;
+    }
+    try {
+      const bases = await fetchKnowledgeBases();
+      if (bases.length === 0) {
+        setChatNotice("还没有知识库：请先在「知识库」里新建一个，再把回答存为知识页。");
+        return;
+      }
+      if (bases.length === 1) {
+        saveMessageToKnowledge(message, bases[0]!);
+        return;
+      }
+      setKnowledgeSave({ message, bases });
+      setChatNotice("选择要把这条回答存进哪个知识库。");
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    }
+  }
+
+  function saveMessageToKnowledge(message: RoomMessage, base: KnowledgeBaseMeta): void {
+    const draft = draftFromMessage(message);
+    if (!draft) return;
+    setKnowledgeDraft({ ...draft, baseId: base.id });
+    setKnowledgeSave(null);
+    setChatNotice(`已把这条回答放进「${base.name}」的新建页面，确认标题与路径后保存。`);
     openKnowledge();
   }
 
@@ -2663,6 +2706,18 @@ function RoomView({
                     onResume={handleResume}
                     onAnswer={handleAnswerQuestion}
                     onSaveKnowledge={handleSaveToKnowledge}
+                    saveBases={
+                      knowledgeSave?.message.id === message.id ? knowledgeSave.bases : undefined
+                    }
+                    onPickSaveBase={(baseId) => {
+                      const pending = knowledgeSave;
+                      const base = pending?.bases.find((candidate) => candidate.id === baseId);
+                      if (pending && base) saveMessageToKnowledge(pending.message, base);
+                    }}
+                    onCancelSave={() => {
+                      setKnowledgeSave(null);
+                      setChatNotice(null);
+                    }}
                   />
                 );
               })}
@@ -4521,6 +4576,9 @@ function MessageBubble({
   onResume,
   onAnswer,
   onSaveKnowledge,
+  saveBases,
+  onPickSaveBase,
+  onCancelSave,
 }: {
   message: RoomMessage;
   question?: QuestionItem;
@@ -4534,6 +4592,10 @@ function MessageBubble({
     payload: { optionId?: string; text?: string },
   ) => Promise<void>;
   onSaveKnowledge?: (message: RoomMessage) => void;
+  /** 「存为知识页」已展开选库时传入候选库；点击具体库才真正打开面板。 */
+  saveBases?: KnowledgeBaseMeta[];
+  onPickSaveBase?: (baseId: string) => void;
+  onCancelSave?: () => void;
 }) {
   const [source, setSource] = useState(false);
   if (message.senderKind === "system") {
@@ -4616,6 +4678,30 @@ function MessageBubble({
         </div>
       ) : (
         <div className="bubble-text">{message.text}</div>
+      )}
+      {saveBases && saveBases.length > 0 && (
+        <div className="bubble-save-picker" role="group" aria-label="选择知识库">
+          <span className="bubble-save-label">存到：</span>
+          {saveBases.map((base) => (
+            <button
+              key={base.id}
+              type="button"
+              className="chip bubble-save-target"
+              title={base.description || `存到「${base.name}」`}
+              onClick={() => onPickSaveBase?.(base.id)}
+            >
+              <span className="bubble-save-name">{base.name}</span>
+              <span className="bubble-save-meta">{base.pageCount} 页</span>
+            </button>
+          ))}
+          <button
+            type="button"
+            className="chip bubble-save-cancel"
+            onClick={onCancelSave}
+          >
+            取消
+          </button>
+        </div>
       )}
       {question && (
         <QuestionCard question={question} paused={questionPaused} resumed={questionResumed} onAnswer={onAnswer} />

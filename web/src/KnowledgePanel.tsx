@@ -91,6 +91,18 @@ export interface KnowledgePageDraft {
   title: string;
   content: string;
   nonce: number;
+  /** 指定存进哪个库；缺省或该库已删除时退回最近更新的库。 */
+  baseId?: string;
+}
+
+/** 草稿的目标库：显式指定且仍存在就用它，否则退回最近更新的库。 */
+export function resolveDraftBaseId(
+  bases: KnowledgeBaseMeta[],
+  preferred?: string,
+): string | null {
+  if (bases.length === 0) return null;
+  if (preferred && bases.some((base) => base.id === preferred)) return preferred;
+  return bases[0]!.id;
 }
 
 const SEARCH_MODE_LABEL: Record<KnowledgeSearchMode, string> = {
@@ -482,15 +494,19 @@ export default function KnowledgePanel({
   // 聊天消息带来的草稿：等库清单就绪后直接进入新建页面，交给用户确认路径与正文。
   useEffect(() => {
     if (!draft || bases === null) return;
-    if (bases.length === 0) {
+    const targetId = resolveDraftBaseId(bases, draft.baseId);
+    if (!targetId) {
       setNotice("还没有知识库：请先创建一个，再把回答存为知识页。");
       onDraftUsed?.();
       return;
     }
     const page = draftPage(draft);
+    const target = bases.find((base) => base.id === targetId);
     setError(null);
-    setNotice("已把这条回答放进新建页面：确认标题与路径后点保存。");
-    setSelectedId((current) => current ?? bases[0]!.id);
+    setNotice(
+      `已把这条回答放进「${target?.name ?? "知识库"}」的新建页面：确认标题与路径后点保存。`,
+    );
+    setSelectedId(targetId);
     setPreviewMode(false);
     setMode({ kind: "page", path: page.path, content: page.content, isNew: true });
     onDraftUsed?.();
