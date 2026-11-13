@@ -22,6 +22,7 @@ import type {
 } from "../../src/core/types";
 import { DEFAULT_LIMITS, LIMIT_FIELDS, ROOM_ROUTING_LABELS, RUN_SCOPE_LABELS } from "../../src/core/types";
 import type { QuestionField, QuestionItem } from "../../src/room/questions";
+import type { ApprovalBehavior } from "../../src/core/approvals";
 import { Icon, type IconName } from "./icons";
 import {
   LAYOUT_KEY,
@@ -250,6 +251,23 @@ const ROUTING_TITLES: Record<RoomRoutingMode, string> = {
   everyone:
     "全员：没点名的消息同时唤醒在场成员（最多 6 人），与自己无关的成员回一个 pass 就保持沉默。",
   auto: "自动选人：没点名的消息先由一次不带工具的小调用从花名册挑人（最多 6 人），挑不出来就交回主智能体。",
+};
+
+/** 聊天框下的命令执行开关：和设置 → 审批里的「运行命令」是同一份值。 */
+const COMMAND_MODE_OPTIONS: readonly {
+  value: ApprovalBehavior;
+  label: string;
+  hint: string;
+}[] = [
+  { value: "ask", label: "每次询问", hint: "命令执行前弹出审批卡，等你确认" },
+  { value: "allow", label: "直接允许", hint: "命令直接执行，不再逐条确认" },
+  { value: "deny", label: "拒绝", hint: "命令一律不执行" },
+];
+
+const COMMAND_MODE_TITLES: Record<ApprovalBehavior, string> = {
+  ask: "每次询问",
+  allow: "直接允许",
+  deny: "拒绝",
 };
 
 /**
@@ -547,6 +565,8 @@ function RoomView({
   const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [clearingChat, setClearingChat] = useState(false);
   const [startingSession, setStartingSession] = useState(false);
+  const [commandModeBusy, setCommandModeBusy] = useState(false);
+  const [commandModeOpen, setCommandModeOpen] = useState(false);
   const [commandOutput, setCommandOutput] = useState<{ title: string; body: string } | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [usersOpen, setUsersOpen] = useState(false);
@@ -658,6 +678,7 @@ function RoomView({
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const checkingSession = useRef(false);
   const accountRef = useRef<HTMLDivElement | null>(null);
+  const commandModeRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -676,6 +697,24 @@ function RoomView({
       document.removeEventListener("keydown", handleKey);
     };
   }, [menuOpen]);
+
+  useEffect(() => {
+    if (!commandModeOpen) return;
+    const handlePointer = (event: MouseEvent) => {
+      if (commandModeRef.current && !commandModeRef.current.contains(event.target as Node)) {
+        setCommandModeOpen(false);
+      }
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setCommandModeOpen(false);
+    };
+    document.addEventListener("mousedown", handlePointer);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handlePointer);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [commandModeOpen]);
 
   useEffect(() => {
     try {
@@ -1492,6 +1531,32 @@ function RoomView({
       else setError(messageOf(err));
     } finally {
       setStartingSession(false);
+    }
+  }
+
+  /** 聊天框下的快捷开关：只改「运行命令 / 技能脚本」一类，写回与设置 → 审批同一个值。 */
+  async function handleCommandModeChange(mode: ApprovalBehavior) {
+    setCommandModeOpen(false);
+    if (commandModeBusy || !state) return;
+    if (state.settings.approvals.categories.command === mode) return;
+    setCommandModeBusy(true);
+    setError(null);
+    try {
+      const next = await saveSettings({
+        approvals: {
+          categories: { ...state.settings.approvals.categories, command: mode },
+          rules: state.settings.approvals.rules,
+        },
+      });
+      setState((current) => (current ? { ...current, settings: next } : current));
+      setChatNotice(
+        `命令执行模式已切换为「${COMMAND_MODE_TITLES[mode]}」，后续命令按新规则执行。`,
+      );
+    } catch (err) {
+      if (isUnauthorized(err)) onSessionLost();
+      else setError(messageOf(err));
+    } finally {
+      setCommandModeBusy(false);
     }
   }
 
@@ -2936,11 +3001,50 @@ function RoomView({
                   <Icon name="archive" size={15} />
                   <span>{clearingChat ? "清除中…" : "清除会话"}</span>
                 </button>
+                <div className="composer-mode" ref={commandModeRef}>
+                  <button
+                    type="button"
+                    className={`btn composer-btn composer-mode-trigger mode-${state.settings.approvals.categories.command}`}
+                    aria-haspopup="listbox"
+                    aria-expanded={commandModeOpen}
+                    aria-label={`命令执行模式：${COMMAND_MODE_TITLES[state.settings.approvals.categories.command]}`}
+                    title="命令执行模式：run_command / run_batch / run_skill_script 的默认行为；与「设置 → 审批 → 运行命令」是同一个值，所有房间生效"
+                    disabled={commandModeBusy}
+                    onClick={() => setCommandModeOpen((open) => !open)}
+                  >
+                    <span className="composer-mode-dot" aria-hidden="true" />
+                    <span>{COMMAND_MODE_TITLES[state.settings.approvals.categories.command]}</span>
+                    <Icon name="chevronDown" size={14} />
+                  </button>
+                  {commandModeOpen && (
+                    <div className="composer-mode-menu" role="listbox" aria-label="命令执行模式">
+                      {COMMAND_MODE_OPTIONS.map((option) => {
+                        const selected =
+                          option.value === state.settings.approvals.categories.command;
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            role="option"
+                            aria-selected={selected}
+                            className={`composer-mode-option mode-${option.value}`}
+                            onClick={() => void handleCommandModeChange(option.value)}
+                          >
+                            <span className="composer-mode-dot" aria-hidden="true" />
+                            <span className="composer-mode-option-text">
+                              <strong>{option.label}</strong>
+                              <small>{option.hint}</small>
+                            </span>
+                            {selected && <Icon name="check" size={15} />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
               <div className="composer-tips">
                 <span>Enter 发送 · Shift+Enter 换行</span>
-                <span>@成员名 指派任务</span>
-                <span>输入 /help 查看命令</span>
               </div>
             </div>
           </div>

@@ -2122,8 +2122,6 @@ body.pane-dragging * {
 .composer-tips {
   display: flex;
   flex-wrap: wrap;
-  /* 字号升到 12px 后，聊天列窄时提示会折行：行距收到 4px、整体靠右对齐，
-     折出来的第二行不会悬在按钮正下方。 */
   gap: 4px 12px;
   justify-content: flex-end;
   min-width: 0;
@@ -2133,6 +2131,118 @@ body.pane-dragging * {
   display: flex;
   flex: none;
   gap: 6px;
+}
+
+/* 命令执行开关：触发器是一枚次要按钮（与旁边会话按钮同规格），菜单用应用统一的卡片浮层；
+   模式只用圆点颜色区分，不给整块控件染色。 */
+.composer-mode {
+  position: relative;
+  flex: none;
+}
+
+.composer-mode-trigger {
+  gap: 6px;
+}
+
+.composer-mode-trigger > svg {
+  flex: none;
+  color: var(--muted);
+}
+
+.composer-mode-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.mode-ask .composer-mode-dot {
+  background: var(--warn);
+}
+
+.mode-allow .composer-mode-dot {
+  background: var(--ok);
+}
+
+.mode-deny .composer-mode-dot {
+  background: var(--danger);
+}
+
+.composer-mode-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 252px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow: var(--shadow-lg);
+  animation: rise 0.16s var(--ease);
+}
+
+.composer-mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s var(--ease);
+}
+
+.composer-mode-option:hover {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.composer-mode-option[aria-selected="true"] {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.composer-mode-option:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.composer-mode-option .composer-mode-dot {
+  margin-top: 5px;
+}
+
+.composer-mode-option-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.composer-mode-option-text strong {
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.composer-mode-option-text small {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+}
+
+.composer-mode-option > svg {
+  flex: none;
+  margin-top: 1px;
+  color: var(--accent);
 }
 
 /* 会话操作按钮：贴在输入框下面但要一眼认出是可按的——实边框、轻投影、各自带色，
@@ -5649,8 +5759,19 @@ body.pane-dragging * {
     border-radius: var(--radius-lg) var(--radius-lg) 0 0;
   }
 
-  .composer-tips span:last-child {
-    display: none;
+  /* 窄屏放不下三枚按钮一行时提示换行；命令模式菜单靠右展开，避免超出视口。 */
+  .composer-hint {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .composer-mode-menu {
+    right: 0;
+    left: auto;
+  }
+
+  .composer-tips {
+    width: 100%;
   }
 
   .content-title {
