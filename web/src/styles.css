@@ -7602,6 +7602,27 @@ body.pane-dragging * {
   resize: vertical;
 }
 
+.knowledge-sheet .knowledge-raw-scroll {
+  flex: 1;
+  min-height: 320px;
+  max-height: 62vh;
+  overflow: auto;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
+.knowledge-sheet .knowledge-raw-text {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .knowledge-sheet .knowledge-editor-actions {
   display: flex;
   flex-wrap: wrap;

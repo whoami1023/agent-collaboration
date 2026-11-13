@@ -742,6 +742,20 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
+  app.get("/api/knowledge/:id/sources/:sourceId/raw", async (req: Request, res: Response) => {
+    const workspace = await workspaceFor(res);
+    try {
+      res.json(
+        await workspace.knowledge.readSourceRaw(
+          knowledgeBaseId(req),
+          String(req.params["sourceId"] ?? ""),
+        ),
+      );
+    } catch (err) {
+      knowledgeFailure(res, err);
+    }
+  });
+
   app.delete("/api/knowledge/:id/sources/:sourceId", async (req: Request, res: Response) => {
     const workspace = await workspaceFor(res);
     try {

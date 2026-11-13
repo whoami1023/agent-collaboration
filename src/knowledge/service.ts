@@ -789,6 +789,23 @@ export class KnowledgeService {
     return this.store.readBase(meta.id);
   }
 
+  /** 来源原文：只读返回；二进制文件不返回正文，交给前端提示不可预览。 */
+  async readSourceRaw(
+    kbId: string,
+    sourceId: string,
+  ): Promise<{ source: KnowledgeSource; content: string; binary: boolean }> {
+    const base = await this.store.readBase(kbId);
+    const sources = await this.store.readSourceIndex(base.id);
+    const source = sources.find((item) => item.id === sourceId);
+    if (!source) throw new KnowledgeError(404, "来源不存在");
+    const content = await this.store.readSourceRaw(base.id, source.rawPath);
+    const binary = content.includes("\0");
+    if (!content && !binary) {
+      throw new KnowledgeError(404, "原始文件不存在（可能已被外部删除）");
+    }
+    return { source, content: binary ? "" : content, binary };
+  }
+
   async removeSource(kbId: string, sourceId: string): Promise<void> {
     const base = await this.store.readBase(kbId);
     const sources = await this.store.readSourceIndex(kbId);

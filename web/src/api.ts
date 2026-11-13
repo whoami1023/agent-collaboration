@@ -1457,6 +1457,13 @@ export async function removeKnowledgeSource(id: string, sourceId: string): Promi
   });
 }
 
+export async function fetchKnowledgeSourceRaw(
+  id: string,
+  sourceId: string,
+): Promise<{ source: KnowledgeSource; content: string; binary: boolean }> {
+  return request(`/api/knowledge/${id}/sources/${sourceId}/raw`);
+}
+
 export async function retryKnowledgeQueue(
   id: string,
   itemId?: string,

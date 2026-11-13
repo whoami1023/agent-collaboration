@@ -23,6 +23,7 @@ import {
   fetchKnowledgeLint,
   fetchKnowledgePage,
   fetchKnowledgeSnapshot,
+  fetchKnowledgeSourceRaw,
   importKnowledgeBundle,
   importKnowledgeFolder,
   knowledgeExportUrl,
@@ -55,7 +56,15 @@ type PanelMode =
   | { kind: "browse" }
   | { kind: "create-base" }
   | { kind: "edit-base" }
-  | { kind: "page"; path: string; content: string; isNew: boolean };
+  | { kind: "page"; path: string; content: string; isNew: boolean }
+  | {
+      kind: "source";
+      sourceId: string;
+      title: string;
+      content: string;
+      bytes: number;
+      binary: boolean;
+    };
 
 interface BaseFormState {
   name: string;
@@ -542,6 +551,27 @@ export default function KnowledgePanel({
     }
   }
 
+  async function openSourceRaw(sourceId: string) {
+    if (!selectedId) return;
+    setBusy("source-raw");
+    setError(null);
+    try {
+      const result = await fetchKnowledgeSourceRaw(selectedId, sourceId);
+      setMode({
+        kind: "source",
+        sourceId,
+        title: result.source.title,
+        content: result.content,
+        bytes: result.source.bytes,
+        binary: result.binary,
+      });
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function openNewPage() {
     resetMessages();
     setMode({ kind: "page", path: "notes/新页面.md", content: NEW_PAGE_TEMPLATE, isNew: true });
@@ -781,7 +811,35 @@ export default function KnowledgePanel({
         {error && <p className="form-error">{error}</p>}
         {notice && <p className="form-note">{notice}</p>}
 
-        {mode.kind === "page" ? (
+        {mode.kind === "source" ? (
+          <div className="knowledge-editor">
+            <div className="knowledge-editor-bar">
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => {
+                  setMode({ kind: "browse" });
+                  setTab("sources");
+                  setError(null);
+                }}
+              >
+                <Icon name="back" size={13} />
+                返回来源
+              </button>
+              <span className="knowledge-editor-title">原文 · {mode.title}</span>
+              <span className="knowledge-row-meta">{mode.bytes} 字节 · 只读</span>
+            </div>
+            {mode.binary ? (
+              <p className="empty small">
+                该来源是二进制文件（如 PDF、图片或压缩包），暂不支持在线预览原文。
+              </p>
+            ) : (
+              <div className="knowledge-raw-scroll">
+                <pre className="knowledge-raw-text">{mode.content}</pre>
+              </div>
+            )}
+          </div>
+        ) : mode.kind === "page" ? (
           <div className="knowledge-editor">
             <div className="knowledge-editor-bar">
               <button
@@ -1489,6 +1547,15 @@ export default function KnowledgePanel({
                                   查看摘要
                                 </button>
                               )}
+                              <button
+                                type="button"
+                                className="btn ghost sm"
+                                disabled={busy !== null}
+                                onClick={() => void openSourceRaw(source.id)}
+                              >
+                                <Icon name="file" size={13} />
+                                {busy === "source-raw" ? "读取中…" : "查看原文"}
+                              </button>
                               {confirmingSource === source.id ? (
                                 <>
                                   <button

@@ -10,7 +10,7 @@ import { SkillLibrary } from "../src/skills/library";
 import { TemplateLibrary } from "../src/templates/template-library";
 import { WorkspaceRegistry } from "../src/workspace/workspace";
 import { createApp } from "../src/server/app";
-import type { KnowledgeBaseMeta, KnowledgeSnapshot } from "../src/knowledge/types";
+import type { KnowledgeBaseMeta, KnowledgeSnapshot, KnowledgeSource } from "../src/knowledge/types";
 
 let dir: string;
 let registry: WorkspaceRegistry;
@@ -197,6 +197,48 @@ describe("知识库 REST", () => {
     expect(snapshot.base.pendingCount).toBe(0);
 
     expect((await call("/api/knowledge/kb_bad", { auth: ownerCookie })).status).toBe(400);
+  });
+
+  it("来源原文只读接口：返回未经整理的正文，未登录与跨账号不可见", async () => {
+    const created = await call("/api/knowledge", {
+      method: "POST",
+      auth: ownerCookie,
+      body: { name: "原文库" },
+    });
+    const base = created.body["base"] as KnowledgeBaseMeta;
+    const added = await call(`/api/knowledge/${base.id}/sources`, {
+      method: "POST",
+      auth: ownerCookie,
+      body: {
+        title: "原始材料",
+        content: "# 原文标题\n\n这是未经模型整理的原始正文。",
+      },
+    });
+    const source = added.body["source"] as KnowledgeSource;
+
+    const raw = await call(`/api/knowledge/${base.id}/sources/${source.id}/raw`, {
+      auth: ownerCookie,
+    });
+    expect(raw.status).toBe(200);
+    expect(String(raw.body["content"])).toContain("未经模型整理的原始正文");
+    expect(raw.body["binary"]).toBe(false);
+    expect((raw.body["source"] as KnowledgeSource).title).toBe("原始材料");
+
+    expect((await call(`/api/knowledge/${base.id}/sources/${source.id}/raw`)).status).toBe(401);
+    expect(
+      (
+        await call(`/api/knowledge/${base.id}/sources/${source.id}/raw`, {
+          auth: aliceCookie,
+        })
+      ).status,
+    ).toBe(404);
+
+    const item = added.body["queueItem"] as { id: string };
+    await call(`/api/knowledge/${base.id}/queue/cancel`, {
+      method: "POST",
+      auth: ownerCookie,
+      body: { itemId: item.id },
+    });
   });
 
   it("页面可新建、读取原始文本、删除；体检与图谱接口可用", async () => {
