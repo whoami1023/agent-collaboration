@@ -4,7 +4,7 @@
 
 本项目是一套自研的轻量 TypeScript 运行时（Node + Express + React），核心调度、上下文预算、记忆检索，以及部分健壮性机制深度参考并移植自 OpenClaw（MIT，相关文件保留版权声明）。内置的 Word 文档技能改写自 wintersdragon-c/office-docx-skills（MIT，Copyright (c) 2026 wintersdragon-c，脚本文件头保留出处与改动说明）；`internal-comms`、`theme-factory`、`pdf` 三个技能改写自 anthropics/skills（Apache-2.0，已中文化并适配本运行时，许可全文见 `THIRD_PARTY_LICENSES/Apache-2.0.txt`）；技能说明里的联网、数据、工程类内容另有各自的开源来源，均记录在技能的「来源」字段上。
 
-当前版本：**v2.11.1**
+当前版本：**v2.12.0**
 
 ## 功能特性
 
