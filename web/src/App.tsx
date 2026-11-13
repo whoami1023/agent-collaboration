@@ -1876,6 +1876,33 @@ function RoomView({
     }
   }
 
+  /** 工作区面板互斥：同一时刻只允许一个整块视图，打开时统一收掉其余面板。 */
+  function openPanel(
+    panel:
+      | "skills"
+      | "templates"
+      | "knowledge"
+      | "cron"
+      | "learning"
+      | "trace"
+      | "rooms"
+      | "members"
+      | "newMember",
+  ) {
+    setSkillsOpen(panel === "skills");
+    setTemplatesOpen(panel === "templates");
+    setKnowledgeOpen(panel === "knowledge");
+    setCronOpen(panel === "cron");
+    setLearningOpen(panel === "learning");
+    setTraceOpen(panel === "trace");
+    setRoomsOpen(panel === "rooms");
+    setMembersOpen(panel === "members");
+    setNewMemberOpen(panel === "newMember");
+    setSelectedMemberId(null);
+    setBoardOpen(true);
+    setNavOpen(false);
+  }
+
   function openAgentFiles(memberId: string) {
     setSelectedMemberId(memberId);
     setMembersOpen(false);
@@ -1892,63 +1919,20 @@ function RoomView({
   }
 
   function openNewMember() {
-    setNewMemberOpen(true);
-    setSelectedMemberId(null);
-    setMembersOpen(false);
-    setSkillsOpen(false);
-    setTemplatesOpen(false);
-    setCronOpen(false);
-    setLearningOpen(false);
-    setKnowledgeOpen(false);
-    setTraceOpen(false);
-    setRoomsOpen(false);
-    setBoardOpen(true);
-    setNavOpen(false);
+    openPanel("newMember");
   }
 
   /** 成员列表：右侧整块区域，侧边栏「成员」按钮与其它工作区视图互斥。 */
   function openMembers() {
-    setMembersOpen(true);
-    setSelectedMemberId(null);
-    setSkillsOpen(false);
-    setTemplatesOpen(false);
-    setCronOpen(false);
-    setLearningOpen(false);
-    setKnowledgeOpen(false);
-    setTraceOpen(false);
-    setRoomsOpen(false);
-    setNewMemberOpen(false);
-    setBoardOpen(true);
-    setNavOpen(false);
+    openPanel("members");
   }
 
   function openSkills() {
-    setSkillsOpen(true);
-    setMembersOpen(false);
-    setNewMemberOpen(false);
-    setTemplatesOpen(false);
-    setCronOpen(false);
-    setLearningOpen(false);
-    setKnowledgeOpen(false);
-    setTraceOpen(false);
-    setRoomsOpen(false);
-    setBoardOpen(true);
-    setNavOpen(false);
+    openPanel("skills");
   }
 
   function openTemplates() {
-    setTemplatesOpen(true);
-    setSkillsOpen(false);
-    setMembersOpen(false);
-    setNewMemberOpen(false);
-    setCronOpen(false);
-    setLearningOpen(false);
-    setKnowledgeOpen(false);
-    setTraceOpen(false);
-    setRoomsOpen(false);
-    setSelectedMemberId(null);
-    setBoardOpen(true);
-    setNavOpen(false);
+    openPanel("templates");
   }
 
   /** 成员 → 我的模板：先向服务端要一份草稿，再让模板库面板用新建表单接住它。 */
@@ -1965,45 +1949,17 @@ function RoomView({
   }
 
   function openCron() {
-    setCronOpen(true);
-    setSkillsOpen(false);
-    setTemplatesOpen(false);
-    setMembersOpen(false);
-    setNewMemberOpen(false);
-    setRoomsOpen(false);
-    setSelectedMemberId(null);
-    setBoardOpen(true);
-    setNavOpen(false);
+    openPanel("cron");
   }
 
   /** 学习面板：右侧整块区域，展示复盘产出的待确认记忆/技能提案与流水。 */
   function openLearning() {
-    setLearningOpen(true);
-    setSkillsOpen(false);
-    setTemplatesOpen(false);
-    setCronOpen(false);
-    setMembersOpen(false);
-    setRoomsOpen(false);
-    setNewMemberOpen(false);
-    setSelectedMemberId(null);
-    setBoardOpen(true);
-    setNavOpen(false);
+    openPanel("learning");
   }
 
   /** 知识库面板：多库 wiki、来源整理队列与体检，账号级视图。 */
   function openKnowledge() {
-    setKnowledgeOpen(true);
-    setSkillsOpen(false);
-    setTemplatesOpen(false);
-    setCronOpen(false);
-    setLearningOpen(false);
-    setTraceOpen(false);
-    setMembersOpen(false);
-    setRoomsOpen(false);
-    setNewMemberOpen(false);
-    setSelectedMemberId(null);
-    setBoardOpen(true);
-    setNavOpen(false);
+    openPanel("knowledge");
   }
 
   /** 把成员的一条回答带进知识库：面板打开后直接进入新建页面草稿。 */
@@ -2026,35 +1982,13 @@ function RoomView({
 
   /** 运行轨迹：像素小人 + 成员轨迹带，与聊天和其它工作区视图互斥。 */
   function openTrace() {
-    setTraceOpen(true);
-    setSkillsOpen(false);
-    setTemplatesOpen(false);
-    setCronOpen(false);
-    setLearningOpen(false);
-    setKnowledgeOpen(false);
-    setMembersOpen(false);
-    setRoomsOpen(false);
-    setNewMemberOpen(false);
-    setSelectedMemberId(null);
-    setBoardOpen(true);
-    setNavOpen(false);
+    openPanel("trace");
   }
 
   /** 群聊区面板：列表或花名册，两个标签共用同一个右侧区域。 */
   function openRooms(tab: "list" | "members") {
     setRoomsTab(tab);
-    setRoomsOpen(true);
-    setSkillsOpen(false);
-    setTemplatesOpen(false);
-    setCronOpen(false);
-    setLearningOpen(false);
-    setKnowledgeOpen(false);
-    setTraceOpen(false);
-    setMembersOpen(false);
-    setNewMemberOpen(false);
-    setSelectedMemberId(null);
-    setBoardOpen(true);
-    setNavOpen(false);
+    openPanel("rooms");
   }
 
   /**
