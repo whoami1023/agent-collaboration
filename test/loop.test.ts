@@ -274,4 +274,58 @@ describe("agent loop", () => {
     expect(deltas.join("")).not.toContain("echo");
     expect(result.text).toContain("完成");
   });
+
+  it("审批挂起时不执行工具；续跑经批准后执行一次", async () => {
+    const execute = vi.fn(async () => "命令已执行");
+    const commandTool: ToolImpl = {
+      retry: "never",
+      executionMode: "sequential",
+      schema: {
+        name: "run_command",
+        description: "跑命令",
+        parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+      },
+      execute,
+    };
+    const call = { id: "call_approval_1", name: "run_command", args: { command: "echo hi" } };
+    const handler: MockHandler = (request) => {
+      const assistants = request.messages.filter((m) => m.role === "assistant").length;
+      if (assistants === 0) return { toolCalls: [call] };
+      return { text: "完成" };
+    };
+    const suspended = await runAgentLoop({
+      provider: new MockProvider(handler),
+      model: "mock",
+      system: "测试",
+      messages: [{ role: "user", content: "开始" }],
+      tools: [commandTool],
+      maxSteps: 3,
+      signal: new AbortController().signal,
+      beforeTool: async () => ({
+        action: "suspend" as const,
+        suspension: { kind: "awaiting_user" as const, questionId: "q1", messageId: "m1" },
+      }),
+    });
+    expect(suspended.suspended?.questionId).toBe("q1");
+    expect(execute).not.toHaveBeenCalled();
+
+    const resumed = await runAgentLoop({
+      provider: new MockProvider(() => ({ text: "完成" })),
+      model: "mock",
+      system: "测试",
+      messages: [{ role: "user", content: "开始" }],
+      tools: [commandTool],
+      maxSteps: 3,
+      signal: new AbortController().signal,
+      resume: {
+        messages: [{ role: "assistant", content: "", toolCalls: [call] }],
+        pendingCalls: [call],
+        steps: 1,
+      },
+      approvalResumable: () => true,
+      beforeTool: async () => ({ action: "allow" as const }),
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(resumed.text).toBe("完成");
+  });
 });

@@ -29,6 +29,7 @@ import type { MemorySearchManager } from "../memory/manager";
 import type { RecallLedger } from "../memory/recall-ledger";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import type { KnowledgeService } from "../knowledge/service";
+import type { ApprovalGate } from "../room/approvals";
 import type { ToolOutputStore } from "./content/offload";
 import type { RunJournalStore } from "./run-journal";
 import type { MissionStore } from "./mission-ledger";
@@ -78,6 +79,8 @@ export interface OrchestratorDeps {
   missions?: MissionStore;
   /** 知识库：检索既有整理成果；账号级服务由工作区注入。 */
   knowledge?: KnowledgeService;
+  /** 执行前审批：高风险工具调用先挂起问用户。 */
+  approvals?: ApprovalGate;
 }
 
 export function ensureMainMember(bus: RoomBus, name = "主智能体"): Member {
@@ -1120,6 +1123,7 @@ export class Orchestrator {
         ...(deps.questions ? { questions: deps.questions } : {}),
         ...(deps.journals ? { journals: deps.journals } : {}),
         ...(deps.missions ? { missions: deps.missions } : {}),
+        ...(deps.approvals ? { approvals: deps.approvals } : {}),
         advisors: this.advisors,
         onFinished: () => this.pendingReleases.get(member.id)?.(),
       });

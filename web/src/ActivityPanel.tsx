@@ -67,12 +67,50 @@ export function ActivityPanel({
     [activity, filter],
   );
 
+  function exportCsv(): void {
+    const cell = (value: string) => {
+      const guarded = /^[=+\-@]/.test(value) ? `'${value}` : value;
+      return `"${guarded.replace(/"/g, '""')}"`;
+    };
+    const rows = [
+      ["时间", "成员", "类型", "标题", "详情", "结果"].map(cell).join(","),
+      ...timeline.map((event) =>
+        [
+          new Date(event.at).toISOString(),
+          event.memberName,
+          event.kind,
+          event.title,
+          event.detail ?? "",
+          event.ok === undefined ? "" : event.ok ? "成功" : "失败",
+        ]
+          .map(cell)
+          .join(","),
+      ),
+    ];
+    const blob = new Blob([`\uFEFF${rows.join("\r\n")}`], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `activity-${new Date().toISOString().slice(0, 10)}.csv`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div className="activity-panel">
       <section className="activity-overview" aria-label="成员运行状态">
         <div className="activity-section-head">
           <span>成员状态</span>
           <span className="activity-head-right">
+            <button
+              type="button"
+              className="activity-open-trace"
+              title="把当前筛选的活动导出为 CSV（公式前缀已转义）"
+              onClick={exportCsv}
+            >
+              <Icon name="download" size={13} />
+              导出活动
+            </button>
             {onOpenTrace ? (
               <button
                 type="button"

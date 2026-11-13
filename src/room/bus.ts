@@ -33,6 +33,8 @@ export interface AppendInput {
   handoff?: HandoffContext;
   /** 本轮运行姿态；见 RoomMessage.runScope。缺省按 normal 处理。 */
   runScope?: RunScopeKind;
+  /** 这次发言的触发来源。 */
+  initiator?: "person" | "routine" | "handoff";
 }
 
 const MAX_MESSAGES = 2000;
@@ -165,6 +167,7 @@ export class RoomBus {
       ...(input.resumeQuestionId ? { resumeQuestionId: input.resumeQuestionId } : {}),
       ...(input.handoff ? { handoff: input.handoff } : {}),
       ...(input.runScope ? { runScope: input.runScope } : {}),
+      ...(input.initiator ? { initiator: input.initiator } : {}),
     };
     this.messages.push(message);
     if (this.messages.length > MAX_MESSAGES) {

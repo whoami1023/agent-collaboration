@@ -94,6 +94,42 @@ describe("设置迁移", () => {
     expect(settings.limits.runTimeoutMs).toBe(180_000);
   });
 
+  it("v9 的命令默认 allow 收回 ask，显式 deny 保持", async () => {
+    const allowFile = await writeSettings({
+      settingsVersion: 9,
+      limits: DEFAULT_LIMITS,
+      approvals: { categories: { command: "allow" }, rules: [] },
+    });
+    const ask = await loadSettings(allowFile);
+    expect(ask.approvals.categories.command).toBe("ask");
+
+    const denyFile = await writeSettings({
+      settingsVersion: 9,
+      limits: DEFAULT_LIMITS,
+      approvals: { categories: { command: "deny" }, rules: [] },
+    });
+    const deny = await loadSettings(denyFile);
+    expect(deny.approvals.categories.command).toBe("deny");
+  });
+
+  it("v8 及更早显式改成的 allow 不被收回", async () => {
+    const file = await writeSettings({
+      settingsVersion: 8,
+      limits: DEFAULT_LIMITS,
+      approvals: { categories: { command: "allow" }, rules: [] },
+    });
+    const settings = await loadSettings(file);
+    expect(settings.approvals.categories.command).toBe("allow");
+  });
+
+  it("v7 升级补默认审批设置，保留已有字段", async () => {
+    const file = await writeSettings({ settingsVersion: 7, limits: DEFAULT_LIMITS });
+    const settings = await loadSettings(file);
+    expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+    expect(settings.approvals.categories).toEqual({ command: "ask", delete: "ask", write: "allow" });
+    expect(settings.approvals.rules).toEqual([]);
+  });
+
   it("v6 升级补齐 DeepSeek 新模型，保留用户已有模型与默认选择", async () => {
     const file = await writeSettings({
       settingsVersion: 6,

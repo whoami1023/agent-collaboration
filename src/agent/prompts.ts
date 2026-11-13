@@ -169,6 +169,10 @@ const KNOWLEDGE_SECTION = `知识库
 - 工作区左侧「知识库」里有用户整理过的资料：knowledge_search 按关键词检索页面，knowledge_read 读全文，knowledge_list 看某个库的页面清单。
 - 有既往整理结果时先查知识库，再做网络检索或重新分析；引用以页面正文为准，页面过时或有冲突就写明，不要假装它是当前结论。`;
 
+const APPROVAL_SECTION = `执行前审批
+- 运行命令、运行技能脚本、写文件、删除定时任务等动作可能被系统暂停，向用户请求批准。
+- 挂起期间不要声称已经完成；用户批准后会从原处继续，拒绝时换一种做法或如实说明。不要为了绕过审批把命令拆小、改写或藏进别的工具。`;
+
 const CRON_SECTION = `定时任务
 - 用户提到「每天/每周/半小时后/到点再做…」这类延时或周期性要求，用 cron 工具建任务；绝不要在 run_command 里 sleep 或反复轮询来假装定时器。
 - 任务到点会把指令投进群并唤醒对应成员无人值守执行，最终回复就是交付物；一次运行只交一份结果，重复靠调度而不是靠你追问。
@@ -235,6 +239,7 @@ export function buildSystemPrompt(context: PromptContext): string {
     askSection,
     cronSection,
     knowledgeSection,
+    APPROVAL_SECTION,
     formatDynamicContext(context),
   ]
     .filter((section) => section.length > 0)

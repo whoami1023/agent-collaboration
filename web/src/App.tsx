@@ -136,7 +136,7 @@ import { MembersPanel } from "./MembersPanel";
 import { appendActivity } from "./activity-model";
 
 type ThemeMode = "light" | "dark";
-type SettingsTab = "profile" | "model" | "limits" | "learning" | "curation" | "advisors" | "appearance";
+type SettingsTab = "profile" | "model" | "limits" | "approvals" | "learning" | "curation" | "advisors" | "appearance";
 /** 右侧面板的四个视图：任务看板、执行状态、文件工作区、归档区。 */
 type RightTab = "tasks" | "files" | "archives" | "activity" | "audit";
 
@@ -2674,7 +2674,7 @@ function RoomView({
                   ?.scrollIntoView({ behavior: "smooth", block: "center" })
               }
             >
-              <span>{openQuestions.length} 个问题等你回答</span>
+              <span>{openQuestions.length} 项待你处理（提问 / 审批）</span>
               <span className="question-banner-action">查看</span>
             </button>
           )}
@@ -4641,6 +4641,12 @@ function MessageBubble({
             {RUN_SCOPE_LABELS[message.runScope]}
           </span>
         )}
+        {message.initiator === "routine" && (
+          <span className="chip" title="由定时任务触发，当时没有人在旁边">无人值守</span>
+        )}
+        {message.initiator === "handoff" && (
+          <span className="chip" title="由另一位成员交接触发">交接</span>
+        )}
         {message.taskId && <span className="chip">{message.taskId.slice(0, 12)}</span>}
         {toggleable && (
           <button
@@ -4737,12 +4743,23 @@ function QuestionCard({
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const open = question.status === "open";
+  const approval = question.approval;
   return (
-    <section className={`question-card ${question.status}${paused ? " paused" : ""}`}>
+    <section className={`question-card ${question.status}${paused ? " paused" : ""}${approval ? " approval" : ""}`}>
       <header className="question-head">
         <strong>{question.title}</strong>
         <span className="chip accent">
-          {question.status === "open" ? "需要你回答" : question.status === "answered" ? "已回答" : "已取消"}
+          {approval
+            ? question.status === "open"
+              ? "需要你批准"
+              : question.status === "answered"
+                ? "已审批"
+                : "已取消"
+            : question.status === "open"
+              ? "需要你回答"
+              : question.status === "answered"
+                ? "已回答"
+                : "已取消"}
         </span>
         {question.urgency !== "routine" && (
           <span className="chip">{question.urgency === "critical" ? "紧急" : "较急"}</span>
@@ -4751,8 +4768,16 @@ function QuestionCard({
       {paused && (
         <p className="question-pause">
           <span className="question-pause-dot" />
-          已暂停运行，等你回答后会自动从原处继续（同一份运行日志，不会再从头重跑）。
+          {approval
+            ? "已暂停运行，等你批准后会自动从原处继续（同一份运行日志，不会再从头重跑）。"
+            : "已暂停运行，等你回答后会自动从原处继续（同一份运行日志，不会再从头重跑）。"}
         </p>
+      )}
+      {approval && (
+        <div className="approval-preview">
+          <span className="approval-preview-label">{approval.label}</span>
+          <pre>{approval.preview}</pre>
+        </div>
       )}
       {resumed && (
         <p className="question-resumed">答案已接回原运行，智能体接着往下做。</p>
@@ -4784,7 +4809,7 @@ function QuestionCard({
                 </button>
               ))}
             </div>
-            {open ? (
+            {open && !approval ? (
               <form
                 className="question-reply"
                 onSubmit={async (event) => {
@@ -5131,6 +5156,14 @@ function SettingsDialog({
             </button>
             <button
               type="button"
+              className={`settings-tab${tab === "approvals" ? " active" : ""}`}
+              onClick={() => setTab("approvals")}
+            >
+              <Icon name="check" />
+              审批
+            </button>
+            <button
+              type="button"
               className={`settings-tab${tab === "learning" ? " active" : ""}`}
               onClick={() => setTab("learning")}
             >
@@ -5168,6 +5201,9 @@ function SettingsDialog({
             )}
             {tab === "model" && <ModelSettings settings={settings} onSaved={onSettingsSaved} />}
             {tab === "limits" && <LimitsSection settings={settings} onSaved={onSettingsSaved} />}
+            {tab === "approvals" && (
+              <ApprovalsSection settings={settings} onSaved={onSettingsSaved} />
+            )}
             {tab === "learning" && (
               <LearningSection
                 settings={settings}
@@ -5488,6 +5524,110 @@ function LimitsSection({
  * 学习层设置：复盘模式、频率、每日上限与复盘用模型。
  * 取值区间与服务端 `sanitizeLearning()` 同源，界面不会比校验宽。
  */
+function ApprovalsSection({
+  settings,
+  onSaved,
+}: {
+  settings: MaskedSettings;
+  onSaved: (next: MaskedSettings) => void;
+}) {
+  const [categories, setCategories] = useState(settings.approvals.categories);
+  const [rules, setRules] = useState(settings.approvals.rules);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    setCategories(settings.approvals.categories);
+    setRules(settings.approvals.rules);
+  }, [settings.approvals]);
+
+  async function save(): Promise<void> {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setNote(null);
+    try {
+      const next = await saveSettings({ approvals: { categories, rules } });
+      onSaved(next);
+      setNote("审批设置已保存，下一条消息生效");
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const rows: Array<{ key: keyof typeof categories; label: string; hint: string }> = [
+    { key: "command", label: "运行命令 / 技能脚本", hint: "run_command、run_batch、run_skill_script" },
+    { key: "delete", label: "删除类操作", hint: "删除定时任务等不可逆动作" },
+    { key: "write", label: "写入文件", hint: "file_write 写进文件工作区" },
+  ];
+  const labels: Record<string, string> = { allow: "直接允许", ask: "每次询问", deny: "拒绝" };
+
+  return (
+    <div className="settings-form">
+      <div className="section-label">执行前审批</div>
+      <p className="hint">
+        有副作用的动作先按这里的默认值判断；「每次询问」会在群里生成审批卡，挂起运行等你选择。
+        拒绝永远优先，允许只对同类、同作用域的动作生效。
+      </p>
+      {rows.map((row) => (
+        <label className="field" key={row.key}>
+          <span>
+            {row.label}
+            <em>{row.hint}</em>
+          </span>
+          <select
+            value={categories[row.key]}
+            onChange={(event) =>
+              setCategories({ ...categories, [row.key]: event.target.value } as typeof categories)
+            }
+          >
+            {(["allow", "ask", "deny"] as const).map((behavior) => (
+              <option key={behavior} value={behavior}>
+                {labels[behavior]}
+              </option>
+            ))}
+          </select>
+        </label>
+      ))}
+      <div className="section-label">始终允许的规则</div>
+      {rules.length === 0 ? (
+        <p className="hint">还没有保存的规则。在审批卡上选「始终允许」会出现在这里。</p>
+      ) : (
+        <div className="approval-rules">
+          {rules.map((rule) => (
+            <div className="approval-rule" key={rule.id}>
+              <div>
+                <strong>{rule.label || `${rule.tool} · ${rule.scope}`}</strong>
+                <span>
+                  {rule.tool} · {rule.scope || "整个工具"}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="btn ghost sm"
+                disabled={busy}
+                onClick={() => setRules(rules.filter((item) => item.id !== rule.id))}
+              >
+                移除
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="modal-actions">
+        <button type="button" className="btn primary" disabled={busy} onClick={() => void save()}>
+          {busy ? "保存中…" : "保存审批设置"}
+        </button>
+      </div>
+      {note && <p className="form-note">{note}</p>}
+      {error && <p className="form-error">{error}</p>}
+    </div>
+  );
+}
+
 function LearningSection({
   settings,
   modelChoices,

@@ -306,6 +306,8 @@ export interface RoomMessage {
   text: string;
   mentions: string[];
   mentionsRaw: string[];
+  /** 这次发言由谁触发：用户、定时任务（无人值守）还是成员交接。 */
+  initiator?: "person" | "routine" | "handoff";
   taskId?: string;
   runId?: string;
   replyTo?: string;
@@ -423,7 +425,7 @@ export interface SessionArchiveDetail extends SessionArchiveSummary {
 }
 
 export type AgentEvent =
-  | { type: "run-start"; runId: string; memberId: string }
+  | { type: "run-start"; runId: string; memberId: string; initiator?: "person" | "routine" | "handoff" }
   | { type: "reasoning"; runId: string; memberId: string; text: string }
   | { type: "delta"; runId: string; memberId: string; text: string }
   | { type: "tool"; runId: string; memberId: string; name: string; args: Record<string, unknown> }
@@ -452,7 +454,13 @@ export type AgentEvent =
       ok?: boolean;
       detail?: string;
     }
-  | { type: "run-final"; runId: string; memberId: string; text: string }
+  | {
+      type: "run-final";
+      runId: string;
+      memberId: string;
+      text: string;
+      initiator?: "person" | "routine" | "handoff";
+    }
   | {
       /** 运行在等用户回答：运行日志保持可续跑，工作项转入 waiting_user。 */
       type: "run-suspended";
@@ -460,6 +468,7 @@ export type AgentEvent =
       memberId: string;
       questionId: string;
       messageId: string;
+      initiator?: "person" | "routine" | "handoff";
     }
   | { type: "run-error"; runId: string; memberId: string; error: string }
   | {

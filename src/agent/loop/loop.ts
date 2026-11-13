@@ -110,6 +110,17 @@ export interface LoopOptions {
   tools: ToolImpl[];
   maxSteps: number;
   signal: AbortSignal;
+  /** 执行前审批：返回 suspend 时不写工具结果，本轮挂起；拒绝时返回结构化原因。 */
+  beforeTool?: (
+    call: ToolCall,
+    tool: ToolImpl,
+  ) => Promise<
+    | { action: "allow" }
+    | { action: "deny"; reason: string }
+    | { action: "suspend"; suspension: ToolSuspension }
+  >;
+  /** 续跑时确认该调用是因审批而挂起，需要重放而不是标成「结果未知」。 */
+  approvalResumable?: (call: ToolCall) => boolean;
   /** 模型调用了本轮没挂载的工具（运行姿态收窄）时的回执；不传则按「没有名为 X 的工具」回复。 */
   toolUnavailable?: (name: string) => string;
   /**
@@ -359,7 +370,8 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       throwIfAborted(options.signal);
       const tool = options.tools.find((candidate) => candidate.schema.name === call.name);
       const retryable = tool !== undefined && (tool.retry === "safe" || tool.retry === "idempotent");
-      if (retryable) {
+      const approvalResumable = tool !== undefined && options.approvalResumable?.(call) === true;
+      if (retryable || approvalResumable) {
         options.onToolCall?.(call);
         const outcome = await executeOne(
           options,
@@ -872,6 +884,8 @@ interface CallOutcome {
   status: ToolResultStatus;
   halt?: string;
   suspend?: ToolSuspension;
+  /** 挂起前没有写工具结果：续跑时该调用仍是 pending，需要重放。 */
+  noResult?: boolean;
 }
 
 async function executeOne(
@@ -906,6 +920,9 @@ async function executeOne(
   let suspension: ToolSuspension | undefined;
   let status: ToolResultStatus;
   let refused = false;
+  let approvalGate:
+    | Awaited<NonNullable<ReturnType<NonNullable<LoopOptions["beforeTool"]>>>>
+    | undefined;
   if (!tool) {
     raw = options.toolUnavailable?.(call.name) ?? `错误：没有名为 ${call.name} 的工具`;
     status = { ok: false, code: "unknown_tool" };
@@ -913,38 +930,53 @@ async function executeOne(
     refused = true;
     guardrails.recordRefusal();
   } else {
-    try {
-      // 全局重试配置只提供退避参数；是否重试由「工具声明 + 错误分类」决定。
-      const callRetryOptions: RetryOptions = {
-        ...retryOptions,
-        shouldRetry: (err, attempt) =>
-          (retryOptions.shouldRetry?.(err, attempt) ?? true) &&
-          toolRetryAllowed(tool, err, options.signal),
-        onRetry: (info) =>
-          options.onToolRetry?.({
-            callId: call.id,
-            name: call.name,
-            attempt: info.attempt,
-            delayMs: info.delayMs,
-            error: info.err instanceof Error ? info.err.message : String(info.err),
-          }),
+    approvalGate = await options.beforeTool?.(call, tool);
+    if (approvalGate?.action === "suspend") {
+      // 审批卡已经落库；调用本身没有执行，也不写工具结果，续跑时从日志重放。
+      return {
+        content: "",
+        status: { ok: true },
+        suspend: approvalGate.suspension,
+        noResult: true,
       };
-      raw = await retryAsync(
-        () => tool.execute(call.args, options.signal),
-        callRetryOptions,
-      );
-      status = classifyToolResult(raw);
-    } catch (err) {
-      if (err instanceof ToolSuspensionSignal) {
-        suspension = err.suspension;
-        raw = err.message;
-        status = { ok: true };
-      } else if (err instanceof ToolFailure) {
-        raw = toolErrorText(err);
-        status = { ok: false, code: err.code };
-      } else {
-        raw = `工具执行失败：${err instanceof Error ? err.message : String(err)}`;
-        status = { ok: false, code: "tool_exception" };
+    }
+    if (approvalGate?.action === "deny") {
+      raw = `未执行：${approvalGate.reason}`;
+      status = { ok: false, code: "permission_denied" };
+    } else {
+      try {
+        // 全局重试配置只提供退避参数；是否重试由「工具声明 + 错误分类」决定。
+        const callRetryOptions: RetryOptions = {
+          ...retryOptions,
+          shouldRetry: (err, attempt) =>
+            (retryOptions.shouldRetry?.(err, attempt) ?? true) &&
+            toolRetryAllowed(tool, err, options.signal),
+          onRetry: (info) =>
+            options.onToolRetry?.({
+              callId: call.id,
+              name: call.name,
+              attempt: info.attempt,
+              delayMs: info.delayMs,
+              error: info.err instanceof Error ? info.err.message : String(info.err),
+            }),
+        };
+        raw = await retryAsync(
+          () => tool.execute(call.args, options.signal),
+          callRetryOptions,
+        );
+        status = classifyToolResult(raw);
+      } catch (err) {
+        if (err instanceof ToolSuspensionSignal) {
+          suspension = err.suspension;
+          raw = err.message;
+          status = { ok: true };
+        } else if (err instanceof ToolFailure) {
+          raw = toolErrorText(err);
+          status = { ok: false, code: err.code };
+        } else {
+          raw = `工具执行失败：${err instanceof Error ? err.message : String(err)}`;
+          status = { ok: false, code: "tool_exception" };
+        }
       }
     }
   }

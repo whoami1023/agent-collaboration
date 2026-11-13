@@ -13,6 +13,7 @@ import {
   sanitizeLimits,
   type Settings,
 } from "../core/settings";
+import { sanitizeApprovals } from "../core/approvals";
 import {
   THINKING_LEVELS,
   type ProviderConfig,
@@ -1702,6 +1703,8 @@ export function createApp(deps: AppDeps): express.Express {
       const learning = body.learning !== undefined ? sanitizeLearning(body.learning) : undefined;
       const advisors = body.advisors !== undefined ? sanitizeAdvisors(body.advisors) : undefined;
       const curation = body.curation !== undefined ? sanitizeCuration(body.curation) : undefined;
+      const approvals =
+        body.approvals !== undefined ? sanitizeApprovals(body.approvals, current.approvals) : undefined;
       const next = mergeSettings(current, {
         ...(providers ? { providers } : {}),
         ...(selection ? { selection } : {}),
@@ -1709,6 +1712,7 @@ export function createApp(deps: AppDeps): express.Express {
         ...(learning ? { learning } : {}),
         ...(advisors ? { advisors } : {}),
         ...(curation ? { curation } : {}),
+        ...(approvals ? { approvals } : {}),
       });
       // 默认模型失效（指向已删/已停用的模型）时先回落到仍然可用的引用，再校验。
       const ready = repairDefaultModel(next);

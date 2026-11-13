@@ -5932,6 +5932,75 @@ body.pane-dragging * {
   opacity: 0.7;
 }
 
+.question-card.approval {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent) 4%, var(--panel));
+}
+
+.approval-preview {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+
+.approval-preview-label {
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+
+.approval-preview pre {
+  margin: 4px 0 0;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.question-card.approval .question-options {
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.approval-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.approval-rule {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+
+.approval-rule div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.approval-rule strong {
+  font-weight: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-rule span {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-family: var(--mono);
+}
+
 .question-card.paused {
   border-color: color-mix(in srgb, #d99b2b 45%, var(--border-strong));
   background: color-mix(in srgb, #d99b2b 5%, var(--panel));

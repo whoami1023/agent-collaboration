@@ -19,10 +19,15 @@ import {
 } from "../model/types";
 import { looksMasked, preserveSecretOnPatch, secretPreview } from "../model/secret";
 import { CURATION_RULES } from "../skills/curation/types";
+import {
+  DEFAULT_APPROVALS,
+  sanitizeApprovals,
+  type ApprovalSettings,
+} from "./approvals";
 
 export type { ModelDefinition, ModelSelection, ProviderApi, ProviderConfig } from "../model/types";
 
-export const SETTINGS_VERSION = 7;
+export const SETTINGS_VERSION = 10;
 
 /**
  * 内置别名（对应 OpenClaw `src/config/defaults.ts` 的 alias 表），
@@ -169,6 +174,10 @@ export const DEFAULT_SETTINGS: Settings = {
   learning: { ...DEFAULT_LEARNING },
   advisors: { ...DEFAULT_ADVISORS },
   curation: { ...DEFAULT_CURATION },
+  approvals: {
+    categories: { ...DEFAULT_APPROVALS.categories },
+    rules: [],
+  },
 };
 
 export interface Settings {
@@ -183,6 +192,8 @@ export interface Settings {
   advisors: AdvisorSettings;
   /** 技能策展（闲置 / 归档 / 合并建议）的开关与阈值；默认只跑确定性扫描，不调模型。 */
   curation: CurationSettings;
+  /** 执行前审批：分类默认与「始终允许」规则。 */
+  approvals: ApprovalSettings;
 }
 
 /** 每次返回一份全新的默认设置：DEFAULT_SETTINGS 是共享常量，调用方不要直接改它。 */
@@ -223,6 +234,7 @@ export interface MaskedSettings {
   learning: LearningSettings;
   advisors: AdvisorSettings;
   curation: CurationSettings;
+  approvals: ApprovalSettings;
 }
 
 function maskModel(model: ModelDefinition): MaskedModelDefinition {
@@ -262,6 +274,7 @@ export function maskSettings(settings: Settings): MaskedSettings {
     learning: structuredClone(settings.learning),
     advisors: structuredClone(settings.advisors),
     curation: structuredClone(settings.curation),
+    approvals: structuredClone(settings.approvals),
   };
 }
 
@@ -303,6 +316,7 @@ interface LegacySettings {
   learning?: Partial<LearningSettings>;
   advisors?: Partial<AdvisorSettings>;
   curation?: Partial<CurationSettings>;
+  approvals?: unknown;
 }
 
 /**
@@ -314,6 +328,22 @@ const LEGACY_LIMIT_DEFAULTS: ReadonlyArray<{ since: number; maxStepsPerRun: numb
   { since: 2, maxStepsPerRun: 24, runTimeoutMs: 180_000 },
   { since: 3, maxStepsPerRun: 48, runTimeoutMs: 420_000 },
 ];
+
+/**
+ * v10 把命令类操作收回「每次询问」：只翻转 v9 里还是 allow 的库。
+ * v9 存下的 allow 无法区分是旧默认还是用户显式选择，统一按默认收回；deny 保持不动。
+ */
+function migratedApprovals(raw: unknown, version: number): ApprovalSettings {
+  try {
+    const approvals = sanitizeApprovals(raw ?? {}, DEFAULT_APPROVALS);
+    if (version === 9 && approvals.categories.command === "allow") {
+      approvals.categories.command = "ask";
+    }
+    return approvals;
+  } catch {
+    return structuredClone(DEFAULT_APPROVALS);
+  }
+}
 
 /**
  * 逐级迁移历史默认值：只有「存的值 == 那一版的默认值」才升级，用户显式改过的数值保持不动。
@@ -415,6 +445,7 @@ function migrateSettings(raw: Partial<Settings>): Partial<Settings> {
         return { ...DEFAULT_CURATION };
       }
     })(),
+    approvals: migratedApprovals(legacy.approvals, version),
   };
 }
 
@@ -457,6 +488,7 @@ interface SettingsPatch {
   learning?: Partial<LearningSettings>;
   advisors?: Partial<AdvisorSettings>;
   curation?: Partial<CurationSettings>;
+  approvals?: ApprovalSettings;
 }
 
 /**
@@ -746,6 +778,7 @@ export function mergeSettings(base: Settings, patch: SettingsPatch): Settings {
       ...base.curation,
       ...(patch.curation ?? {}),
     },
+    approvals: patch.approvals ?? base.approvals,
   };
 }
 

@@ -3,7 +3,7 @@ import { SYSTEM_ID } from "../core/types";
 import { newId } from "../core/ids";
 import type { RoomBus } from "../room/bus";
 import type { Workboard } from "../workboard/board";
-import type { LlmMessage } from "../provider/types";
+import type { LlmMessage, ToolCall } from "../provider/types";
 import {
   resolveModelRuntime,
   type ModelTransport,
@@ -18,7 +18,7 @@ import type { MemorySearchManager } from "../memory/manager";
 import type { WorkspaceFiles } from "../files/workspace-files";
 import { resolveTriggerRecall, type TriggerRecallHit } from "../memory/recall";
 import { findCitedRecallHits, type RecallLedger } from "../memory/recall-ledger";
-import { runAgentLoop } from "./loop";
+import { runAgentLoop, type ToolImpl } from "./loop";
 import type { LearningHost } from "./learning/types";
 import type { AdvisorService } from "./advisors/service";
 import { CRON_SENDER_ID } from "../cron/types";
@@ -38,6 +38,7 @@ import { buildInstruction, buildSystemPrompt, formatRoomWindow } from "./prompts
 import type { LoadedRunJournal, RunJournalRecorder, RunJournalStore } from "./run-journal";
 import type { MissionStore } from "./mission-ledger";
 import type { KnowledgeService } from "../knowledge/service";
+import type { ApprovalGate } from "../room/approvals";
 
 export interface MemberUsageRecord {
   ref: string;
@@ -79,6 +80,8 @@ export interface RuntimeDeps {
   missions?: MissionStore;
   /** 知识库：既往整理过的资料，工具检索 + 提示词里给一份目录摘录。 */
   knowledge?: KnowledgeService;
+  /** 执行前审批：高风险工具调用先挂起问用户。 */
+  approvals?: ApprovalGate;
   onFinished?(memberId: string): void;
   /** 每次运行结束后回报本程各模型的 token 与成本，供 SSE 与账本消费。 */
   onUsageRecord?(record: MemberUsageRecord): void;
@@ -199,7 +202,9 @@ export class MemberRuntime {
     timeout.unref();
 
     this.setStatus("running");
-    this.emit({ type: "run-start", runId, memberId: this.member.id });
+    const initiator: "person" | "routine" | "handoff" =
+      trigger.senderId === CRON_SENDER_ID ? "routine" : trigger.handoff ? "handoff" : "person";
+    this.emit({ type: "run-start", runId, memberId: this.member.id, initiator });
 
     /** 运行日志：每一步已完成的回合与工具结果都落盘，进程中断后据此续跑。 */
     let journal: RunJournalRecorder | null = null;
@@ -480,6 +485,20 @@ export class MemberRuntime {
         ...(runScope ? { toolUnavailable: (name: string) => scopeToolUnavailable(runScope, name) } : {}),
         maxSteps: limits.maxStepsPerRun,
         signal: controller.signal,
+        ...(this.deps.approvals
+          ? {
+              beforeTool: (call: ToolCall, tool: ToolImpl) =>
+                this.deps.approvals!.check({
+                  runId,
+                  memberId: this.member.id,
+                  memberName: this.member.name,
+                  call,
+                  tool,
+                }),
+              approvalResumable: (call: ToolCall) =>
+                this.deps.approvals!.canResume(runId, call),
+            }
+          : {}),
         budget,
         budgetOwnerId: this.member.id,
         // 工具结果进上下文前的统一出口：外部来源套不可信信封、疑似密钥掩码（见 content/policy.ts）。
@@ -559,6 +578,7 @@ export class MemberRuntime {
           memberId: this.member.id,
           questionId: result.suspended.questionId,
           messageId: result.suspended.messageId,
+          initiator,
         });
         this.setStatus("waiting");
         return;
@@ -625,9 +645,10 @@ export class MemberRuntime {
           ...(trigger.taskId ? { taskId: trigger.taskId } : {}),
           // 姿态跟着这一轮产出的消息走：唤醒规则用它挡住计划轮的 @，界面也靠它标出「计划轮」。
           ...(trigger.runScope ? { runScope: trigger.runScope } : {}),
+          initiator,
         });
         if (trigger.taskId) board.linkMessage(trigger.taskId, message.id);
-        this.emit({ type: "run-final", runId, memberId: this.member.id, text: result.text });
+        this.emit({ type: "run-final", runId, memberId: this.member.id, text: result.text, initiator });
       } else {
         // pass 这一轮什么都没交付：终局事件留空，前端不会为它渲染一条气泡。
         this.emit({
@@ -635,6 +656,7 @@ export class MemberRuntime {
           runId,
           memberId: this.member.id,
           text: passed ? "" : (result.text ?? ""),
+          initiator,
         });
       }
       // 召回账本的另一半：交付正文里出现 `Source: path#Lx` 才算这条记忆真被引用。

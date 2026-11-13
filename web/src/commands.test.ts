@@ -123,6 +123,7 @@ const settings: MaskedSettings = {
     autoArchive: false,
     consolidate: false,
   },
+  approvals: { categories: { command: "ask", delete: "ask", write: "allow" }, rules: [] },
 };
 
 function data(overrides: Partial<CommandData> = {}): CommandData {

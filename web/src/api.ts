@@ -26,6 +26,7 @@ import type { QuestionItem } from "../../src/room/questions";
 import type { ActivityEvent } from "../../src/room/activity-log";
 import type { AuditRecord } from "../../src/agent/audit/types";
 import type { AdvisorSettings, CurationSettings } from "../../src/core/settings";
+import type { ApprovalSettings } from "../../src/core/approvals";
 import type {
   CurationLog,
   CurationProposal,
@@ -118,6 +119,7 @@ export interface MaskedSettings {
   learning: LearningSettings;
   advisors: AdvisorSettings;
   curation: CurationSettings;
+  approvals: ApprovalSettings;
 }
 
 export interface StateSnapshot {
@@ -1249,6 +1251,7 @@ export async function saveSettings(patch: {
   advisors?: Partial<AdvisorSettings>;
   /** 技能策展开关：是否启用 / 闲置与归档阈值 / 扫描间隔 / 自动归档 / 合并建议 / 策展模型。 */
   curation?: Partial<CurationSettings>;
+  approvals?: ApprovalSettings;
 }): Promise<MaskedSettings> {
   const body = await request<{ settings: MaskedSettings }>("/api/settings", {
     method: "PUT",

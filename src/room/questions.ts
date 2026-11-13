@@ -48,6 +48,18 @@ export interface QuestionTransition {
   note?: string;
 }
 
+/** 审批卡附带的动作信息：批准后由运行时据此执行被挂起的工具调用。 */
+export interface ApprovalPayload {
+  category: "command" | "delete" | "write";
+  tool: string;
+  scope: string;
+  label: string;
+  preview: string;
+  runId: string;
+  callId: string;
+  memberId: string;
+}
+
 export interface QuestionItem {
   id: string;
   roomId: string;
@@ -62,6 +74,8 @@ export interface QuestionItem {
   answers: Record<string, QuestionAnswer>;
   status: QuestionStatus;
   urgency: QuestionUrgency;
+  /** 有它表示这是一张动作审批卡，不是普通提问。 */
+  approval?: ApprovalPayload;
   /** 答完能解锁什么：给用户判断优先级的上下文。 */
   unblocks?: string;
   answeredAt?: number;
@@ -154,6 +168,33 @@ function isField(value: unknown): value is QuestionField {
   return typeof raw["id"] === "string" && typeof raw["question"] === "string" && Array.isArray(raw["options"]);
 }
 
+function hydrateApproval(value: unknown): ApprovalPayload | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    (raw["category"] !== "command" && raw["category"] !== "delete" && raw["category"] !== "write") ||
+    typeof raw["tool"] !== "string" ||
+    typeof raw["scope"] !== "string" ||
+    typeof raw["label"] !== "string" ||
+    typeof raw["preview"] !== "string" ||
+    typeof raw["runId"] !== "string" ||
+    typeof raw["callId"] !== "string" ||
+    typeof raw["memberId"] !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    category: raw["category"],
+    tool: raw["tool"],
+    scope: raw["scope"],
+    label: raw["label"],
+    preview: raw["preview"],
+    runId: raw["runId"],
+    callId: raw["callId"],
+    memberId: raw["memberId"],
+  };
+}
+
 export class QuestionStore {
   private items: QuestionItem[] = [];
   private readonly now: () => number;
@@ -196,6 +237,7 @@ export class QuestionStore {
           };
         }
       }
+      const approval = hydrateApproval(rawItem["approval"]);
       restored.push({
         id: rawItem["id"],
         roomId: typeof rawItem["roomId"] === "string" ? rawItem["roomId"] : this.roomId,
@@ -212,6 +254,7 @@ export class QuestionStore {
           rawItem["urgency"] === "urgent" || rawItem["urgency"] === "critical"
             ? rawItem["urgency"]
             : "routine",
+        ...(approval ? { approval } : {}),
         ...(typeof rawItem["unblocks"] === "string" ? { unblocks: rawItem["unblocks"] } : {}),
         ...(typeof rawItem["answeredAt"] === "number" ? { answeredAt: rawItem["answeredAt"] } : {}),
         ...(typeof rawItem["answeredBy"] === "string" ? { answeredBy: rawItem["answeredBy"] } : {}),
@@ -231,6 +274,7 @@ export class QuestionStore {
     questions: QuestionField[];
     urgency?: QuestionUrgency;
     unblocks?: string;
+    approval?: ApprovalPayload;
   }): QuestionItem {
     const at = this.now();
     const item: QuestionItem = {
@@ -246,6 +290,7 @@ export class QuestionStore {
       answers: {},
       status: "open",
       urgency: input.urgency ?? "routine",
+      ...(input.approval ? { approval: input.approval } : {}),
       ...(input.unblocks?.trim() ? { unblocks: input.unblocks.trim().slice(0, MAX_QUESTION_CHARS) } : {}),
       transitions: [{ at, from: null, to: "open", by: input.askerId, note: "发起提问" }],
     };

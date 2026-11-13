@@ -31,6 +31,7 @@ import {
   formatAnswerMessage,
   type QuestionItem,
 } from "../room/questions";
+import { ApprovalGate } from "../room/approvals";
 import { ActivityStore, type ActivityEvent } from "../room/activity-log";
 import { AuditStore } from "../agent/audit/store";
 import { AuditService } from "../agent/audit/service";
@@ -126,6 +127,8 @@ export interface RoomInstance {
   workQueue: WorkQueue;
   /** 结构化提问：待答问题与答案，界面按 messageId 把卡片挂在提问消息下。 */
   questions: QuestionStore;
+  /** 执行前审批：高风险工具调用生成审批卡并挂起运行。 */
+  approvals: ApprovalGate;
   /** 执行轨迹：服务端统一记录，前端读快照与 SSE，不在本地推导工具活动。 */
   activity: ActivityStore;
   /** 持续审计：任务验收的独立核对记录与每任务进度。 */
@@ -444,6 +447,13 @@ export class Workspace {
       },
     });
     questions.hydrate(persisted?.questions);
+    const approvals = new ApprovalGate({
+      roomId: descriptor.id,
+      bus,
+      questions,
+      getSettings: () => this.settingsRef.current,
+      setSettings: (next) => this.setSettings(next),
+    });
     const activity = new ActivityStore(descriptor.id, {
       onChange: (event) => {
         this.scheduleSave(descriptor.id);
@@ -486,6 +496,7 @@ export class Workspace {
       knowledge: this.knowledge,
       workQueue,
       questions,
+      approvals,
       journals,
       missions,
     });
@@ -539,6 +550,7 @@ export class Workspace {
       orchestrator,
       workQueue,
       questions,
+      approvals,
       activity,
       audits,
       auditService,
