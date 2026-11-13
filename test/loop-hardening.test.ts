@@ -198,6 +198,27 @@ describe("agent loop hardening", () => {
     expect(messages[5]?.content).toBe("新消息");
   });
 
+  it("工具结果乱序时按 tool_calls 顺序重排", () => {
+    const messages: LlmMessage[] = [
+      { role: "system", content: "测试" },
+      { role: "user", content: "开始" },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          { id: "call_a", name: "run_batch", args: {} },
+          { id: "call_b", name: "file_read", args: {} },
+        ],
+      },
+      { role: "tool", toolCallId: "call_b", content: "挂起占位" },
+      { role: "tool", toolCallId: "call_a", content: "真实结果" },
+    ];
+    fillMissingToolResults(messages);
+    const results = messages.filter((m) => m.role === "tool");
+    expect(results.map((m) => (m.role === "tool" ? m.toolCallId : ""))).toEqual(["call_a", "call_b"]);
+    expect(results.map((m) => m.content)).toEqual(["真实结果", "挂起占位"]);
+  });
+
   it("工具抛错时按配置重试，最终返回失败信息", async () => {
     let attempts = 0;
     const flakyTool: ToolImpl = {

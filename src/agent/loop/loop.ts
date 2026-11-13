@@ -294,36 +294,39 @@ const MISSING_TOOL_RESULT =
   "工具调用未执行：运行中收到新的群聊消息，该调用已被释放，没有结果；如仍需执行请重新发起。";
 
 /**
- * OpenAI 兼容接口要求 assistant 的每个 tool_call 都有对应 tool 结果。
- * 上下文裁剪或中途打断可能留下悬空调用，这里补一条说明性结果兜底，
- * 避免整个请求被 400 拒绝。
+ * OpenAI 兼容接口要求 assistant 的每个 tool_call 都有对应 tool 结果，且结果顺序
+ * 与 tool_calls 一致（DeepSeek 会严格校验顺序，乱序同样报 400）。
+ * 上下文裁剪、中途打断或审批挂起后续跑都可能留下悬空/乱序结果，这里统一补齐并重排。
  */
 export function fillMissingToolResults(messages: LlmMessage[]): void {
   for (let index = 0; index < messages.length; index += 1) {
     const assistant = messages[index];
     if (assistant?.role !== "assistant" || !assistant.toolCalls?.length) continue;
+    const calls = assistant.toolCalls.filter((call) => call.id);
+    if (calls.length === 0) continue;
+
     let frameEnd = index + 1;
     while (frameEnd < messages.length && messages[frameEnd]?.role !== "assistant") frameEnd += 1;
-    const answered = new Set<string>();
+
+    // 同一调用出现多条结果时保留最后一条：续跑重放的真实结果比挂起占位更新。
+    const answered = new Map<string, LlmMessage>();
     for (let cursor = index + 1; cursor < frameEnd; cursor += 1) {
       const message = messages[cursor];
-      if (message?.role === "tool" && message.toolCallId) answered.add(message.toolCallId);
+      if (message?.role === "tool" && message.toolCallId) answered.set(message.toolCallId, message);
     }
-    const missing = assistant.toolCalls.filter((call) => call.id && !answered.has(call.id));
-    if (missing.length === 0) continue;
-    // 插在已有 tool 结果之后、下一条普通消息之前，保证结果紧跟调用。
-    let insertAt = index + 1;
-    while (insertAt < messages.length && messages[insertAt]?.role === "tool") insertAt += 1;
-    messages.splice(
-      insertAt,
-      0,
-      ...missing.map((call) => ({
-        role: "tool" as const,
-        toolCallId: call.id,
-        content: MISSING_TOOL_RESULT,
-      })),
+
+    const ordered: LlmMessage[] = calls.map(
+      (call) =>
+        answered.get(call.id) ?? {
+          role: "tool" as const,
+          toolCallId: call.id,
+          content: MISSING_TOOL_RESULT,
+        },
     );
-    index = insertAt + missing.length - 1;
+    // 该帧内不属于本批 tool_calls 的工具结果会被接口拒绝，一并丢弃。
+    const rest = messages.slice(index + 1, frameEnd).filter((message) => message.role !== "tool");
+    messages.splice(index + 1, frameEnd - (index + 1), ...ordered, ...rest);
+    index += ordered.length + rest.length;
   }
 }
 
