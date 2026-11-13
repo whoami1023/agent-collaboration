@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   CatalogSuggestion,
   MaskedProvider,
@@ -39,7 +39,7 @@ const PROVIDER_PRESETS: Array<{
   baseUrl: string;
   models: string[];
 }> = [
-  { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"] },
+  { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", models: ["deepseek-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"] },
   { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", models: ["gpt-4o-mini", "gpt-4o", "o4-mini"] },
   { id: "moonshot", label: "Moonshot (Kimi)", baseUrl: "https://api.moonshot.cn/v1", models: ["moonshot-v1-8k"] },
   { id: "zhipu", label: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", models: ["glm-4"] },
@@ -228,14 +228,6 @@ export function ModelSettings({
       active = false;
     };
   }, [provider?.id, provider?.api, settings]);
-
-  const allRefs = useMemo(() => {
-    const refs: string[] = [];
-    for (const item of settings.providers) {
-      for (const model of item.models) refs.push(`${item.id}/${model.id}`);
-    }
-    return refs;
-  }, [settings.providers]);
 
   async function handleCreate(id: string): Promise<void> {
     const trimmed = id.trim();
@@ -427,6 +419,12 @@ export function ModelSettings({
 
   const editorDraft = draft;
   const patched = settings.providers.find((item) => item.id === editorDraft.id) ?? provider;
+  // 默认模型只列当前供应商的模型；全局默认若来自别家，只保留一个「当前」占位，避免下拉被别家选项淹没。
+  const providerRefs = editorDraft.models
+    .map((model) => model.id.trim())
+    .filter(Boolean)
+    .map((id) => `${editorDraft.id}/${id}`);
+  const defaultElsewhere = defaultModel.trim() !== "" && !providerRefs.includes(defaultModel);
 
   return (
     <div className="settings-form model-settings">
@@ -513,23 +511,24 @@ export function ModelSettings({
         <label className="field">
           <span>
             默认模型
-            <em>成员选择「跟随默认」时使用；也可用 /model 命令临时改</em>
+            <em>只列当前供应商的模型；成员选择「跟随默认」时使用，也可用 /model 命令临时改</em>
           </span>
           <select value={defaultModel} onChange={(event) => setDefaultModel(event.target.value)}>
-            {!allRefs.includes(defaultModel) && <option value={defaultModel}>{defaultModel}</option>}
-            {settings.providers.map((item) => (
-              <optgroup key={item.id} label={item.id}>
-                {item.models.map((model) => {
-                  const ref = `${item.id}/${model.id}`;
-                  return (
-                    <option key={ref} value={ref} disabled={model.status === "disabled"}>
-                      {model.name || model.id}
-                      {model.status !== "available" ? `（${model.status}）` : ""}
-                    </option>
-                  );
-                })}
-              </optgroup>
-            ))}
+            {defaultElsewhere && (
+              <option value={defaultModel}>{defaultModel}（当前默认，其他供应商）</option>
+            )}
+            {editorDraft.models.length === 0 && <option value="">（该供应商还没有模型）</option>}
+            {editorDraft.models.map((model) => {
+              const id = model.id.trim();
+              if (!id) return null;
+              const ref = `${editorDraft.id}/${id}`;
+              return (
+                <option key={ref} value={ref} disabled={model.status === "disabled"}>
+                  {model.name || id}
+                  {model.status !== "available" ? `（${model.status}）` : ""}
+                </option>
+              );
+            })}
           </select>
         </label>
 

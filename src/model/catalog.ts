@@ -28,12 +28,34 @@ const BY_REF: Record<string, CatalogRow> = {
     thinkingLevelMap: { off: null, minimal: "low", low: "low", medium: "high", high: "high", xhigh: "max", max: "max" },
     compat: { thinkingFormat: "deepseek", supportsTemperature: false },
   },
+  "deepseek/deepseek-flash": {
+    name: "DeepSeek Flash",
+    contextWindow: 1_000_000,
+    maxTokens: 384_000,
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0.3 },
+    thinkingLevelMap: { off: null, minimal: "low", low: "low", medium: "high", high: "high", xhigh: "max", max: "max" },
+    compat: { thinkingFormat: "deepseek" },
+  },
+  "deepseek/deepseek-v4-pro": {
+    name: "DeepSeek V4 Pro",
+    contextWindow: 1_000_000,
+    maxTokens: 384_000,
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 1.32, output: 3.96, cacheRead: 0.044, cacheWrite: 1.32 },
+    thinkingLevelMap: { off: null, minimal: "low", low: "low", medium: "high", high: "high", xhigh: "max", max: "max" },
+    compat: { thinkingFormat: "deepseek" },
+  },
 };
 
 /** 按模型 id 前缀匹配（取最长前缀），让自定义供应商也能命中。 */
 const BY_MODEL: Record<string, CatalogRow> = {
   "deepseek-chat": BY_REF["deepseek/deepseek-chat"],
   "deepseek-reasoner": BY_REF["deepseek/deepseek-reasoner"],
+  "deepseek-flash": BY_REF["deepseek/deepseek-flash"],
+  "deepseek-v4-pro": BY_REF["deepseek/deepseek-v4-pro"],
   "gpt-5.1": {
     name: "GPT-5.1",
     contextWindow: 400_000,

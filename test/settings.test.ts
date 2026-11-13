@@ -94,6 +94,36 @@ describe("设置迁移", () => {
     expect(settings.limits.runTimeoutMs).toBe(180_000);
   });
 
+  it("v6 升级补齐 DeepSeek 新模型，保留用户已有模型与默认选择", async () => {
+    const file = await writeSettings({
+      settingsVersion: 6,
+      providers: [
+        {
+          id: "deepseek",
+          api: "openai-completions",
+          baseUrl: "https://api.deepseek.com/v1",
+          models: [
+            { id: "deepseek-chat", name: "自定义 Chat" },
+            { id: "my-proxy-model" },
+          ],
+        },
+      ],
+      selection: { defaultModel: "deepseek/deepseek-chat", aliases: {}, fallbacks: [] },
+      limits: DEFAULT_LIMITS,
+    });
+    const settings = await loadSettings(file);
+    const models = settings.providers.find((provider) => provider.id === "deepseek")!.models;
+    expect(models.map((model) => model.id)).toEqual([
+      "deepseek-chat",
+      "my-proxy-model",
+      "deepseek-flash",
+      "deepseek-v4-pro",
+    ]);
+    expect(models[0]?.name).toBe("自定义 Chat");
+    expect(settings.selection.defaultModel).toBe("deepseek/deepseek-chat");
+    expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+  });
+
   it("用户显式调整过的步数与超时保持不变", async () => {
     const file = await writeSettings(
       legacySettings({ ...DEFAULT_LIMITS, maxStepsPerRun: 30, runTimeoutMs: 90_000 }, 2),

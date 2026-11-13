@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defaultSettings } from "../src/core/settings";
-import { catalogSuggestions } from "../src/model/catalog";
+import { catalogSuggestions, findCatalogRow } from "../src/model/catalog";
 import { resolveModelChain } from "../src/model/refs";
 import { probeModel } from "../src/model/probe";
 
@@ -17,6 +17,16 @@ describe("内置模型目录建议", () => {
 
   it("认不出族的自定义供应商不给建议，避免造出解析不了的引用", () => {
     expect(catalogSuggestions("company-gateway")).toEqual([]);
+  });
+
+  it("DeepSeek 新模型带窗口与输出上限，可直接从目录添加", () => {
+    const flash = findCatalogRow("deepseek/deepseek-flash");
+    expect(flash).toMatchObject({ contextWindow: 1_000_000, maxTokens: 384_000, reasoning: true });
+    const pro = findCatalogRow("deepseek/deepseek-v4-pro");
+    expect(pro).toMatchObject({ contextWindow: 1_000_000, maxTokens: 384_000 });
+    const refs = catalogSuggestions("deepseek").map((item) => item.ref);
+    expect(refs).toContain("deepseek/deepseek-flash");
+    expect(refs).toContain("deepseek/deepseek-v4-pro");
   });
 });
 

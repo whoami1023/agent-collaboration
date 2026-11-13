@@ -22,7 +22,7 @@ import { CURATION_RULES } from "../skills/curation/types";
 
 export type { ModelDefinition, ModelSelection, ProviderApi, ProviderConfig } from "../model/types";
 
-export const SETTINGS_VERSION = 6;
+export const SETTINGS_VERSION = 7;
 
 /**
  * 内置别名（对应 OpenClaw `src/config/defaults.ts` 的 alias 表），
@@ -150,7 +150,12 @@ export const DEFAULT_SETTINGS: Settings = {
       id: "deepseek",
       api: "openai-completions",
       baseUrl: "https://api.deepseek.com/v1",
-      models: [{ id: "deepseek-chat" }, { id: "deepseek-reasoner" }],
+      models: [
+        { id: "deepseek-chat" },
+        { id: "deepseek-reasoner" },
+        { id: "deepseek-flash" },
+        { id: "deepseek-v4-pro" },
+      ],
     },
     {
       id: "openai",
@@ -351,6 +356,16 @@ function migrateSettings(raw: Partial<Settings>): Partial<Settings> {
       models,
     };
   });
+
+  // v7：DeepSeek 官方目录新增 flash / v4-pro。只补缺失项，用户已有的模型定义与默认选择不动。
+  if (version < 7) {
+    for (const provider of providers) {
+      if (provider.id !== "deepseek") continue;
+      for (const id of ["deepseek-flash", "deepseek-v4-pro"]) {
+        if (!provider.models.some((model) => model.id === id)) provider.models.push({ id });
+      }
+    }
+  }
 
   const defaultModel =
     legacy.selection?.defaultModel ??
